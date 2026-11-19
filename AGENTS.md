@@ -73,8 +73,8 @@ NRO). Нативный x86-32 код игры переводится в C (`reco
 | `host/hello/`, `platform/` | проверка GL/DXT1; окно SDL и контекст GL; `gles_shim.{h,c}` — GL 4.1 поверх ES 3.0, `android/` — потоки и ADPF |
 | `host/boot/android.c`, `touch.h` | JNI экранного управления (Kotlin → `input.c`) |
 | `android/` | проект Gradle: лаунчер, редактор раскладки, `GameActivity` (SDLActivity) на Kotlin — `docs/ANDROID.md` |
-| `tests/` | `rt/` (CTest), `bink/` (сверка с ffmpeg), `difftest/` (unicorn, нужна игра), `test_public.py` |
-| `tools/` | `build.sh`, `check_public.py`, `switch_upload.py`, `pgo_fetch.py`, `make_rus.sh`, `make_icon.sh`, `cc_partition.sh`, `probe/` (профили, дизассемблер), `recon/` (PE, MSI, пакеты `.u`) |
+| `tests/` | `rt/` (CTest), `bink/` (сверка с ffmpeg), `difftest/` (unicorn, нужна игра), `test_public.py`, `fetch_game_test.sh` |
+| `tools/` | `build.sh`, `android_deps.sh`, `fetch_game.sh` (архив игры по ссылке → System), `check_public.py`, `switch_upload.py`, `pgo_fetch.py`, `make_rus.sh`, `make_icon.sh`, `cc_partition.sh`, `probe/` (профили, дизассемблер), `recon/` (PE, MSI, пакеты `.u`) |
 
 ---
 

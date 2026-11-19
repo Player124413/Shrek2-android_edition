@@ -19,6 +19,7 @@ on:
       - 'tools/android_deps.sh'
       - 'tools/build.sh'
       - 'tools/fetch_game.sh'
+      - 'tests/fetch_game_test.sh'
       - '.github/workflows/android.yml'
   pull_request:
   workflow_dispatch:
@@ -45,6 +46,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # загрузка архива игры по ссылке (tools/fetch_game.sh) — на синтетических архивах, без игры
+  fetch-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: tools/fetch_game.sh
+        run: sh tests/fetch_game_test.sh
+
   apk:
     runs-on: ubuntu-24.04
     timeout-minutes: 300
