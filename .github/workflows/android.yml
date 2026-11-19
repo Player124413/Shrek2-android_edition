@@ -1,9 +1,9 @@
-# Сборка APK для Android (docs/ANDROID.md).
-# Без файлов игры (обычный случай, публичный репозиторий) собирается APK «без игры»: весь код порта, SDL2, OpenAL,
-# FFmpeg, лаунчер и редактор управления; «Играть» сообщает, что модулей игры в сборке нет (SNX_NO_GAME).
-# С игрой — только в приватном репозитории: секрет SNX_GAME_SYSTEM_URL — прямая ссылка на zip с папкой System
-# своей копии игры (DLL и game.exe); код игры генерируется рекомпилятором прямо здесь. Такой APK содержит код,
-# полученный из игры, — не публикуйте его. [проверить: путь с игрой в CI не запускался]
+# Сборка APK для Android (docs/ANDROID.md, «Сборка в GitHub Actions»).
+# Без игры (push, PR или «Run workflow» с пустой ссылкой) — APK со всем кодом порта, лаунчером и редактором
+# управления, но без кода игры (SNX_NO_GAME): «Играть» сообщает, что игры в сборке нет.
+# С игрой — «Run workflow» со ссылкой на архив своей копии игры (или секрет SNX_GAME_SYSTEM_URL): код игры
+# генерируется рекомпилятором из её System (tools/fetch_game.sh). Такой APK содержит код, полученный из игры:
+# в публичном репозитории он выкладывается только зашифрованным zip (AES-256) с паролем из поля запуска.
 name: Android APK
 
 on:
@@ -18,25 +18,73 @@ on:
       - 'recomp/**'
       - 'tools/android_deps.sh'
       - 'tools/build.sh'
+      - 'tools/fetch_game.sh'
       - '.github/workflows/android.yml'
   pull_request:
   workflow_dispatch:
+    inputs:
+      game_url:
+        description: 'Ссылка на архив игры (zip/7z/rar: папка игры или System; прямая, Яндекс Диск, Google Диск, Dropbox). Пусто — APK без игры'
+        type: string
+        default: ''
+      variant:
+        description: 'Версия игры (rus — в System нужен распакованный английский game.exe)'
+        type: choice
+        options: [eng, rus]
+        default: eng
+      apk_password:
+        description: 'Пароль zip с APK (обязателен в публичном репозитории, от 8 символов)'
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 concurrency:
-  group: android-${{ github.ref }}
+  group: android-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
   apk:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 300
     env:
       NDK_VERSION: 27.2.12479018
-      SNX_GAME_SYSTEM_URL: ${{ secrets.SNX_GAME_SYSTEM_URL }}
     steps:
+      # ссылку и пароль читаем из события, а не через ${{ inputs.* }}: иначе они попадут в текст шага в логе
+      - name: Режим сборки
+        id: mode
+        env:
+          SECRET_URL: ${{ secrets.SNX_GAME_SYSTEM_URL }}
+          PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          ev() { jq -r ".inputs.$1 // \"\"" "$GITHUB_EVENT_PATH"; }
+          URL=$(ev game_url | tr -d '[:space:]')
+          PW=$(ev apk_password)
+          VARIANT=$(ev variant)
+          [ -n "$URL" ] || URL="$SECRET_URL"
+          [ -n "$URL" ] && echo "::add-mask::$URL"
+          [ -n "$PW" ] && echo "::add-mask::$PW"
+          [ "$VARIANT" = rus ] || VARIANT=eng
+          GAME=0
+          if [ -n "$URL" ]; then
+            GAME=1
+            if [ "$PRIVATE" != true ] && [ ${#PW} -lt 8 ]; then
+              echo "::error::Репозиторий публичный: для APK с игрой задайте пароль zip (от 8 символов) — без него артефакт был бы доступен всем"
+              exit 1
+            fi
+            printf %s "$URL" > "$RUNNER_TEMP/game_url"
+          fi
+          [ -n "$PW" ] && printf %s "$PW" > "$RUNNER_TEMP/apk_password"
+          if [ "$VARIANT" = rus ]; then PLAT=android-rus; else PLAT=android; fi
+          {
+            echo "game=$GAME"
+            echo "variant=$VARIANT"
+            echo "plat=$PLAT"
+            echo "apk=build/shrekNX-$VARIANT.apk"
+          } >> "$GITHUB_OUTPUT"
+          echo "### Сборка: $([ $GAME = 1 ] && echo "с игрой ($VARIANT)" || echo "без игры")" >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -79,53 +127,52 @@ jobs:
           path: build/android-deps
           key: ${{ steps.deps-cache.outputs.cache-primary-key }}
 
-      - name: Модули игры (только приватный репозиторий с секретом SNX_GAME_SYSTEM_URL)
-        if: env.SNX_GAME_SYSTEM_URL != ''
+      - name: Игра по ссылке → код рекомпилятора
+        if: steps.mode.outputs.game == '1'
+        env:
+          VARIANT: ${{ steps.mode.outputs.variant }}
         run: |
-          if [ "${{ github.event.repository.private }}" != "true" ]; then
-            echo "::error::Репозиторий публичный: APK с кодом игры здесь собирать нельзя (артефакты видны всем)"
-            exit 1
-          fi
-          curl -fsSL "$SNX_GAME_SYSTEM_URL" -o "$RUNNER_TEMP/system.zip"
-          mkdir -p "$RUNNER_TEMP/system" game
-          unzip -q "$RUNNER_TEMP/system.zip" -d "$RUNNER_TEMP/system"
-          SYS=$(dirname "$(find "$RUNNER_TEMP/system" -iname core.dll | head -1)")
-          [ -n "$SYS" ] && [ "$SYS" != . ] || { echo "::error::в архиве нет System/Core.dll"; exit 1; }
-          mv "$SYS" game/System
           python3 -m venv tools/.venv
           tools/.venv/bin/python -m pip install -q -r tools/requirements.txt
-          tools/.venv/bin/python -I recomp/main.py gen --game game/System --out build/gen
+          if [ "$VARIANT" = rus ]; then SYS=build/game-rus/System; GEN=build/gen-rus; else SYS=game/System; GEN=build/gen; fi
+          tools/fetch_game.sh "$(cat "$RUNNER_TEMP/game_url")" "$SYS"
+          rm -f "$RUNNER_TEMP/game_url"
+          time tools/.venv/bin/python -I recomp/main.py gen --game "$SYS" --out "$GEN"
+          du -sh "$GEN"
 
       - name: Сборка APK
         shell: bash
+        env:
+          PLAT: ${{ steps.mode.outputs.plat }}
         run: |
           set -o pipefail
-          tools/build.sh android --no-daemon 2>&1 | tee "$RUNNER_TEMP/build.log"
+          tools/build.sh "$PLAT" --no-daemon 2>&1 | tee "$RUNNER_TEMP/build.log"
 
       - name: Ошибки сборки — в аннотации
         if: failure()
         shell: bash
         run: |
+          esc() { sed -e 's/%/%25/g' | awk 'BEGIN{ORS="%0A"} {print}'; }
           L="$RUNNER_TEMP/build.log"
           [ -f "$L" ] || exit 0
-          esc() { sed -e 's/%/%25/g' | awk 'BEGIN{ORS="%0A"} {print}'; }
           grep -nE -A12 "What went wrong|CMake Error|error:|undefined (symbol|reference)" "$L" | grep -v "^\s*at " | head -120 | cut -c1-400 \
             > "$RUNNER_TEMP/err.txt" || true
           echo "::error title=build errors::$(esc < "$RUNNER_TEMP/err.txt")"
           echo "::error title=build tail::$(grep -v "^\s*at " "$L" | tail -n 60 | cut -c1-300 | esc)"
 
       - name: Проверка APK
+        env:
+          APK: ${{ steps.mode.outputs.apk }}
+          GAME: ${{ steps.mode.outputs.game }}
         run: |
-          APK=build/shrekNX-eng.apk
           ls -l "$APK"
           unzip -l "$APK" > "$RUNNER_TEMP/apk.txt"
           for f in lib/arm64-v8a/libmain.so lib/arm64-v8a/libSDL2.so classes.dex AndroidManifest.xml; do
             grep -q " $f\$" "$RUNNER_TEMP/apk.txt" || { echo "::error::в APK нет $f"; cat "$RUNNER_TEMP/apk.txt"; exit 1; }
           done
           BT="$ANDROID_HOME/build-tools/35.0.0"
-          "$BT/aapt2" dump badging "$APK" | head -5
           "$BT/apksigner" verify --print-certs "$APK" | head -3
-          # libmain.so: все JNI-функции экранного управления и SDL_main на месте, неразрешённых — только из системы
+          # libmain.so: JNI экранного управления и SDL_main на месте, выравнивание 16 КБ, ролики (FFmpeg)
           TC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
           unzip -o -q "$APK" lib/arm64-v8a/libmain.so -d "$RUNNER_TEMP/apk"
           SO="$RUNNER_TEMP/apk/lib/arm64-v8a/libmain.so"
@@ -134,15 +181,18 @@ jobs:
                    Java_com_shreknx_game_SnxNative_key Java_com_shreknx_game_SnxNative_state; do
             grep -q " T $s\$" "$RUNNER_TEMP/syms.txt" || { echo "::error::в libmain.so нет $s"; exit 1; }
           done
-          "$TC/llvm-readelf" -d "$SO" | grep NEEDED
           "$TC/llvm-readelf" -lW "$SO" | grep LOAD | awk '{ if ($NF != "0x4000") bad=1 } END { exit bad }' \
             || { echo "::error::LOAD-сегменты не выровнены на 16 КБ"; exit 1; }
-          [ -f build/android-deps/ffmpeg/arm64-v8a/lib/libavcodec.a ] || { echo "::error::FFmpeg не собран"; exit 1; }
           grep -q "SNX_ANDROID_VIDEO:BOOL=ON" build/android-cxx/Release/*/arm64-v8a/CMakeCache.txt \
             || { echo "::error::libmain.so собран без роликов (SNX_ANDROID_VIDEO=OFF)"; exit 1; }
-          # сводка — в аннотации (видна в интерфейсе запуска и через API)
+          # с игрой в libmain.so должен быть код модулей (mod_core и т. д.), без игры — сообщение SNX_NO_GAME
+          if [ "$GAME" = 1 ]; then
+            ! grep -aq "SNX_NO_GAME" "$SO" || { echo "::error::APK собран без модулей игры"; exit 1; }
+          else
+            grep -aq "SNX_NO_GAME" "$SO" || { echo "::error::ожидалась сборка без игры"; exit 1; }
+          fi
           {
-            "$BT/aapt2" dump badging "$APK" | grep -E "^package|^sdkVersion|^targetSdkVersion|^launchable"
+            "$BT/aapt2" dump badging "$APK" | grep -E "^package|^minSdkVersion|^targetSdkVersion|^launchable"
             echo "APK: $(stat -c %s "$APK") байт"
             unzip -lv "$APK" | awk '/lib\/arm64-v8a\// { print $NF ": " $1 " байт (" $2 ")" }'
             echo "NEEDED: $("$TC/llvm-readelf" -d "$SO" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' | tr '\n' ' ')"
@@ -150,18 +200,36 @@ jobs:
           echo "::notice title=APK::$(sed -e 's/%/%25/g' "$RUNNER_TEMP/summary.txt" | awk 'BEGIN{ORS="%0A"} {print}')"
           cat "$RUNNER_TEMP/summary.txt" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: APK без игры
-        if: env.SNX_GAME_SYSTEM_URL == ''
-        uses: actions/upload-artifact@v7
-        with:
-          name: shrekNX-android-nogame
-          path: build/shrekNX-eng.apk
-          retention-days: 14
+      - name: Упаковка APK
+        id: pack
+        env:
+          APK: ${{ steps.mode.outputs.apk }}
+          GAME: ${{ steps.mode.outputs.game }}
+          VARIANT: ${{ steps.mode.outputs.variant }}
+        run: |
+          if [ "$GAME" = 1 ] && [ -f "$RUNNER_TEMP/apk_password" ]; then
+            # zip AES-256: открывают 7-Zip, ZArchiver, RAR и т. п. (стандартный распаковщик Windows — нет)
+            OUT="build/shrekNX-$VARIANT-apk.zip"
+            (cd build && 7z a -tzip -mem=AES256 -p"$(cat "$RUNNER_TEMP/apk_password")" "$(basename "$OUT")" "$(basename "$APK")" >/dev/null)
+            rm -f "$RUNNER_TEMP/apk_password"
+            7z l -slt "$OUT" | grep -E "^(Path|Encrypted|Method)" | head -3
+            echo "name=shrekNX-android-$VARIANT-encrypted" >> "$GITHUB_OUTPUT"
+            echo "days=3" >> "$GITHUB_OUTPUT"
+          elif [ "$GAME" = 1 ]; then
+            OUT="$APK"
+            echo "name=shrekNX-android-$VARIANT" >> "$GITHUB_OUTPUT"
+            echo "days=3" >> "$GITHUB_OUTPUT"
+          else
+            OUT="$APK"
+            echo "name=shrekNX-android-nogame" >> "$GITHUB_OUTPUT"
+            echo "days=14" >> "$GITHUB_OUTPUT"
+          fi
+          echo "path=$OUT" >> "$GITHUB_OUTPUT"
 
-      - name: APK с игрой (приватный репозиторий)
-        if: env.SNX_GAME_SYSTEM_URL != ''
+      - name: Артефакт
         uses: actions/upload-artifact@v7
         with:
-          name: shrekNX-android
-          path: build/shrekNX-eng.apk
-          retention-days: 3
+          name: ${{ steps.pack.outputs.name }}
+          path: ${{ steps.pack.outputs.path }}
+          retention-days: ${{ steps.pack.outputs.days }}
+          if-no-files-found: error
