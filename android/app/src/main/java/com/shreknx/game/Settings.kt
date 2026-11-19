@@ -54,6 +54,9 @@ class Settings(private val ctx: Context) {
     var haptics: Boolean
         get() = p.getBoolean("haptics", true)
         set(v) { p.edit().putBoolean("haptics", v).commit() }
+    var creditsShownVersion: Int  // versionCode, для которого уже показано окно «О порте»
+        get() = p.getInt("creditsShown", 0)
+        set(v) { p.edit().putInt("creditsShown", v).commit() }
 
     fun applyTier(t: Device.Tier) {
         renderScale = t.scale
@@ -95,9 +98,9 @@ class Settings(private val ctx: Context) {
 object Device {
     data class Tier(val name: String, val scale: Float, val fps: Int, val tex16: Boolean, val fileCacheMb: Int)
 
-    val LOW = Tier("Слабый", 0.5f, 30, true, 96)
-    val MID = Tier("Средний", 0.75f, 0, false, 256)
-    val HIGH = Tier("Мощный", 1.0f, 0, false, 512)
+    val LOW = Tier(L.t("Слабый", "Low"), 0.5f, 30, true, 96)
+    val MID = Tier(L.t("Средний", "Medium"), 0.75f, 0, false, 256)
+    val HIGH = Tier(L.t("Мощный", "High"), 1.0f, 0, false, 512)
 
     fun ramMb(ctx: Context): Long {
         val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager

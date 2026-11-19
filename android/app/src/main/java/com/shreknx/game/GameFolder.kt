@@ -16,11 +16,11 @@ object GameFolder {
     // null — всё на месте, иначе — чего не хватает
     fun check(path: String): String? {
         val dir = File(path)
-        if (!dir.isDirectory) return "Папка не найдена: $path"
-        if (dir.listFiles() == null) return "Нет доступа к папке (дай разрешение на файлы или используй «Импорт»)"
-        val sys = child(dir, "System") ?: return "В папке нет System — нужна папка установленной игры с ПК"
-        for (f in listOf("Core.u", "Engine.u")) if (child(sys, f) == null) return "В System нет $f"
-        if (child(dir, "Maps") == null) return "В папке нет Maps"
+        if (!dir.isDirectory) return L.t("Папка не найдена: $path", "Folder not found: $path")
+        if (dir.listFiles() == null) return L.t("Нет доступа к папке (дай разрешение на файлы или используй «Импорт»)", "No access to the folder (grant file access or use “Import”)")
+        val sys = child(dir, "System") ?: return L.t("В папке нет System — нужна папка установленной игры с ПК", "No System folder — select the folder of the game installed on a PC")
+        for (f in listOf("Core.u", "Engine.u")) if (child(sys, f) == null) return L.t("В System нет $f", "System has no $f")
+        if (child(dir, "Maps") == null) return L.t("В папке нет Maps", "No Maps folder")
         return null
     }
 

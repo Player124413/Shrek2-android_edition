@@ -13,6 +13,19 @@ if (!sdlJava.exists()) {
     throw new GradleException("Нет ${sdlJava}: сначала запусти tools/android_deps.sh")
 }
 
+// versionCode растёт с каждым коммитом (обновление ставится поверх старой версии, без удаления): число коммитов
+// ветки; -Psnx.versionCode=N — вручную. В CI нужен полный клон (fetch-depth: 0), иначе число — 1.
+def gitCommits = {
+    try {
+        def p = ['git', '-C', repoRoot.absolutePath, 'rev-list', '--count', 'HEAD'].execute()
+        def out = p.text.trim()
+        p.waitFor() == 0 && out ? out.toInteger() : 1
+    } catch (Exception ignored) {
+        1
+    }
+}
+def snxVersionCode = project.hasProperty('snx.versionCode') ? project.property('snx.versionCode').toString().toInteger() : gitCommits()
+
 android {
     namespace 'com.shreknx.game'
     compileSdk 35
@@ -22,8 +35,8 @@ android {
         applicationId 'com.shreknx.game'
         minSdk 24          // Android 7.0: OpenGL ES 3.0 есть везде, AAudio — с 8.1 (иначе OpenSL ES)
         targetSdk 35
-        versionCode 1
-        versionName '0.1.0'
+        versionCode snxVersionCode
+        versionName "0.1.0-${snxVersionCode}"
         ndk {
             abiFilters 'arm64-v8a'  // окно гостя — 4 ГБ адресов: только 64-битные телефоны
         }
@@ -66,31 +79,48 @@ android {
         }
     }
 
-    buildTypes {
-        release {
-            minifyEnabled false
-            // подпись: android/keystore.properties (см. docs/ANDROID.md); без неё — отладочным ключом
-            signingConfig signingConfigs.debug
-        }
-        debug {
-            // сгенерированный код без оптимизаций слишком медленный даже для отладки лаунчера
-            externalNativeBuild { cmake { arguments '-DCMAKE_BUILD_TYPE=Release' } }
+    // Подпись — всегда одним ключом, иначе новая версия не ставится поверх старой. По умолчанию — ключ из
+    // репозитория (android/shreknx-release.jks.b64, пароль открыт: подписать «обновление» им может любой — см.
+    // docs/ANDROID.md); свой — android/keystore.properties или переменные SNX_KEYSTORE* (секреты CI).
+    def ksProps = new Properties()
+    def ksFile = new File(projectDir.parentFile, 'keystore.properties')
+    if (System.getenv('SNX_KEYSTORE')) {
+        ksProps['storeFile'] = System.getenv('SNX_KEYSTORE')
+        ksProps['storePassword'] = System.getenv('SNX_KEYSTORE_PASSWORD') ?: ''
+        ksProps['keyAlias'] = System.getenv('SNX_KEY_ALIAS') ?: 'shreknx'
+        ksProps['keyPassword'] = System.getenv('SNX_KEY_PASSWORD') ?: ksProps['storePassword']
+    } else if (ksFile.exists()) {
+        ksFile.withInputStream { ksProps.load(it) }
+    } else {
+        // ключ хранится текстом (base64), чтобы tools/check_public.py не пропускал в репозиторий бинарники
+        def jks = new File(layout.buildDirectory.get().asFile, 'shreknx-release.jks')
+        jks.parentFile.mkdirs()
+        jks.bytes = Base64.mimeDecoder.decode(new File(projectDir.parentFile, 'shreknx-release.jks.b64').text)
+        ksProps['storeFile'] = jks.absolutePath
+        ksProps['storePassword'] = 'shreknx-android'
+        ksProps['keyAlias'] = 'shreknx'
+        ksProps['keyPassword'] = 'shreknx-android'
+    }
+    signingConfigs {
+        snx {
+            def f = new File(ksProps['storeFile'].toString())
+            storeFile f.isAbsolute() ? f : new File(projectDir.parentFile, ksProps['storeFile'].toString())
+            storePassword ksProps['storePassword']
+            keyAlias ksProps['keyAlias']
+            keyPassword ksProps['keyPassword']
         }
     }
 
-    def ks = new File(projectDir.parentFile, 'keystore.properties')
-    if (ks.exists()) {
-        def p = new Properties()
-        ks.withInputStream { p.load(it) }
-        signingConfigs {
-            snx {
-                storeFile new File(projectDir.parentFile, p['storeFile'])
-                storePassword p['storePassword']
-                keyAlias p['keyAlias']
-                keyPassword p['keyPassword']
-            }
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.snx
         }
-        buildTypes.release.signingConfig signingConfigs.snx
+        debug {
+            signingConfig signingConfigs.snx  // тот же ключ: отладочная сборка ставится поверх релизной
+            // сгенерированный код без оптимизаций слишком медленный даже для отладки лаунчера
+            externalNativeBuild { cmake { arguments '-DCMAKE_BUILD_TYPE=Release' } }
+        }
     }
 
     buildFeatures {

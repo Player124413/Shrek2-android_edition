@@ -30,30 +30,30 @@ class LayoutEditor(private val ctx: Context, private val settings: Settings, pri
         field.onSelect = { showProps(it) }
 
         val top = Ui.hbox(ctx)
-        top.addView(Ui.title(ctx, "Раскладка", 16f), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        top.addView(Ui.title(ctx, L.t("Раскладка", "Layout"), 16f), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         top.addView(Ui.button(ctx, "⇅") {
             atTop = !atTop
             scroll.layoutParams = panelParams()
         })
         panel.addView(top)
-        panel.addView(Ui.label(ctx, "Тяни элемент — переместить, двумя пальцами — размер. Скрытые — пунктиром.",
+        panel.addView(Ui.label(ctx, L.t("Тяни элемент — переместить, двумя пальцами — размер. Скрытые — пунктиром.", "Drag a control to move it, pinch to resize. Hidden ones are dashed."),
             dim = true, size = 12f))
-        panel.addView(Ui.seekRow(ctx, "Прозрачность всего", 18, ((settings.opacity - 0.1f) * 20f).toInt(),
+        panel.addView(Ui.seekRow(ctx, L.t("Прозрачность всего", "Overall opacity"), 18, ((settings.opacity - 0.1f) * 20f).toInt(),
             { "${((0.1f + it / 20f) * 100).toInt()} %" }) {
             settings.opacity = 0.1f + it / 20f
             field.invalidate()
         })
         panel.addView(props)
         val buttons = Ui.hbox(ctx).apply { setPadding(0, Ui.dp(ctx, 8f), 0, 0) }
-        buttons.addView(Ui.button(ctx, "Сброс") {
-            AlertDialog.Builder(ctx).setMessage("Вернуть раскладку по умолчанию?")
-                .setPositiveButton("Да") { _, _ ->
+        buttons.addView(Ui.button(ctx, L.t("Сброс", "Reset")) {
+            AlertDialog.Builder(ctx).setMessage(L.t("Вернуть раскладку по умолчанию?", "Restore the default layout?"))
+                .setPositiveButton(L.t("Да", "Yes")) { _, _ ->
                     field.controls = TouchLayout.defaults().map { it.copy() }.toMutableList()
                     field.select(null)
-                }.setNegativeButton("Нет", null).show()
+                }.setNegativeButton(L.t("Нет", "No"), null).show()
         }, gap())
-        buttons.addView(Ui.button(ctx, "Отмена") { onClose(false) }, gap())
-        buttons.addView(Ui.button(ctx, "Сохранить", primary = false) {
+        buttons.addView(Ui.button(ctx, L.t("Отмена", "Cancel")) { onClose(false) }, gap())
+        buttons.addView(Ui.button(ctx, L.t("Сохранить", "Save"), primary = false) {
             TouchLayout.save(ctx, field.controls)
             onClose(true)
         })
@@ -71,43 +71,43 @@ class LayoutEditor(private val ctx: Context, private val settings: Settings, pri
     }
 
     private fun nameOf(c: Control): String = when {
-        c.kind == Kind.STICK -> if (c.rightStick) "Правый стик (камера)" else "Левый стик (ходьба)"
-        c.kind == Kind.DPAD -> "Крестовина"
-        c.label.isNotEmpty() -> "Кнопка «${c.label}»"
+        c.kind == Kind.STICK -> if (c.rightStick) L.t("Правый стик (камера)", "Right stick (camera)") else L.t("Левый стик (ходьба)", "Left stick (move)")
+        c.kind == Kind.DPAD -> L.t("Крестовина", "D-pad")
+        c.label.isNotEmpty() -> L.t("Кнопка «${c.label}»", "Button “${c.label}”")
         else -> c.id
     }
 
     private fun showProps(c: Control?) {
         props.removeAllViews()
         if (c == null) {
-            props.addView(Ui.label(ctx, "Выбери элемент на экране.", dim = true))
-            props.addView(Ui.button(ctx, "Показать скрытые элементы…") { pickHidden() })
+            props.addView(Ui.label(ctx, L.t("Выбери элемент на экране.", "Select a control on the screen."), dim = true))
+            props.addView(Ui.button(ctx, L.t("Показать скрытые элементы…", "Show hidden controls…")) { pickHidden() })
             return
         }
         props.addView(Ui.title(ctx, nameOf(c), 15f))
-        props.addView(Ui.switchRow(ctx, "Показывать", null, c.visible) { c.visible = it; field.invalidate() })
-        props.addView(Ui.seekRow(ctx, "Размер", 49, ((c.size - TouchLayout.MIN_SIZE) / (TouchLayout.MAX_SIZE - TouchLayout.MIN_SIZE) * 49).toInt(),
+        props.addView(Ui.switchRow(ctx, L.t("Показывать", "Visible"), null, c.visible) { c.visible = it; field.invalidate() })
+        props.addView(Ui.seekRow(ctx, L.t("Размер", "Size"), 49, ((c.size - TouchLayout.MIN_SIZE) / (TouchLayout.MAX_SIZE - TouchLayout.MIN_SIZE) * 49).toInt(),
             { "${(TouchLayout.MIN_SIZE * 100 + it).toInt()}" }) {
             c.size = TouchLayout.MIN_SIZE + (TouchLayout.MAX_SIZE - TouchLayout.MIN_SIZE) * it / 49f
             field.invalidate()
         })
-        props.addView(Ui.seekRow(ctx, "Непрозрачность", 9, ((c.opacity - 0.1f) * 10f).toInt(),
+        props.addView(Ui.seekRow(ctx, L.t("Непрозрачность", "Opacity"), 9, ((c.opacity - 0.1f) * 10f).toInt(),
             { "${((0.1f + it / 10f) * 100).toInt()} %" }) {
             c.opacity = 0.1f + it / 10f
             field.invalidate()
         })
         if (c.kind == Kind.STICK)
-            props.addView(Ui.switchRow(ctx, "Плавающий", "Появляется там, где коснулся пальцем (в своей половине экрана)",
+            props.addView(Ui.switchRow(ctx, L.t("Плавающий", "Floating"), L.t("Появляется там, где коснулся пальцем (в своей половине экрана)", "Appears where you touch (in its half of the screen)"),
                 c.floating) { c.floating = it; field.invalidate() })
         if (c.kind == Kind.BUTTON)
-            props.addView(Ui.switchRow(ctx, "Залипание", "Нажал — держится до следующего нажатия (бег, блок)",
+            props.addView(Ui.switchRow(ctx, L.t("Залипание", "Toggle"), L.t("Нажал — держится до следующего нажатия (бег, блок)", "Tap to hold until the next tap (run, block)"),
                 c.toggle) { c.toggle = it })
     }
 
     private fun pickHidden() {
         val hidden = field.controls.filter { !it.visible }
         if (hidden.isEmpty()) return
-        AlertDialog.Builder(ctx).setTitle("Скрытые элементы")
+        AlertDialog.Builder(ctx).setTitle(L.t("Скрытые элементы", "Hidden controls"))
             .setItems(hidden.map { nameOf(it) }.toTypedArray()) { _, i ->
                 hidden[i].visible = true
                 field.select(hidden[i])

@@ -13,7 +13,9 @@
 // (android/…/GameActivity.kt: --game, --user, --res, --env); лог — <user>/snx.log (прошлый — snx.log.old).
 #ifdef __ANDROID__
 #include <SDL_main.h>  // main -> SDL_main: её зовёт SDLActivity
+#include <SDL_locale.h>
 #include <SDL_messagebox.h>
+#include <SDL_stdinc.h>
 #include <sys/stat.h>
 #endif
 #include <pthread.h>
@@ -453,10 +455,19 @@ int main(int argc, char **argv)
 #ifdef SNX_NO_GAME
     // APK из CI без файлов игры (host/boot/CMakeLists.txt): код порта собран, модулей игры нет
     fprintf(stderr, "[boot] сборка без модулей игры (SNX_NO_GAME): нужен APK, собранный из своей копии игры\n");
+    int ru = 0;  // язык телефона (лаунчер — так же, android/…/L.kt)
+    SDL_Locale *loc = SDL_GetPreferredLocales();
+    if (loc && loc[0].language)
+        ru = !strcmp(loc[0].language, "ru") || !strcmp(loc[0].language, "be") || !strcmp(loc[0].language, "kk");
+    SDL_free(loc);
     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "shrekNX",
-                             "Этот APK собран без игры: в нём только лаунчер, управление и движок порта.\n\n"
-                             "Код игры переводится из DLL вашей копии Shrek 2 и входит в APK при сборке — "
-                             "соберите APK сами (docs/ANDROID.md).",
+                             ru ? "Этот APK собран без игры: в нём только лаунчер, управление и движок порта.\n\n"
+                                  "Код игры переводится из DLL вашей копии Shrek 2 и входит в APK при сборке — "
+                                  "соберите APK со ссылкой на свою игру (GitHub Actions → Run workflow)."
+                                : "This APK was built without the game: it only has the launcher, the controls and "
+                                  "the port engine.\n\nThe game code is translated from the DLLs of your copy of "
+                                  "Shrek 2 at build time — build the APK with a link to your game "
+                                  "(GitHub Actions → Run workflow).",
                              NULL);
     return 0;
 #endif

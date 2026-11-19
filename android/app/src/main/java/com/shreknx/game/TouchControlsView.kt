@@ -338,11 +338,7 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
         var dy = (y - st.cy) / r
         val m = hypot(dx, dy)
         if (m > 1f) {
-            // плавающий стик тянется за пальцем: центр догоняет, если палец ушёл далеко
-            if (c.floating) {
-                st.cx += (dx / m) * (m - 1f) * r
-                st.cy += (dy / m) * (m - 1f) * r
-            }
+            // центр стоит на месте (и у плавающего — там, где коснулись): палец за краем — просто полный наклон
             dx /= m; dy /= m
         }
         st.vx = dx

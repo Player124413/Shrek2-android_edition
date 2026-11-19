@@ -70,6 +70,12 @@ tools/build.sh android
 | `tests/` | Самостоятельные тесты и сравнение с Unicorn на локальных файлах игры |
 | `tools/` | Сборка, анализ файлов, профилирование и перенос на Switch |
 
+## Android
+
+Android-порт — **Player1444** ([Telegram-канал](https://t.me/player1444ports)), на основе
+[Ananasiy/shrekNX](https://github.com/Ananasiy/shrekNX) — огромное спасибо, без него Android-порта бы не было.
+Подробности — [docs/ANDROID.md](docs/ANDROID.md).
+
 ## Лицензия
 
 Собственный код порта и инструменты распространяются по лицензии **MIT** — см. [LICENSE](LICENSE). Лицензия не распространяется на игру, её файлы и сторонние зависимости ([THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).

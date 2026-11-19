@@ -14,6 +14,8 @@ import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings as SysSettings
 import android.text.InputType
+import android.text.method.LinkMovementMethod
+import android.text.util.Linkify
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.EditText
@@ -36,6 +38,39 @@ class LauncherActivity : Activity() {
         super.onCreate(savedInstanceState)
         s = Settings(this)
         build()
+        // при первом запуске и после обновления — кто сделал порт и кому спасибо
+        if (s.creditsShownVersion != BuildConfig.VERSION_CODE) {
+            s.creditsShownVersion = BuildConfig.VERSION_CODE
+            showCredits()
+        }
+    }
+
+    private fun showCredits() {
+        val text = L.t(
+            "Android-порт сделан ${L.AUTHOR}.\n\n" +
+                "Мой Telegram-канал: ${L.TG_CHANNEL}\n\n" +
+                "Огромное спасибо репозиторию ${L.UPSTREAM} — без него Android-порта бы не существовало.",
+            "Android port by ${L.AUTHOR}.\n\n" +
+                "My Telegram channel: ${L.TG_CHANNEL}\n\n" +
+                "Huge thanks to the ${L.UPSTREAM} repository — without it the Android port would not exist.")
+        val tv = TextView(this).apply {
+            this.text = text
+            textSize = 16f
+            setTextColor(Ui.TEXT)
+            setLinkTextColor(Ui.ACCENT)
+            autoLinkMask = Linkify.WEB_URLS
+            movementMethod = LinkMovementMethod.getInstance()
+            val p = Ui.dp(this@LauncherActivity, 22f)
+            setPadding(p, p, p, 0)
+        }
+        AlertDialog.Builder(this).setTitle("Shrek 2 · shrekNX Android").setView(tv)
+            .setPositiveButton("OK", null)
+            .setNeutralButton(L.t("Открыть канал", "Open channel")) { _, _ ->
+                try {
+                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(L.TG_CHANNEL)))
+                } catch (e: Exception) {
+                }
+            }.show()
     }
 
     override fun onResume() {
@@ -60,12 +95,15 @@ class LauncherActivity : Activity() {
         val head = Ui.hbox(this).apply { setPadding(0, 0, 0, Ui.dp(this@LauncherActivity, 12f)) }
         val titles = Ui.vbox(this)
         titles.addView(Ui.title(this, getString(R.string.app_name), 28f))
-        titles.addView(Ui.label(this, "shrekNX ${BuildConfig.VERSION_NAME} · ${if (Settings.variant() == "rus") "русская версия" else "English"}",
+        titles.addView(Ui.label(this, "shrekNX ${BuildConfig.VERSION_NAME} · ${if (Settings.variant() == "rus") L.t("русская версия", "Russian version") else L.t("английская версия", "English version")}",
             dim = true, size = 13f))
         status = Ui.label(this, "", size = 14f).apply { setPadding(0, Ui.dp(this@LauncherActivity, 6f), 0, 0) }
         titles.addView(status)
         head.addView(titles, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        head.addView(Ui.button(this, "▶  Играть", primary = true) { play() })
+        head.addView(Ui.button(this, L.t("О порте", "About")) { showCredits() },
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { rightMargin = Ui.dp(this@LauncherActivity, 8f) })
+        head.addView(Ui.button(this, L.t("▶  Играть", "▶  Play"), primary = true) { play() })
         content.addView(head)
 
         val cols = Ui.hbox(this).apply { gravity = Gravity.TOP }
@@ -85,18 +123,20 @@ class LauncherActivity : Activity() {
     // ---------------------------------------------------------------- папка игры
     private fun gameCard(): LinearLayout {
         val c = Ui.card(this)
-        c.addView(Ui.title(this, "Файлы игры"))
+        c.addView(Ui.title(this, L.t("Файлы игры", "Game files")))
         val path = Ui.label(this, s.gameDir, dim = true, size = 12f)
         c.addView(path)
-        c.addView(Ui.label(this, "Нужна папка установленной игры с ПК (System, Maps, Textures, Sounds…). Проще всего — " +
-            "скопировать её по USB в папку по умолчанию:\n${Settings.defaultGameDir(this).absolutePath}",
+        c.addView(Ui.label(this, L.t("Нужна папка установленной игры с ПК (System, Maps, Textures, Sounds…). Проще всего — " +
+            "скопировать её по USB в папку по умолчанию:", "You need the folder of the game installed on a PC (System, Maps, " +
+            "Textures, Sounds…). The easiest way is to copy it over USB to the default folder:") +
+            "\n${Settings.defaultGameDir(this).absolutePath}",
             dim = true, size = 12f).apply { setPadding(0, Ui.dp(this@LauncherActivity, 6f), 0, Ui.dp(this@LauncherActivity, 8f)) })
         val row1 = Ui.hbox(this)
-        row1.addView(Ui.button(this, "Импорт из папки…") { pickImport() }, wrapGap())
-        row1.addView(Ui.button(this, "Указать папку…") { pickPath() }, wrapGap())
+        row1.addView(Ui.button(this, L.t("Импорт из папки…", "Import from folder…")) { pickImport() }, wrapGap())
+        row1.addView(Ui.button(this, L.t("Указать папку…", "Choose folder…")) { pickPath() }, wrapGap())
         c.addView(row1)
         val row2 = Ui.hbox(this).apply { setPadding(0, Ui.dp(this@LauncherActivity, 8f), 0, 0) }
-        row2.addView(Ui.button(this, "По умолчанию") {
+        row2.addView(Ui.button(this, L.t("По умолчанию", "Default")) {
             s.gameDir = Settings.defaultGameDir(this).absolutePath
             Settings.defaultGameDir(this).mkdirs()
             path.text = s.gameDir
@@ -115,7 +155,7 @@ class LauncherActivity : Activity() {
     private fun refreshStatus() {
         if (!::status.isInitialized) return
         val err = GameFolder.check(s.gameDir)
-        status.text = err?.let { "⚠ $it" } ?: "✓ Игра найдена"
+        status.text = err?.let { "⚠ $it" } ?: L.t("✓ Игра найдена", "✓ Game found")
         status.setTextColor(if (err == null) Ui.ACCENT else 0xFFFFB74D.toInt())
         pathLabel?.text = s.gameDir
     }
@@ -136,10 +176,12 @@ class LauncherActivity : Activity() {
         else checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
 
     private fun requestFileAccess() {
-        AlertDialog.Builder(this).setTitle("Доступ к файлам")
-            .setMessage("Чтобы игра читала файлы прямо из выбранной папки, нужно разрешение на доступ ко всем файлам. " +
-                "Без него используй «Импорт» — файлы скопируются в папку приложения.")
-            .setPositiveButton("Разрешить") { _, _ ->
+        AlertDialog.Builder(this).setTitle(L.t("Доступ к файлам", "File access"))
+            .setMessage(L.t("Чтобы игра читала файлы прямо из выбранной папки, нужно разрешение на доступ ко всем файлам. " +
+                "Без него используй «Импорт» — файлы скопируются в папку приложения.",
+                "To read the files right from the chosen folder the game needs the “All files access” permission. " +
+                "Without it, use “Import” — the files will be copied into the app folder."))
+            .setPositiveButton(L.t("Разрешить", "Allow")) { _, _ ->
                 if (Build.VERSION.SDK_INT >= 30) {
                     try {
                         startActivity(Intent(SysSettings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
@@ -149,7 +191,7 @@ class LauncherActivity : Activity() {
                     }
                 } else requestPermissions(arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE,
                     Manifest.permission.WRITE_EXTERNAL_STORAGE), REQ_PERM)
-            }.setNegativeButton("Отмена", null).show()
+            }.setNegativeButton(L.t("Отмена", "Cancel"), null).show()
     }
 
     @Deprecated("Activity API")
@@ -162,7 +204,7 @@ class LauncherActivity : Activity() {
             REQ_PATH -> {
                 val p = GameFolder.pathOfTree(uri)
                 if (p == null) {
-                    toastDialog("Эту папку нельзя открыть по пути. Используй «Импорт».")
+                    toastDialog(L.t("Эту папку нельзя открыть по пути. Используй «Импорт».", "This folder can't be opened by path. Use “Import”."))
                     return
                 }
                 s.gameDir = p
@@ -175,18 +217,18 @@ class LauncherActivity : Activity() {
     private fun runImport(tree: Uri) {
         val dst = Settings.defaultGameDir(this)
         val box = Ui.vbox(this, 20)
-        val what = Ui.label(this, "Подготовка…")
+        val what = Ui.label(this, L.t("Подготовка…", "Preparing…"))
         val bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { isIndeterminate = true }
         box.addView(what)
         box.addView(bar)
         val cancelled = AtomicBoolean(false)
-        val dlg = AlertDialog.Builder(this).setTitle("Импорт игры").setView(box).setCancelable(false)
-            .setNegativeButton("Отмена") { _, _ -> cancelled.set(true) }.show()
+        val dlg = AlertDialog.Builder(this).setTitle(L.t("Импорт игры", "Importing the game")).setView(box).setCancelable(false)
+            .setNegativeButton(L.t("Отмена", "Cancel")) { _, _ -> cancelled.set(true) }.show()
         Thread {
             var error: String? = null
             try {
                 GameFolder.import(contentResolver, tree, dst, { cancelled.get() }) { p ->
-                    runOnUiThread { what.text = "${p.files} файлов, ${p.bytes / (1 shl 20)} МБ\n${p.current}" }
+                    runOnUiThread { what.text = L.t("${p.files} файлов, ${p.bytes / (1 shl 20)} МБ\n${p.current}", "${p.files} files, ${p.bytes / (1 shl 20)} MB\n${p.current}") }
                 }
             } catch (e: Exception) {
                 error = e.message ?: e.toString()
@@ -196,8 +238,8 @@ class LauncherActivity : Activity() {
                 if (!cancelled.get()) {
                     s.gameDir = dst.absolutePath
                     refreshStatus()
-                    toastDialog(error?.let { "Ошибка импорта: $it" } ?: (GameFolder.check(dst.absolutePath)
-                        ?.let { "Скопировано, но: $it" } ?: "Готово: игра скопирована."))
+                    toastDialog(error?.let { L.t("Ошибка импорта: $it", "Import failed: $it") } ?: (GameFolder.check(dst.absolutePath)
+                        ?.let { L.t("Скопировано, но: $it", "Copied, but: $it") } ?: L.t("Готово: игра скопирована.", "Done: the game has been copied.")))
                 }
             }
         }.start()
@@ -206,27 +248,27 @@ class LauncherActivity : Activity() {
     // ---------------------------------------------------------------- графика
     private fun graphicsCard(): LinearLayout {
         val c = Ui.card(this)
-        c.addView(Ui.title(this, "Графика и скорость"))
+        c.addView(Ui.title(this, L.t("Графика и скорость", "Graphics and speed")))
         val tier = Device.tier(this)
         val ram = "%.1f".format(Device.ramMb(this) / 1024.0)
-        c.addView(Ui.label(this, "Телефон: $ram ГБ ОЗУ, ЦП до ${Device.maxFreqMhz()} МГц → «${tier.name}»",
+        c.addView(Ui.label(this, L.t("Телефон: $ram ГБ ОЗУ, ЦП до ${Device.maxFreqMhz()} МГц → «${tier.name}»", "Phone: $ram GB RAM, CPU up to ${Device.maxFreqMhz()} MHz → “${tier.name}”"),
             dim = true, size = 12f))
         val holder = Ui.vbox(this)
         fun fill() {
             holder.removeAllViews()
             val scales = listOf(0.5f, 0.6f, 0.75f, 0.85f, 1.0f)
-            holder.addView(Ui.choiceRow(this, "Разрешение (доля экрана)", scales.map { "${(it * 100).toInt()} %" },
+            holder.addView(Ui.choiceRow(this, L.t("Разрешение (доля экрана)", "Resolution (share of screen)"), scales.map { "${(it * 100).toInt()} %" },
                 scales.indexOfFirst { it >= s.renderScale - 0.01f }.coerceAtLeast(0)) { s.renderScale = scales[it] })
             val fps = listOf(30, 45, 60, 0)
-            holder.addView(Ui.choiceRow(this, "Ограничение FPS", listOf("30", "45", "60", "Нет"),
+            holder.addView(Ui.choiceRow(this, L.t("Ограничение FPS", "FPS limit"), listOf("30", "45", "60", L.t("Нет", "Off")),
                 fps.indexOf(s.fpsCap).let { if (it < 0) 3 else it }) { s.fpsCap = fps[it] })
-            holder.addView(Ui.switchRow(this, "16-битные текстуры", "Меньше памяти и быстрее на слабых GPU, чуть хуже цвета",
+            holder.addView(Ui.switchRow(this, L.t("16-битные текстуры", "16-bit textures"), L.t("Меньше памяти и быстрее на слабых GPU, чуть хуже цвета", "Less memory and faster on weak GPUs, slightly worse colors"),
                 s.tex16) { s.tex16 = it })
-            holder.addView(Ui.switchRow(this, "Стабильная производительность",
-                "Частоты ниже пика, зато без перегрева и падения FPS через 10 минут (если телефон умеет)", s.sustained) { s.sustained = it })
-            holder.addView(Ui.switchRow(this, "Счётчик FPS", null, s.showFps) { s.showFps = it })
+            holder.addView(Ui.switchRow(this, L.t("Стабильная производительность", "Sustained performance"),
+                L.t("Частоты ниже пика, зато без перегрева и падения FPS через 10 минут (если телефон умеет)", "Lower peak clocks, but no overheating and FPS drops after 10 minutes (if supported)"), s.sustained) { s.sustained = it })
+            holder.addView(Ui.switchRow(this, L.t("Счётчик FPS", "FPS counter"), null, s.showFps) { s.showFps = it })
         }
-        c.addView(Ui.choiceRow(this, "Пресет", listOf(Device.LOW.name, Device.MID.name, Device.HIGH.name),
+        c.addView(Ui.choiceRow(this, L.t("Пресет", "Preset"), listOf(Device.LOW.name, Device.MID.name, Device.HIGH.name),
             listOf(Device.LOW, Device.MID, Device.HIGH).indexOfFirst { it.scale == s.renderScale && it.fps == s.fpsCap }
                 .let { if (it < 0) 1 else it }) {
             s.applyTier(listOf(Device.LOW, Device.MID, Device.HIGH)[it])
@@ -240,19 +282,19 @@ class LauncherActivity : Activity() {
     // ---------------------------------------------------------------- управление
     private fun controlsCard(): LinearLayout {
         val c = Ui.card(this)
-        c.addView(Ui.title(this, "Управление"))
-        c.addView(Ui.button(this, "✎  Редактор раскладки") {
+        c.addView(Ui.title(this, L.t("Управление", "Controls")))
+        c.addView(Ui.button(this, L.t("✎  Редактор раскладки", "✎  Layout editor")) {
             startActivity(Intent(this, LayoutEditorActivity::class.java))
         })
-        c.addView(Ui.label(this, "В игре — шестерёнка в левом верхнем углу. Палец на свободном месте экрана — камера.",
+        c.addView(Ui.label(this, L.t("В игре — шестерёнка в левом верхнем углу. Палец на свободном месте экрана — камера.", "In game: the gear in the top-left corner. A finger on a free area of the screen moves the camera."),
             dim = true, size = 12f).apply { setPadding(0, Ui.dp(this@LauncherActivity, 6f), 0, 0) })
-        c.addView(Ui.switchRow(this, "Экранное управление", null, s.touchEnabled) { s.touchEnabled = it })
-        c.addView(Ui.switchRow(this, "Прятать при геймпаде", "Подключён геймпад — кнопки на экране не нужны",
+        c.addView(Ui.switchRow(this, L.t("Экранное управление", "Touch controls"), null, s.touchEnabled) { s.touchEnabled = it })
+        c.addView(Ui.switchRow(this, L.t("Прятать при геймпаде", "Hide with a gamepad"), L.t("Подключён геймпад — кнопки на экране не нужны", "A gamepad is connected — no need for on-screen buttons"),
             s.hideWithGamepad) { s.hideWithGamepad = it })
-        c.addView(Ui.switchRow(this, "Вибрация кнопок", null, s.haptics) { s.haptics = it })
-        c.addView(Ui.seekRow(this, "Чувствительность камеры", 38, ((s.lookSensitivity - 0.1f) * 10f).toInt(),
+        c.addView(Ui.switchRow(this, L.t("Вибрация кнопок", "Button vibration"), null, s.haptics) { s.haptics = it })
+        c.addView(Ui.seekRow(this, L.t("Чувствительность камеры", "Camera sensitivity"), 38, ((s.lookSensitivity - 0.1f) * 10f).toInt(),
             { "%.1f".format(0.1f + it / 10f) }) { s.lookSensitivity = 0.1f + it / 10f })
-        c.addView(Ui.seekRow(this, "Прозрачность кнопок", 18, ((s.opacity - 0.1f) * 20f).toInt(),
+        c.addView(Ui.seekRow(this, L.t("Прозрачность кнопок", "Button opacity"), 18, ((s.opacity - 0.1f) * 20f).toInt(),
             { "${((0.1f + it / 20f) * 100).toInt()} %" }) { s.opacity = 0.1f + it / 20f })
         return c
     }
@@ -260,17 +302,17 @@ class LauncherActivity : Activity() {
     // ---------------------------------------------------------------- дополнительно
     private fun advancedCard(): LinearLayout {
         val c = Ui.card(this)
-        c.addView(Ui.title(this, "Дополнительно"))
+        c.addView(Ui.title(this, L.t("Дополнительно", "Advanced")))
         val caches = listOf(64, 96, 128, 256, 512, 1024)
-        c.addView(Ui.choiceRow(this, "Кэш файлов игры в памяти, МБ", caches.map { it.toString() },
+        c.addView(Ui.choiceRow(this, L.t("Кэш файлов игры в памяти, МБ", "Game file cache in memory, MB"), caches.map { it.toString() },
             caches.indexOf(s.fileCacheMb).let { if (it < 0) 3 else it }) { s.fileCacheMb = caches[it] })
         val row = Ui.hbox(this).apply { setPadding(0, Ui.dp(this@LauncherActivity, 6f), 0, 0) }
-        row.addView(Ui.button(this, "Журнал") { showLog() }, wrapGap())
-        row.addView(Ui.button(this, "Переменные SNX_*") { editEnv() }, wrapGap())
+        row.addView(Ui.button(this, L.t("Журнал", "Log")) { showLog() }, wrapGap())
+        row.addView(Ui.button(this, L.t("Переменные SNX_*", "SNX_* variables")) { editEnv() }, wrapGap())
         c.addView(row)
-        c.addView(Ui.button(this, "Очистить кэш шейдеров") {
+        c.addView(Ui.button(this, L.t("Очистить кэш шейдеров", "Clear shader cache")) {
             File(cacheDir, "shaders").deleteRecursively()
-            toastDialog("Кэш шейдеров очищен: при следующем запуске они соберутся заново.")
+            toastDialog(L.t("Кэш шейдеров очищен: при следующем запуске они соберутся заново.", "Shader cache cleared: shaders will be rebuilt on the next start."))
         }.apply { layoutParams = wrapGap().apply { topMargin = Ui.dp(this@LauncherActivity, 8f) } })
         return c
     }
@@ -283,14 +325,14 @@ class LauncherActivity : Activity() {
             minLines = 4
             setTextColor(Ui.TEXT)
         }
-        AlertDialog.Builder(this).setTitle("Переменные окружения (ИМЯ=ЗНАЧЕНИЕ)").setView(e)
-            .setPositiveButton("Сохранить") { _, _ -> s.extraEnv = e.text.toString() }
-            .setNegativeButton("Отмена", null).show()
+        AlertDialog.Builder(this).setTitle(L.t("Переменные окружения (ИМЯ=ЗНАЧЕНИЕ)", "Environment variables (NAME=VALUE)")).setView(e)
+            .setPositiveButton(L.t("Сохранить", "Save")) { _, _ -> s.extraEnv = e.text.toString() }
+            .setNegativeButton(L.t("Отмена", "Cancel"), null).show()
     }
 
     private fun showLog() {
         val f = Settings.logFile(this)
-        val text = if (!f.exists()) "Журнала пока нет — запусти игру." else try {
+        val text = if (!f.exists()) L.t("Журнала пока нет — запусти игру.", "No log yet — start the game.") else try {
             RandomAccessFile(f, "r").use { r ->
                 val n = minOf(r.length(), 64L * 1024)
                 r.seek(r.length() - n)
@@ -309,18 +351,18 @@ class LauncherActivity : Activity() {
         }
         val sv = ScrollView(this).apply { addView(tv); post { fullScroll(ScrollView.FOCUS_DOWN) } }
         AlertDialog.Builder(this).setTitle(f.absolutePath).setView(sv)
-            .setPositiveButton("Скопировать") { _, _ ->
+            .setPositiveButton(L.t("Скопировать", "Copy")) { _, _ ->
                 (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("snx.log", text))
-            }.setNegativeButton("Закрыть", null).show()
+            }.setNegativeButton(L.t("Закрыть", "Close"), null).show()
     }
 
     // ---------------------------------------------------------------- запуск
     private fun play() {
         val err = GameFolder.check(s.gameDir)
         if (err != null) {
-            AlertDialog.Builder(this).setTitle("Игра не найдена").setMessage(err)
-                .setPositiveButton("Всё равно запустить") { _, _ -> launch() }
-                .setNegativeButton("Отмена", null).show()
+            AlertDialog.Builder(this).setTitle(L.t("Игра не найдена", "Game not found")).setMessage(err)
+                .setPositiveButton(L.t("Всё равно запустить", "Start anyway")) { _, _ -> launch() }
+                .setNegativeButton(L.t("Отмена", "Cancel"), null).show()
             return
         }
         launch()

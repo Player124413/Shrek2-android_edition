@@ -2,8 +2,9 @@
 # Без игры (push, PR или «Run workflow» с пустой ссылкой) — APK со всем кодом порта, лаунчером и редактором
 # управления, но без кода игры (SNX_NO_GAME): «Играть» сообщает, что игры в сборке нет.
 # С игрой — «Run workflow» со ссылкой на архив своей копии игры (или секрет SNX_GAME_SYSTEM_URL): код игры
-# генерируется рекомпилятором из её System (tools/fetch_game.sh). Такой APK содержит код, полученный из игры:
-# в публичном репозитории он выкладывается только зашифрованным zip (AES-256) с паролем из поля запуска.
+# генерируется рекомпилятором из её System (tools/fetch_game.sh).
+# Артефакт — сам APK (без zip), подписанный постоянным ключом (android/shreknx-release.jks.b64): новая сборка
+# ставится поверх старой без удаления; versionCode — число коммитов (нужен полный клон).
 name: Android APK
 
 on:
@@ -33,10 +34,6 @@ on:
         type: choice
         options: [eng, rus]
         default: eng
-      apk_password:
-        description: 'Пароль zip с APK (обязателен в публичном репозитории, от 8 символов)'
-        type: string
-        default: ''
 
 permissions:
   contents: read
@@ -63,31 +60,23 @@ jobs:
     env:
       NDK_VERSION: 27.2.12479018
     steps:
-      # ссылку и пароль читаем из события, а не через ${{ inputs.* }}: иначе они попадут в текст шага в логе
+      # ссылку читаем из события, а не через ${{ inputs.* }}: иначе она попадёт в текст шага в логе
       - name: Режим сборки
         id: mode
         env:
           SECRET_URL: ${{ secrets.SNX_GAME_SYSTEM_URL }}
-          PRIVATE: ${{ github.event.repository.private }}
         run: |
           ev() { jq -r ".inputs.$1 // \"\"" "$GITHUB_EVENT_PATH"; }
           URL=$(ev game_url | tr -d '[:space:]')
-          PW=$(ev apk_password)
           VARIANT=$(ev variant)
           [ -n "$URL" ] || URL="$SECRET_URL"
           [ -n "$URL" ] && echo "::add-mask::$URL"
-          [ -n "$PW" ] && echo "::add-mask::$PW"
           [ "$VARIANT" = rus ] || VARIANT=eng
           GAME=0
           if [ -n "$URL" ]; then
             GAME=1
-            if [ "$PRIVATE" != true ] && [ ${#PW} -lt 8 ]; then
-              echo "::error::Репозиторий публичный: для APK с игрой задайте пароль zip (от 8 символов) — без него артефакт был бы доступен всем"
-              exit 1
-            fi
             printf %s "$URL" > "$RUNNER_TEMP/game_url"
           fi
-          [ -n "$PW" ] && printf %s "$PW" > "$RUNNER_TEMP/apk_password"
           if [ "$VARIANT" = rus ]; then PLAT=android-rus; else PLAT=android; fi
           {
             echo "game=$GAME"
@@ -100,6 +89,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          fetch-depth: 0  # versionCode = число коммитов
 
       - uses: actions/setup-java@v6
         with:
@@ -183,7 +173,12 @@ jobs:
             grep -q " $f\$" "$RUNNER_TEMP/apk.txt" || { echo "::error::в APK нет $f"; cat "$RUNNER_TEMP/apk.txt"; exit 1; }
           done
           BT="$ANDROID_HOME/build-tools/35.0.0"
-          "$BT/apksigner" verify --print-certs "$APK" | head -3
+          "$BT/apksigner" verify --print-certs "$APK" > "$RUNNER_TEMP/cert.txt"
+          head -3 "$RUNNER_TEMP/cert.txt"
+          # постоянный ключ репозитория (android/shreknx-release.jks.b64): иначе обновление не встанет поверх
+          D=$(sed -n 's/.*certificate SHA-256 digest: //p' "$RUNNER_TEMP/cert.txt" | head -1)
+          [ "$D" = 90071132e1f6152373649029ee9c3f41cf5feba67132318a3186e0ff4f491a2f ] \
+            || { echo "::error::APK подписан не ключом android/shreknx-release.jks.b64 ($D)"; exit 1; }
           # libmain.so: JNI экранного управления и SDL_main на месте, выравнивание 16 КБ, ролики (FFmpeg)
           TC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
           unzip -o -q "$APK" lib/arm64-v8a/libmain.so -d "$RUNNER_TEMP/apk"
@@ -212,36 +207,26 @@ jobs:
           echo "::notice title=APK::$(sed -e 's/%/%25/g' "$RUNNER_TEMP/summary.txt" | awk 'BEGIN{ORS="%0A"} {print}')"
           cat "$RUNNER_TEMP/summary.txt" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Упаковка APK
+      - name: Имя файла
         id: pack
         env:
           APK: ${{ steps.mode.outputs.apk }}
           GAME: ${{ steps.mode.outputs.game }}
           VARIANT: ${{ steps.mode.outputs.variant }}
         run: |
-          if [ "$GAME" = 1 ] && [ -f "$RUNNER_TEMP/apk_password" ]; then
-            # zip AES-256: открывают 7-Zip, ZArchiver, RAR и т. п. (стандартный распаковщик Windows — нет)
-            OUT="build/shrekNX-$VARIANT-apk.zip"
-            (cd build && 7z a -tzip -mem=AES256 -p"$(cat "$RUNNER_TEMP/apk_password")" "$(basename "$OUT")" "$(basename "$APK")" >/dev/null)
-            rm -f "$RUNNER_TEMP/apk_password"
-            7z l -slt "$OUT" | grep -E "^(Path|Encrypted|Method)" | head -3
-            echo "name=shrekNX-android-$VARIANT-encrypted" >> "$GITHUB_OUTPUT"
-            echo "days=3" >> "$GITHUB_OUTPUT"
-          elif [ "$GAME" = 1 ]; then
-            OUT="$APK"
-            echo "name=shrekNX-android-$VARIANT" >> "$GITHUB_OUTPUT"
-            echo "days=3" >> "$GITHUB_OUTPUT"
-          else
-            OUT="$APK"
-            echo "name=shrekNX-android-nogame" >> "$GITHUB_OUTPUT"
-            echo "days=14" >> "$GITHUB_OUTPUT"
-          fi
-          echo "path=$OUT" >> "$GITHUB_OUTPUT"
+          VER=$("$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$APK" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")
+          if [ "$GAME" = 1 ]; then NAME="Shrek2-$VARIANT-$VER.apk"; DAYS=7; else NAME="shrekNX-nogame-$VARIANT-$VER.apk"; DAYS=14; fi
+          mkdir -p build/out
+          cp "$APK" "build/out/$NAME"
+          echo "path=build/out/$NAME" >> "$GITHUB_OUTPUT"
+          echo "days=$DAYS" >> "$GITHUB_OUTPUT"
+          echo "APK: **$NAME**" >> "$GITHUB_STEP_SUMMARY"
 
+      # archive: false — скачивается сам .apk, а не zip с ним (имя артефакта — имя файла)
       - name: Артефакт
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ steps.pack.outputs.name }}
           path: ${{ steps.pack.outputs.path }}
+          archive: false
           retention-days: ${{ steps.pack.outputs.days }}
           if-no-files-found: error
