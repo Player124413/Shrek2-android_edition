@@ -4,6 +4,7 @@ pluginManagement {
     repositories {
         google()
         mavenCentral()
+        maven { url 'https://maven-central.storage-download.googleapis.com/maven2/' }  // зеркало Maven Central
         gradlePluginPortal()
     }
 }
@@ -12,6 +13,7 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        maven { url 'https://maven-central.storage-download.googleapis.com/maven2/' }  // зеркало Maven Central
     }
 }
 rootProject.name = "shrekNX"
