@@ -210,7 +210,7 @@ EXCEPTION_RECORD/CONTEXT на стеке гостя и зовёт цепочку
 
 ```sh
 tools/build.sh mac|mac-rus|switch|switch-rus|switch-pgo [цели]   # каталог build/<вариант>
-tools/android_deps.sh [--ffmpeg] && tools/build.sh android|android-rus   # APK, docs/ANDROID.md
+tools/android_deps.sh [--ffmpeg] && tools/build.sh android|android-rus   # APK, docs/ANDROID.md (CI: android.yml)
 tools/.venv/bin/python -I recomp/main.py discover --game game/System [модули]
 tools/.venv/bin/python -I recomp/main.py gen --game game/System --out build/gen [модули]
 build/mac/host/boot/snx_boot [--game game] [--user DIR] [--dlls-only] [--headless] [--seconds N] [-- карта]
@@ -314,8 +314,8 @@ FDIV, `fnstenv/fldenv` (не реализованы), `_j0/_j1/_jn` на кра�
   нативное чтение `FArchive`, старт игры. Выбирай по свежему профилю.
 * D3D8: недостающие методы (выше); проверить тени в катсцене полёта Осла после исправления полупикселя.
 * 2D-интерфейс растянут в 16:9.
-* **Android (не проверен ни разу):** C проверен только синтаксически (zig cc, musl, заголовки Khronos);
-  CMake-ветка `cmake/android.cmake`, Gradle и Kotlin не собирались. Сначала — сборка и запуск на телефоне, затем
+* **Android (на устройстве не запускался):** APK без игры собирается в CI (`.github/workflows/android.yml`,
+  `SNX_NO_GAME`); с игрой и на телефоне не проверен. Сначала — запуск на телефоне, затем
   прослойка ES (`gles_shim.c`: смещение LOD, чтение DXT и глубины, `glCompressedTexSubImage2D`), кольцевой
   буфер для `STREAM`-вершин, замер на слабом телефоне.
 * Не проверены: загрузка сейвов, переходы между уровнями (`3_The_Hunt_Part4`), окно фатальной ошибки на Switch,
