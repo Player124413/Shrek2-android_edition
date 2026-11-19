@@ -2,6 +2,7 @@ package com.shreknx.game
 
 import android.Manifest
 import android.app.Activity
+import android.app.ActivityManager
 import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -12,6 +13,10 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.os.Process
+import android.os.SystemClock
 import android.provider.Settings as SysSettings
 import android.text.InputType
 import android.text.method.LinkMovementMethod
@@ -370,7 +375,24 @@ class LauncherActivity : Activity() {
 
     private fun launch() {
         stale = true
-        startActivity(Intent(this, GameActivity::class.java).putExtra(GameActivity.EXTRA_ARGS, s.gameArgs()))
+        // Лаунчер виден — значит, игры поверх него нет (она в той же задаче). Живой процесс :game тогда — остаток
+        // прошлого запуска (завис на выходе): новая игра попала бы в него и не отвечала бы на касания. Завершить
+        // и дождаться, пока система его отпустит (до 2 с), затем — запуск с чистого листа.
+        val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        fun gamePid(): Int? = am.runningAppProcesses
+            ?.firstOrNull { it.processName == "$packageName:game" && it.pid != Process.myPid() }?.pid
+        val start = { startActivity(Intent(this, GameActivity::class.java).putExtra(GameActivity.EXTRA_ARGS, s.gameArgs())) }
+        val pid = gamePid() ?: return start()
+        Process.killProcess(pid)
+        val h = Handler(Looper.getMainLooper())
+        val t0 = SystemClock.uptimeMillis()
+        h.post(object : Runnable {
+            override fun run() {
+                if (gamePid() == null || SystemClock.uptimeMillis() - t0 > 2000) {
+                    h.postDelayed({ start() }, 150)
+                } else h.postDelayed(this, 50)
+            }
+        })
     }
 
     private fun toastDialog(msg: String) {

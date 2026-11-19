@@ -1,8 +1,11 @@
 // Android: JNI для лаунчера (android/app/src/main/java/com/shreknx/game/SnxNative.kt) — экранное управление
 // (host/boot/touch.h) и состояние игры. Методы зовёт поток UI Android; touch_* — потокобезопасны.
 #include <jni.h>
+#include <stdio.h>
+#include <unistd.h>
 
 #include "host/boot/touch.h"
+#include "runtime/hle/hle.h"
 
 #define JNI_FN(name) Java_com_shreknx_game_SnxNative_##name
 
@@ -25,6 +28,17 @@ JNIEXPORT void JNICALL JNI_FN(key)(JNIEnv *env, jclass cls, jint vk, jboolean do
     (void)env;
     (void)cls;
     touch_key(vk, down ? 1 : 0);
+}
+
+// Выход из игры кнопкой «Назад» (лаунчер спросил подтверждение): записанное гостем — на диск, процесс — сразу.
+// Без этого SDLActivity.onDestroy ждал бы конца потока SDL (игра на SDL_QUIT может не выйти — зависание UI).
+JNIEXPORT void JNICALL JNI_FN(exitNow)(JNIEnv *env, jclass cls)
+{
+    (void)env;
+    (void)cls;
+    hle_file_flush_all();
+    fflush(NULL);
+    _exit(0);
 }
 
 JNIEXPORT jint JNICALL JNI_FN(state)(JNIEnv *env, jclass cls)

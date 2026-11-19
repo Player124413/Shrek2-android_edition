@@ -403,6 +403,16 @@ static void exit_process(void)
     fflush(NULL);
     svcExitProcess();
 }
+#elif defined(__ANDROID__)
+// Android — то же: обычный exit() зовёт деструкторы libmain/OpenAL/SDL, пока поток рендера, звук и потоки гостя
+// ещё работают, — падение или зависание. Зависший процесс :game оставался жить, и следующий запуск из лаунчера
+// попадал в него: картинка есть, а касания и игра молчат. Файлы гостя к этому времени сброшены
+// (hle_file_flush_all — обработчик atexit, поставленный позже этого, идёт раньше).
+static void exit_process(void)
+{
+    fflush(NULL);
+    _exit(0);
+}
 #endif
 
 static void *boot(void *arg)
@@ -569,6 +579,7 @@ int main(int argc, char **argv)
     if (g_res_w < 0 && !g_headless)
         plat_screen_size(&g_res_w, &g_res_h);
 #elif defined(__ANDROID__)
+    atexit(exit_process);  // после SDL: обработчики atexit идут в обратном порядке, этот — первым
     // по умолчанию — экран телефона с масштабом SNX_RENDER_SCALE (лаунчер: «Качество картинки»); кадр
     // растягивается на экран при показе. Чётные размеры, не меньше 640x360
     if (g_res_w < 0 && !g_headless) {

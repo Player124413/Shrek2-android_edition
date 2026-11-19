@@ -1,5 +1,6 @@
 package com.shreknx.game
 
+import android.app.AlertDialog
 import android.content.Context
 import android.hardware.input.InputManager
 import android.os.Build
@@ -56,16 +57,34 @@ class GameActivity : SDLActivity(), InputManager.InputDeviceListener {
 
     override fun onDestroy() {
         inputManager?.unregisterInputDeviceListener(this)
-        val finishing = isFinishing
-        super.onDestroy()
         // libmain.so не умеет запускаться второй раз в том же процессе (окно гостя, глобальные состояния):
-        // процесс :game завершается вместе с игрой, следующий запуск — с чистого листа
-        if (finishing) Process.killProcess(Process.myPid())
+        // процесс :game завершается вместе с игрой, следующий запуск — с чистого листа. Сразу, до
+        // SDLActivity.onDestroy: тот ждёт конца потока SDL без срока, а игра на SDL_QUIT может и не выйти
+        if (isFinishing) quitNow()
+        super.onDestroy()
+    }
+
+    private fun quitNow() {
+        try {
+            SnxNative.exitNow()  // сбросить записанное игрой (сохранения, User.ini) и выйти
+        } catch (e: UnsatisfiedLinkError) {
+        }
+        Process.killProcess(Process.myPid())
     }
 
     override fun onPause() {
         touch?.releaseAll()
         super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // возврат из фона: пальцы, бывшие на экране, забыты; опрос состояния игры — заново (мог остановиться)
+        touch?.let {
+            it.releaseAll()
+            it.removeCallbacks(poll)
+            it.post(poll)
+        }
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -105,8 +124,16 @@ class GameActivity : SDLActivity(), InputManager.InputDeviceListener {
             touch?.visibility = View.VISIBLE
             return
         }
-        @Suppress("DEPRECATION")
-        super.onBackPressed()
+        // «Назад» не закрывает игру молча (несохранённое пропало бы): спросить
+        touch?.releaseAll()
+        AlertDialog.Builder(this)
+            .setTitle(L.t("Выйти из игры?", "Quit the game?"))
+            .setMessage(L.t("Несохранённый прогресс пропадёт. Меню игры — кнопка «Меню».",
+                "Unsaved progress will be lost. The game menu is the “Menu” button."))
+            .setPositiveButton(L.t("Выйти", "Quit")) { _, _ -> quitNow() }
+            .setNegativeButton(L.t("Отмена", "Cancel"), null)
+            .setOnDismissListener { immersive() }
+            .show()
     }
 
     // ---------------------------------------------------------------- геймпад: экранное управление прячется

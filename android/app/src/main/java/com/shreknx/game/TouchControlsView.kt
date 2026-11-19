@@ -341,6 +341,15 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
             // центр стоит на месте (и у плавающего — там, где коснулись): палец за краем — просто полный наклон
             dx /= m; dy /= m
         }
+        // Прилипание к осям: палец на стекле не ведёт ровно вбок, и при «влево» шла ещё и составляющая
+        // «вперёд/назад» — на карнизе Шрек вместо перебирания руками лез вверх или срывался, при ходьбе вбок —
+        // уходил по диагонали. В пределах SNAP_DEG от оси — строго по оси (с той же силой); между — диагональ.
+        if (dx != 0f || dy != 0f) {
+            val ang = Math.toDegrees(atan2(abs(dy).toDouble(), abs(dx).toDouble()))  // 0 — вбок, 90 — вверх/вниз
+            val mag = min(1f, hypot(dx, dy))
+            if (ang < SNAP_DEG) { dx = if (dx < 0) -mag else mag; dy = 0f }
+            else if (ang > 90 - SNAP_DEG) { dy = if (dy < 0) -mag else mag; dx = 0f }
+        }
         st.vx = dx
         st.vy = dy
         invalidate()
@@ -492,5 +501,6 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
     companion object {
         private val ALL_KINDS = setOf(Kind.BUTTON, Kind.STICK, Kind.DPAD)
         private val BUTTONS = setOf(Kind.BUTTON)
+        private const val SNAP_DEG = 25.0  // стик: ближе к оси — строго по оси
     }
 }
