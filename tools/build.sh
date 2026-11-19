@@ -24,8 +24,8 @@ if [ "$PLAT" = android ] || [ "$PLAT" = android-rus ]; then
   FLAVOR=Eng
   [ "$VARIANT" = rus ] && FLAVOR=Rus
   [ -d "$ROOT/build/android-deps/SDL" ] || sh "$ROOT/tools/android_deps.sh"
-  GRADLE=$(command -v gradle || true)
-  if [ -z "$GRADLE" ]; then  # gradle-wrapper.jar в репозитории нет: дистрибутив из gradle-wrapper.properties
+  GRADLE=${SNX_GRADLE:-}  # свой gradle; по умолчанию — версия из gradle-wrapper.properties (с AGP 8.7 проверена она)
+  if [ -z "$GRADLE" ]; then  # gradle-wrapper.jar в репозитории нет: дистрибутив скачивается в build/gradle
     URL=$(sed -n 's/^distributionUrl=//p' "$ROOT/android/gradle/wrapper/gradle-wrapper.properties" | sed 's/\\:/:/')
     NAME=$(basename "$URL" -bin.zip)
     if [ ! -x "$ROOT/build/gradle/$NAME/bin/gradle" ]; then
