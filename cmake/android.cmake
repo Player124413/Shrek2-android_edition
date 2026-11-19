@@ -43,11 +43,11 @@ set(ALSOFT_INSTALL OFF CACHE BOOL "" FORCE)
 set(ALSOFT_INSTALL_CONFIG OFF CACHE BOOL "" FORCE)
 set(ALSOFT_INSTALL_HRTF_DATA OFF CACHE BOOL "" FORCE)
 set(ALSOFT_INSTALL_AMBDEC_PRESETS OFF CACHE BOOL "" FORCE)
-set(ALSOFT_EMBED_HRTF_DATA ON CACHE BOOL "" FORCE)  # 160 КБ; OFF в 1.25.2 ломает CMake 3.22 (пустой add_dependencies)
+set(ALSOFT_EMBED_HRTF_DATA ON CACHE BOOL "" FORCE)  # 160 КБ; при OFF в 1.25.2 — пустой add_dependencies
 set(ALSOFT_BACKEND_OBOE OFF CACHE BOOL "" FORCE)
 set(ALSOFT_BACKEND_OPENSL ON CACHE BOOL "" FORCE)
 set(ALSOFT_BACKEND_WAVE OFF CACHE BOOL "" FORCE)
-set(ALSOFT_ENABLE_MODULES OFF CACHE BOOL "" FORCE)  # модули C++20 — CMake 3.28+, у NDK — 3.22
+set(ALSOFT_ENABLE_MODULES OFF CACHE BOOL "" FORCE)  # модули C++20 не нужны (и требуют свежий Ninja)
 add_subdirectory("${deps}/openal-soft" "${CMAKE_BINARY_DIR}/deps/openal" EXCLUDE_FROM_ALL)
 
 # ---------------------------------------------------------------- ogg + vorbis + vorbisfile (своим списком файлов)

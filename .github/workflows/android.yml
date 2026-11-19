@@ -46,11 +46,11 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Android SDK (NDK 27, CMake 3.22.1, API 35)
+      - name: Android SDK (NDK 27, CMake 3.31.6, API 35)
         run: |
           SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           yes | "$SDKM" --licenses >/dev/null || true
-          "$SDKM" --install "platforms;android-35" "build-tools;35.0.0" "ndk;$NDK_VERSION" "cmake;3.22.1" >/dev/null
+          "$SDKM" --install "platforms;android-35" "build-tools;35.0.0" "ndk;$NDK_VERSION" "cmake;3.31.6" >/dev/null
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
 
       - name: Кэш библиотек (SDL2, OpenAL, ogg/vorbis, FreeType, FFmpeg)

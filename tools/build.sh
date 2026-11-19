@@ -3,7 +3,7 @@
 # -rus — русская версия (SNX_VARIANT=rus: код из build/gen-rus, каталог сборки build/<платформа>-rus).
 # switch-pgo — Switch со счётчиками профиля (build/switch-pgo, SNX_PGO=gen). Switch собирается по профилю из
 # build/pgo, если он есть (AGENTS.md, «PGO»; SNX_PGO= — без него): новый профиль (tools/pgo_fetch.py) — с нуля.
-# android — APK через Gradle (docs/ANDROID.md): нужны ANDROID_HOME (SDK с NDK 27 и CMake 3.22.1), JDK 17 и
+# android — APK через Gradle (docs/ANDROID.md): нужны ANDROID_HOME (SDK с NDK 27 и CMake 3.31.6), JDK 17 и
 # библиотеки из tools/android_deps.sh; результат — build/shrekNX-<eng|rus>.apk.
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)

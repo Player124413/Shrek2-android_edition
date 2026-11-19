@@ -14,10 +14,10 @@ Switch, поверх SDL2). **Статус: собрано и проверено
 
 * сгенерированные модули: `build/gen` (английская) или `build/gen-rus` (русская) — [BUILDING.md](BUILDING.md),
   «Подготовка своей игры» и «Русская версия». Генерировать можно на маке или в Linux;
-* JDK 17, Android SDK (`ANDROID_HOME`) с пакетами `platforms;android-35`, `ndk;27.2.12479018`, `cmake;3.22.1`:
+* JDK 17, Android SDK (`ANDROID_HOME`) с пакетами `platforms;android-35`, `ndk;27.2.12479018`, `cmake;3.31.6`:
 
 ```sh
-sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.31.6"
 ```
 
 Дальше, из корня репозитория:
