@@ -687,6 +687,43 @@ int touch_state(void) { return (g_touch_menu ? 1 : 0) | (g_touch_ready ? 2 : 0);
 // оси экранных стиков: поверх физического геймпада — тот, что отклонён сильнее
 static float g_touch_ax[4];
 
+// Диагностика ввода в лог (Android — всегда, иначе SNX_LOG_TOUCH=1): первые изменения экранного геймпада и касания
+// меню, раз в 10 с — сводка: идёт ли цикл ввода, окно с фокусом, меню, опросы DirectInput игрой. По ней видно,
+// где теряется ввод (жалоба «при втором запуске не работает управление»).
+static int log_touch(void)
+{
+    static int on = -1;
+    if (on < 0) {
+#ifdef __ANDROID__
+        on = 1;
+#else
+        on = getenv("SNX_LOG_TOUCH") != NULL;
+#endif
+    }
+    return on;
+}
+
+static unsigned g_diag_pad, g_diag_taps, g_diag_ticks;
+
+static void diag_tick(void)
+{
+    static u32 next;
+    g_diag_ticks++;
+    u32 now = SDL_GetTicks();
+    if (!log_touch() || (s32)(now - next) < 0)
+        return;
+    next = now + 10000;
+    unsigned st[4];
+    dinput8_stats(st);
+    int x = 0, y = 0;
+    int ready = d3d8_window_to_target(0.5f, 0.5f, &x, &y);
+    fprintf(stderr, "[touch] t=%us ticks=%u focus=%x menu=%d ready=%d center=%d,%d pad=%u taps=%u buttons=%x "
+                    "lx=%.2f ly=%.2f | dinput: mouse %u joy %u unacquired %u acquire %u\n",
+            now / 1000, g_diag_ticks, user32_focus(), g_menu, ready, x, y, g_diag_pad, g_diag_taps, g_touch_applied,
+            (double)g_touch_ax[0], (double)g_touch_ax[1], st[0], st[1], st[2], st[3]);
+}
+
+
 static void touch_tick(void)
 {
     u32 buttons;
@@ -694,6 +731,7 @@ static void touch_tick(void)
     int nkeys;
     short vks[32];
     char downs[32];
+    static float prev_ax[4];
     pthread_mutex_lock(&g_touch_lock);
     buttons = g_touch_buttons;
     memcpy(g_touch_ax, g_touch_axis, sizeof g_touch_ax);
@@ -710,6 +748,10 @@ static void touch_tick(void)
     int x, y;
     g_touch_ready = d3d8_window_to_target(0.5f, 0.5f, &x, &y);
     u32 diff = buttons ^ g_touch_applied;
+    if ((diff || memcmp(g_touch_ax, prev_ax, sizeof prev_ax)) && log_touch() && g_diag_pad++ < 12)
+        fprintf(stderr, "[touch] pad buttons=%x lx=%.2f ly=%.2f focus=%x menu=%d\n", buttons, (double)g_touch_ax[0],
+                (double)g_touch_ax[1], user32_focus(), g_menu);
+    memcpy(prev_ax, g_touch_ax, sizeof prev_ax);
     for (int b = 0; diff && b < PB_N; b++)
         if (diff & (1u << b))
             pad_button(b, (buttons >> b) & 1);
@@ -739,6 +781,7 @@ void input_tick(void)
 {
     scripted_keys();
     touch_tick();
+    diag_tick();
     static u64 last;
     static float fx, fy;  // дробные остатки смещения мыши
     u64 now = SDL_GetPerformanceCounter();
@@ -836,6 +879,12 @@ void input_event(const void *p)
     case SDL_FINGERDOWN:  // сенсорный экран (Switch в руках): в меню — курсор и щелчок, в игре — ничего
     case SDL_FINGERUP:
     case SDL_FINGERMOTION:
+        if (e->type == SDL_FINGERDOWN && log_touch() && g_diag_taps++ < 12) {
+            int x = 0, y = 0;
+            int ok = d3d8_window_to_target(e->tfinger.x, e->tfinger.y, &x, &y);
+            fprintf(stderr, "[touch] finger %.2f,%.2f -> %d,%d (%d) menu=%d focus=%x\n", (double)e->tfinger.x,
+                    (double)e->tfinger.y, x, y, ok, g_menu, user32_focus());
+        }
         if (!g_menu)
             break;
         if (e->type == SDL_FINGERDOWN)

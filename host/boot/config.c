@@ -543,6 +543,14 @@ void boot_config_apply(int res_w, int res_h)
     char user[1100], cur[256];
     vfs_for_write("System/User.ini", user, sizeof user, 1);
     copy_if_missing(user, "System/DefUser.ini");
+    {  // диагностика «второго запуска»: файлы, записанные игрой в прошлый раз (обрезанный ini — без привязок)
+        size_t ul = 0, gl = 0;
+        char *u = read_all(user, &ul), *g = read_all(ini, &gl);
+        fprintf(stderr, "[config] User.ini %zu bytes (Aliases %d, Joy1 %d), game.ini %zu bytes\n", ul,
+                u ? has_ci(u, "Aliases[") : -1, u ? has_ci(u, "Joy1=") : -1, gl);
+        free(u);
+        free(g);
+    }
     repair_bindings(user);
     for (size_t i = 0; i < sizeof g_joy_bindings / sizeof g_joy_bindings[0]; i++) {
         const char *k = g_joy_bindings[i][0];

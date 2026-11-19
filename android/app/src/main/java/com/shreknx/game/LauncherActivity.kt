@@ -358,7 +358,62 @@ class LauncherActivity : Activity() {
         AlertDialog.Builder(this).setTitle(f.absolutePath).setView(sv)
             .setPositiveButton(L.t("Скопировать", "Copy")) { _, _ ->
                 (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("snx.log", text))
-            }.setNegativeButton(L.t("Закрыть", "Close"), null).show()
+            }.setNeutralButton(L.t("Поделиться", "Share")) { _, _ -> shareLogs() }
+            .setNegativeButton(L.t("Закрыть", "Close"), null).show()
+    }
+
+    // Отчёт для разработчика: журнал последнего запуска и прошлого (начало и конец каждого) — текстом в любое
+    // приложение и файлом в «Загрузки» (папка Android/data файловым менеджерам на Android 11+ не видна)
+    private fun shareLogs() {
+        fun part(f: File): String {
+            if (!f.exists()) return "(нет файла)\n"
+            return try {
+                RandomAccessFile(f, "r").use { r ->
+                    val len = r.length()
+                    fun read(from: Long, n: Long): String {
+                        r.seek(from)
+                        val b = ByteArray(n.toInt())
+                        r.readFully(b)
+                        return String(b)
+                    }
+                    val head = 24L * 1024
+                    val tail = 40L * 1024
+                    if (len <= head + tail) read(0, len)
+                    else read(0, head) + "\n…\n" + read(len - tail, tail)
+                }
+            } catch (e: Exception) {
+                e.toString()
+            }
+        }
+        val log = Settings.logFile(this)
+        val report = "shrekNX ${BuildConfig.VERSION_NAME} (${Settings.variant()}), ${Build.MANUFACTURER} ${Build.MODEL}, " +
+            "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\n\n" +
+            "===== snx.log (последний запуск) =====\n" + part(log) +
+            "\n\n===== snx.log.old (запуск перед ним) =====\n" + part(File(log.path + ".old"))
+        var saved = ""
+        if (Build.VERSION.SDK_INT >= 29) {
+            try {
+                val v = android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, "shrekNX-log-${System.currentTimeMillis() / 1000}.txt")
+                    put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                    put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                }
+                contentResolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, v)?.let { uri ->
+                    contentResolver.openOutputStream(uri)?.use { it.write(report.toByteArray()) }
+                    saved = L.t("Файл сохранён в «Загрузки».", "The file is saved to Downloads.")
+                }
+            } catch (e: Exception) {
+            }
+        }
+        val send = Intent(Intent.ACTION_SEND).setType("text/plain")
+            .putExtra(Intent.EXTRA_SUBJECT, "shrekNX log")
+            .putExtra(Intent.EXTRA_TEXT, report)
+        try {
+            startActivity(Intent.createChooser(send, L.t("Отправить журнал", "Send the log")))
+        } catch (e: Exception) {
+            if (saved.isNotEmpty()) toastDialog(saved)
+        }
+        if (saved.isNotEmpty()) android.widget.Toast.makeText(this, saved, android.widget.Toast.LENGTH_LONG).show()
     }
 
     // ---------------------------------------------------------------- запуск

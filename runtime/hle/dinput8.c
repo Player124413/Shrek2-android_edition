@@ -122,9 +122,21 @@ static void dev_GetCapabilities(CPU *c)
 static void dev_GetProperty(CPU *c) { RET(3, DIERR_INVALIDPARAM); }
 static void dev_SetProperty(CPU *c) { RET(3, DI_OK); }  // DIPROP_BUFFERSIZE, DIPROP_AXISMODE, …
 
+// счётчики для диагностики ввода (dinput8_stats): опросы мыши и джойстика, из них без захвата; захваты
+static _Atomic unsigned g_st_mouse, g_st_joy, g_st_unacq, g_st_acq;
+
+void dinput8_stats(unsigned out[4])
+{
+    out[0] = g_st_mouse;
+    out[1] = g_st_joy;
+    out[2] = g_st_unacq;
+    out[3] = g_st_acq;
+}
+
 static void dev_Acquire(CPU *c)
 {
     didev *d = DEV(c);
+    g_st_acq++;
     if (d)
         d->acquired = 1;
     RET(1, DI_OK);
@@ -144,6 +156,12 @@ static void dev_GetDeviceState(CPU *c)
     didev *d = DEV(c);
     u32 cb = ARG(1), p = ARG(2);
     memset(g_mem + p, 0, cb);
+    if (d && d->kind == DEV_MOUSE)
+        g_st_mouse++;
+    else if (d && d->kind == DEV_JOY)
+        g_st_joy++;
+    if (d && !d->acquired)
+        g_st_unacq++;
     if (d && d->kind == DEV_MOUSE && cb >= 16) {
         pthread_mutex_lock(&g_in_lock);
         wr32(g_mem, p, (u32)g_dx);
