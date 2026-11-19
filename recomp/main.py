@@ -59,7 +59,7 @@ def cmd_gen(args):
         if only and name not in only:
             continue
         write_module(ctx, mod, args.out)
-    write_hle_stubs(ctx, args.out)
+    write_hle_stubs(ctx, args.out, partial=only is not None)
 
 
 def main():

@@ -105,10 +105,12 @@ int vfs_rel(const char *in, char *rel, size_t cap)
 // Листинги каталогов хоста: на Switch каждый stat/opendir/readdir — запрос к файловому сервису, а поиск без учёта
 // регистра шёл на каждый CreateFile (≈2 % потока гостя). Каталог игры не меняется; листинги оверлея
 // сбрасываются при любом изменении в нём (vfs_changed).
+// Тип записи берётся из readdir (d_type; devkitA64 newlib заполняет его из st_mode fsdev): на Switch stat — это
+// пять-шесть запросов к сервисам (тип, метка времени с переводом через сервис времени, открытие, размер, закрытие).
 typedef struct dcache {
     struct dcache *next;
     char *path;   // каталог хоста
-    char *names;  // имена подряд через '\0'; NULL — каталога нет
+    char *names;  // записи подряд: тип ('d', 'f', '?' — неизвестен) и имя с '\0'; NULL — каталога нет
     size_t len;
 } dcache;
 #define DC_BUCKETS 1024
@@ -134,23 +136,24 @@ static dcache *dc_load(const char *path)
     e->names = malloc(capb);
     struct dirent *de;
     while ((de = readdir(d))) {
-        size_t l = strlen(de->d_name) + 1;
+        size_t l = strlen(de->d_name) + 2;
         if (e->len + l > capb) {
             capb = (e->len + l) * 2;
             e->names = realloc(e->names, capb);
         }
-        memcpy(e->names + e->len, de->d_name, l);
+        e->names[e->len] = de->d_type == DT_DIR ? 'd' : de->d_type == DT_REG ? 'f' : '?';
+        memcpy(e->names + e->len + 1, de->d_name, l - 1);
         e->len += l;
     }
     closedir(d);
     return e;
 }
 
-// имя в каталоге dir без учёта регистра -> настоящее имя в out; 0 — нет такого (или каталога)
-static int dc_lookup(const char *dir, const char *name, char *out, size_t cap)
+// имя в каталоге dir без учёта регистра -> настоящее имя в out и тип ('d', 'f', '?'); 0 — нет такого (или каталога)
+static char dc_lookup(const char *dir, const char *name, char *out, size_t cap)
 {
     uint32_t b = dc_hash(dir) % DC_BUCKETS;
-    int found = 0;
+    char found = 0;
     pthread_mutex_lock(&g_dc_lock);
     dcache *e = g_dc[b];
     while (e && strcmp(e->path, dir))
@@ -160,18 +163,23 @@ static int dc_lookup(const char *dir, const char *name, char *out, size_t cap)
         e->next = g_dc[b];
         g_dc[b] = e;
     }
-    for (size_t o = 0; e->names && o < e->len; o += strlen(e->names + o) + 1)
-        if (!strcasecmp(e->names + o, name)) {
-            snprintf(out, cap, "%s", e->names + o);
-            found = 1;
+    for (size_t o = 0; e->names && o < e->len; o += strlen(e->names + o + 1) + 2)
+        if (!strcasecmp(e->names + o + 1, name)) {
+            snprintf(out, cap, "%s", e->names + o + 1);
+            found = e->names[o];
             break;
         }
     pthread_mutex_unlock(&g_dc_lock);
     return found;
 }
 
+static uint32_t g_gen;  // vfs_changed
+
+uint32_t vfs_generation(void) { return __atomic_load_n(&g_gen, __ATOMIC_ACQUIRE); }
+
 void vfs_changed(void)
 {
+    __atomic_add_fetch(&g_gen, 1, __ATOMIC_RELEASE);
     size_t ul = strlen(g_user);
     pthread_mutex_lock(&g_dc_lock);
     for (int b = 0; b < DC_BUCKETS; b++)
@@ -189,18 +197,20 @@ void vfs_changed(void)
 }
 
 // Сопоставить rel под root без учёта регистра. Возвращает число разрешённых компонентов; out — путь хоста
-// (неразрешённый хвост дописан как есть). *complete = 1, если разрешён весь путь.
-static int resolve_ci(const char *root, const char *rel, char *out, size_t cap, int *complete)
+// (неразрешённый хвост дописан как есть). *complete = 1, если разрешён весь путь; *kind — тип последнего
+// компонента ('d', 'f', '?'), если разрешён весь путь.
+static int resolve_ci(const char *root, const char *rel, char *out, size_t cap, int *complete, char *kind)
 {
     size_t o = (size_t)snprintf(out, cap, "%s", root);
     const char *s = rel;
     int ok = 1;
+    char k = 'd';  // пустой rel — сам корень
     while (*s) {
         const char *e = strchr(s, '/');
         size_t l = e ? (size_t)(e - s) : strlen(s);
         char name[260];
         snprintf(name, sizeof name, "%.*s", (int)l, s);
-        if (!ok || !dc_lookup(out, name, name, sizeof name))
+        if (!ok || !(k = dc_lookup(out, name, name, sizeof name)))
             ok = 0;
         o += (size_t)snprintf(out + o, o < cap ? cap - o : 0, "/%s", name);
         s += l;
@@ -208,21 +218,25 @@ static int resolve_ci(const char *root, const char *rel, char *out, size_t cap, 
             s++;
     }
     *complete = ok;
+    if (kind)
+        *kind = ok ? k : 0;
     return ok;
 }
 
-int vfs_find(const char *rel, char *host, size_t cap)
+int vfs_find_kind(const char *rel, char *host, size_t cap, char *kind)
 {
     int complete;
-    if (resolve_ci(g_user, rel, host, cap, &complete) && complete)
+    if (resolve_ci(g_user, rel, host, cap, &complete, kind) && complete)
         return 1;
-    return resolve_ci(g_game, rel, host, cap, &complete) && complete;
+    return resolve_ci(g_game, rel, host, cap, &complete, kind) && complete;
 }
+
+int vfs_find(const char *rel, char *host, size_t cap) { return vfs_find_kind(rel, host, cap, NULL); }
 
 int vfs_find_game(const char *rel, char *host, size_t cap)
 {
     int complete;
-    return resolve_ci(g_game, rel, host, cap, &complete) && complete;
+    return resolve_ci(g_game, rel, host, cap, &complete, NULL) && complete;
 }
 
 static int mkdirs(const char *path)  // каталоги на пути к файлу
@@ -261,11 +275,11 @@ static int copy_file(const char *from, const char *to)
 int vfs_for_write(const char *rel, char *host, size_t cap, int copy_existing)
 {
     int complete;
-    resolve_ci(g_user, rel, host, cap, &complete);
+    resolve_ci(g_user, rel, host, cap, &complete, NULL);
     int r = mkdirs(host) == 0;
     if (r && copy_existing && !complete) {
         char src[1100];
-        if (resolve_ci(g_game, rel, src, sizeof src, &complete) && complete) {
+        if (resolve_ci(g_game, rel, src, sizeof src, &complete, NULL) && complete) {
             struct stat st;
             if (stat(src, &st) == 0 && S_ISREG(st.st_mode))
                 copy_file(src, host);
@@ -320,7 +334,7 @@ int vfs_list(const char *rel_dir, char **names)
     n = add_unique(&buf, &len, &capb, n, "..");
     for (int r = 0; r < 2; r++) {
         int complete;
-        if (!resolve_ci(roots[r], rel_dir, host, sizeof host, &complete) || !complete)
+        if (!resolve_ci(roots[r], rel_dir, host, sizeof host, &complete, NULL) || !complete)
             continue;
         DIR *d = opendir(host);
         if (!d)

@@ -355,8 +355,19 @@ def write_module(ctx, mod, outdir, log=print):
     return stem, files
 
 
-def write_hle_stubs(ctx, outdir):
+_STUB_RE = re.compile(r'^__attribute__\(\(weak\)\) void (\w+)\(CPU \*c\) \{ rt_hle_missing\(c, "([^"]*)", "([^"]*)"\); \}$')
+
+
+def write_hle_stubs(ctx, outdir, partial=False):
+    """partial — сгенерированы не все модули: заглушки остальных (из прежнего файла) остаются"""
+    path = os.path.join(outdir, "hle_stubs.c")
+    used = dict(ctx.hle_used)
+    if partial and os.path.exists(path):
+        for ln in open(path, encoding="utf-8"):
+            m = _STUB_RE.match(ln.rstrip("\n"))
+            if m:
+                used.setdefault(m.group(1), (m.group(2), m.group(3)))
     lines = ["/* Слабые заглушки для HLE-импортов, у которых ещё нет реализации. */", '#include "runtime/gen_rt.h"', ""]
-    for sym, (dll, name) in sorted(ctx.hle_used.items()):
+    for sym, (dll, name) in sorted(used.items()):
         lines.append(f'__attribute__((weak)) void {sym}(CPU *c) {{ rt_hle_missing(c, "{dll}", "{name}"); }}')
-    write_if_changed(os.path.join(outdir, "hle_stubs.c"), "\n".join(lines) + "\n")
+    write_if_changed(path, "\n".join(lines) + "\n")

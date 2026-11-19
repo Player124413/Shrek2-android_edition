@@ -208,6 +208,44 @@ static void err_test(void)
     rt_guest_call(c, rd32(g_mem, rd32(g_mem, gerr)), 2, args);  // не возвращается: исключение C++ гостя
 }
 
+// SNX_CFG_TEST=<с>[,<n>[,<мс>]]: через столько секунд n раз (20) с паузой <мс> (250; 0 — все подряд в одном кадре) то
+// же, что подбор монеты на бонусном уровне (SHGame Coin.AnnouncePickup на картах BEANSTALK*): bonuscoins контроллера
+// героя +1 и его SaveConfig. Время каждого — строкой [core] SaveConfig из runtime/overrides_core.c. Подряд каждый
+// следующий ждёт фоновую запись User.ini предыдущего (строка [file] waited). Нужен уровень с героем.
+static u64 g_cfg_test_ns, g_cfg_test_gap_ns = 250000000;
+static int g_cfg_test_n = 20;
+static u32 g_cfg_test_obj, g_cfg_test_save, g_cfg_test_coins;  // контроллер героя, SaveConfig, смещение bonuscoins
+
+static void cfg_test(void)
+{
+    GuestThread *t = rt_thread_current();
+    if (!g_cfg_test_obj) {
+        rt_module *core = rt_module_by_name("Core");
+        u32 obj = 0, save = core ? rt_module_export(core, "?SaveConfig@UObject@@QAEXKPBG@Z", 0) : 0;
+        for (u32 i = 0, n = uo_init() ? uo_count() : 0; i < n && !obj; i++)
+            if (uo_is_a(uo_at(i), "ShHeroController"))
+                obj = uo_at(i);
+        uo_prop coins;
+        if (!t || !save || !obj || !uo_find_prop(uo_class(obj), "bonuscoins", &coins)) {
+            fprintf(stderr, "[boot] SNX_CFG_TEST: no hero controller\n");
+            g_cfg_test_ns = 0;
+            return;
+        }
+        g_cfg_test_obj = obj, g_cfg_test_save = save, g_cfg_test_coins = coins.offset;
+    }
+    u32 at = g_cfg_test_obj + g_cfg_test_coins;
+    do {
+        CPU *c = &t->cpu, saved = *c;
+        wr32(g_mem, at, rd32(g_mem, at) + 1);
+        u32 args[2] = {0x4000 /* CPF_Config */, 0};
+        c->esp -= 64;
+        c->ecx = g_cfg_test_obj;
+        rt_guest_call(c, g_cfg_test_save, 2, args);
+        *c = saved;
+    } while (--g_cfg_test_n > 0 && !g_cfg_test_gap_ns);
+    g_cfg_test_ns = g_cfg_test_n > 0 ? rt_ticks_ns() + g_cfg_test_gap_ns : 0;
+}
+
 // --seconds и SNX_EH_TEST: проверяются в цикле сообщений гостя (PeekMessage/GetMessage)
 static u64 g_uo_dump_ns;  // SNX_UO_DUMP=<с>: разведка объектов гостя (runtime/game/uobj.h)
 
@@ -221,6 +259,8 @@ static void deadline_check(void)
         g_err_test_ns = 0;
         err_test();
     }
+    if (g_cfg_test_ns && rt_ticks_ns() >= g_cfg_test_ns)
+        cfg_test();  // ставит время следующего подбора
     if (g_uo_dump_ns && rt_ticks_ns() >= g_uo_dump_ns) {
         g_uo_dump_ns = 0;
         uo_explore();
@@ -482,8 +522,18 @@ int main(int argc, char **argv)
         g_uo_dump_ns = rt_ticks_ns() + (u64)(atof(getenv("SNX_UO_DUMP")) * 1e9);
     if (getenv("SNX_ERR_TEST"))
         g_err_test_ns = rt_ticks_ns() + (u64)(atof(getenv("SNX_ERR_TEST")) * 1e9);
-    if (g_deadline_ns || g_eh_test_ns || g_uo_dump_ns || g_err_test_ns)
+    if (getenv("SNX_CFG_TEST")) {
+        const char *n = strchr(getenv("SNX_CFG_TEST"), ',');
+        g_cfg_test_ns = rt_ticks_ns() + (u64)(atof(getenv("SNX_CFG_TEST")) * 1e9);
+        if (n && atoi(n + 1) > 0)
+            g_cfg_test_n = atoi(n + 1);
+        const char *gap = n ? strchr(n + 1, ',') : NULL;
+        if (gap && atof(gap + 1) >= 0)
+            g_cfg_test_gap_ns = (u64)(atof(gap + 1) * 1e6);
+    }
+    if (g_deadline_ns || g_eh_test_ns || g_uo_dump_ns || g_err_test_ns || g_cfg_test_ns)
         user32_pump_hook = deadline_check;
+    rt_file_size_hook = hle_file_size_known;  // FileSize без открытия (runtime/overrides_launch.c)
     // гостевая рекурсия исполняется рекурсией хоста: главному потоку гостя — большой стек
     pthread_attr_t a;
     pthread_attr_init(&a);

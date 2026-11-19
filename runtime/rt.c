@@ -481,6 +481,8 @@ void rt_cpuid(u32 leaf, u32 r[4])
 }
 
 // часто зовётся гостем (rdtsc — замеры статистики UE2): без системных вызовов
+u64 rt_file_ns;
+
 u64 rt_ticks_ns(void)
 {
 #if defined(__SWITCH__)

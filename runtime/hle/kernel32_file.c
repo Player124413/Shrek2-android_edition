@@ -34,9 +34,99 @@ typedef struct hfile_s {
     int ndirty;
     int wjob, werr;  // идёт фоновая запись; она не удалась (под g_ws_lock)
     u64 wstreamed;   // байт записано фоном с открытия (для строки в лог)
-    struct hfile_s *wprev, *wnext;  // файлы с буфером записи (g_wb_files)
+    struct hfile_s *wprev, *wnext;  // файлы с буфером записи или отложенным открытием (g_wb_files)
+    int listed;                     // в g_wb_files
+    int lazy;      // открытие отложено (f_open): перезапись существующего файла оверлея
+    int closing;   // закрыт гостем, запись и закрытие — в фоне (wc_worker; под g_wb_lock)
+    struct hfile_s *cnext;          // очередь фонового закрытия
     fimage *img;    // образ файла в памяти (пакет игры, fimg_open), NULL — нет
+    s64 wend;       // конец записанного с открытия (WriteFile): размер файла, открытого с усечением
+    u8 trunc;       // открыт с усечением (CREATE_ALWAYS, TRUNCATE_EXISTING, отложенное открытие)
+    u8 size_bad;    // размер не выводится из записей (SetEndOfFile, проекция)
+    u8 sz_writer;   // учтён писателем в кеше размеров (sz_*)
 } hfile;
+
+// ---------------------------------------------------------------- размеры записанных файлов
+// FFileManagerWindows::FileSize (game.exe; runtime/overrides_launch.c) перед каждой записью файла открывает его на
+// чтение ради размера: на Switch открытие — запросы OpenFile и GetFileTimeStamp (≈1,5 мс на монете бонусного
+// уровня). Размер файла, записанного здесь же с усечения и закрытого, известен точно — конец записанного. Он годен,
+// пока к пути не открыт писатель и в оверлее ничего не создавалось, не удалялось и не переносилось (vfs_generation).
+#define SZ_N 32
+static struct {
+    char path[1024];
+    s64 size;
+    u32 gen;
+    int writers, known;
+} g_sz[SZ_N];
+static pthread_mutex_t g_sz_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int sz_find(const char *path, int create)  // под g_sz_lock; -1 — нет (таблица занята писателями)
+{
+    int free_i = -1;
+    for (int i = 0; i < SZ_N; i++) {
+        if (g_sz[i].path[0] && !strcmp(g_sz[i].path, path))
+            return i;
+        if (!g_sz[i].writers && (free_i < 0 || !g_sz[i].path[0] || (g_sz[free_i].path[0] && !g_sz[i].known)))
+            free_i = i;
+    }
+    if (!create || free_i < 0)
+        return -1;
+    snprintf(g_sz[free_i].path, sizeof g_sz[free_i].path, "%s", path);
+    g_sz[free_i].writers = g_sz[free_i].known = 0;
+    return free_i;
+}
+
+static void sz_open_writer(hfile *f)
+{
+    pthread_mutex_lock(&g_sz_lock);
+    int i = sz_find(f->path, 1);
+    if (i >= 0) {
+        g_sz[i].writers++;
+        g_sz[i].known = 0;
+        f->sz_writer = 1;
+    }
+    pthread_mutex_unlock(&g_sz_lock);
+}
+
+static void sz_close_writer(hfile *f)
+{
+    if (!f->sz_writer)
+        return;
+    pthread_mutex_lock(&g_sz_lock);
+    int i = sz_find(f->path, 0);
+    if (i >= 0 && --g_sz[i].writers <= 0) {
+        g_sz[i].writers = 0;
+        g_sz[i].known = f->trunc && !f->size_bad;
+        g_sz[i].size = f->wend;
+        g_sz[i].gen = vfs_generation();
+    }
+    pthread_mutex_unlock(&g_sz_lock);
+    f->sz_writer = 0;
+}
+
+// Размер по имени без открытия, как его отдал бы CreateFile на чтение + GetFileSize (-1 — не открылся бы): нет пути,
+// каталог, файл, записанный этим слоем. 0 — неизвестно (открыть по-настоящему).
+int hle_file_size_known(u32 wname, s64 *size)
+{
+    char name[1100], rel[1100], host[1100];
+    hle_w2utf8(wname, name, sizeof name);
+    char kind = 0;
+    if (!vfs_rel(name, rel, sizeof rel) || !vfs_find_kind(rel, host, sizeof host, &kind) || kind == 'd') {
+        *size = -1;
+        return 1;
+    }
+    if (kind != 'f')
+        return 0;
+    int ok = 0;
+    pthread_mutex_lock(&g_sz_lock);
+    int i = sz_find(host, 0);
+    if (i >= 0 && g_sz[i].known && !g_sz[i].writers && g_sz[i].gen == vfs_generation()) {
+        *size = g_sz[i].size;
+        ok = 1;
+    }
+    pthread_mutex_unlock(&g_sz_lock);
+    return ok;
+}
 
 // Отложенная запись: WriteFile копятся в буфере файла и уходят на диск одним куском перед любым другим обращением
 // к нему (чтение, размер, усечение, проекция, закрытие, FlushFileBuffers), а также при выходе и ловушке
@@ -47,6 +137,60 @@ typedef struct hfile_s {
 #define WBUF (4u << 20)
 static hfile *g_wb_files;
 static pthread_mutex_t g_wb_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void hle_file_flush_all(void);
+
+static void wb_list(hfile *f)  // под g_wb_lock
+{
+    static int once;
+    if (!once)  // позже atexit(exit_process) из main: идёт раньше него
+        once = atexit(hle_file_flush_all) == 0;
+    if (f->listed)
+        return;
+    f->listed = 1;
+    f->wprev = NULL;
+    f->wnext = g_wb_files;
+    if (g_wb_files)
+        g_wb_files->wprev = f;
+    g_wb_files = f;
+}
+
+static void wb_unlist(hfile *f)  // под g_wb_lock
+{
+    if (!f->listed)
+        return;
+    f->listed = 0;
+    if (f->wprev)
+        f->wprev->wnext = f->wnext;
+    else
+        g_wb_files = f->wnext;
+    if (f->wnext)
+        f->wnext->wprev = f->wprev;
+}
+
+// Перезапись существующего файла оверлея только на запись (CREATE_ALWAYS: ini, лог) открывается при первой
+// надобности: на Switch открытие на запись — это mkdir по всему пути, сброс кеша каталогов, создание и усечение,
+// десяток запросов к файловому сервису. Записанное до закрытия обычно уходит на диск вместе с открытием в фоне.
+static int f_open(hfile *f)
+{
+    if (!f->lazy)
+        return f->std || f->fd >= 0;
+    f->lazy = 0;
+    f->fd = open(f->path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (f->fd < 0)
+        fprintf(stderr, "[file] deferred open of %s failed: %s\n", f->path, strerror(errno));
+    return f->fd >= 0;
+}
+
+// Размер файла: lseek в конец — один запрос GetSize к fsdev; fstat на Switch тянет ещё тип и метки времени (с
+// переводом через сервис времени). Позицию fd чтения и записи ставят сами (lseek перед read/write).
+static s64 fd_size(hfile *f)
+{
+    struct stat st;
+    if (f->std || f->fd < 0)
+        return f->fd >= 0 && fstat(f->fd, &st) == 0 ? (s64)st.st_size : -1;
+    return (s64)lseek(f->fd, 0, SEEK_END);
+}
 
 static int write_range(int fd, const u8 *p, s64 off, u32 n)
 {
@@ -146,6 +290,8 @@ static void ws_dirty(hfile *f, u32 lo, u32 hi)
 
 static int wb_flush(hfile *f)
 {
+    if (f->lazy && !f_open(f))
+        return 0;
     if (!f->wsent && !f->wlen)
         return 1;
     pthread_mutex_lock(&g_ws_lock);
@@ -176,24 +322,101 @@ static int wb_flush(hfile *f)
     return 1;
 }
 
-void hle_file_flush_all(void)
+// Фоновое закрытие: файл, который не писался фоном по ходу (ini, лог — не сохранение), гость закрывает сразу, а
+// открытие (если отложено), запись буфера и закрытие идут в отдельном потоке. До конца файл остаётся в g_wb_files
+// с closing: обращения по имени (открытие того же пути, размер, удаление, перенос, поиск) и выход его дожидаются.
+// SaveConfig переписывает User.ini на каждой монете бонусного уровня.
+static pthread_cond_t g_wc_cv = PTHREAD_COND_INITIALIZER;    // есть работа
+static pthread_cond_t g_wc_done = PTHREAD_COND_INITIALIZER;  // файл закрыт
+static hfile *g_wc_head, *g_wc_tail;
+static int g_wc_thread;  // 1 — поток есть, -1 — не создался
+static void rb_drop(hfile *f);
+
+static void *wc_worker(void *arg)
+{
+    (void)arg;
+    pthread_mutex_lock(&g_wb_lock);
+    for (;;) {
+        while (!g_wc_head)
+            pthread_cond_wait(&g_wc_cv, &g_wb_lock);
+        hfile *f = g_wc_head;
+        if (!(g_wc_head = f->cnext))
+            g_wc_tail = NULL;
+        pthread_mutex_unlock(&g_wb_lock);
+        u32 n = f->wlen;
+        u64 t0 = rt_ticks_ns();
+        wb_flush(f);
+        if (f->fd >= 0)
+            close(f->fd);
+        double ms = (double)(rt_ticks_ns() - t0) / 1e6;
+        if (ms >= 50 || getenv("SNX_LOG_FILES"))  // User.ini на SD Switch — 15–20 мс на каждой монете
+            fprintf(stderr, "[file] %s: %u KB written at close in background, %.0f ms\n", f->path, n >> 10, ms);
+        rb_drop(f);
+        free(f->wbuf);
+        pthread_mutex_lock(&g_wb_lock);
+        wb_unlist(f);
+        free(f);
+        pthread_cond_broadcast(&g_wc_done);
+    }
+    return NULL;
+}
+
+static int wc_post(hfile *f)
 {
     pthread_mutex_lock(&g_wb_lock);
-    for (hfile *f = g_wb_files; f; f = f->wnext)
-        wb_flush(f);
+    if (!g_wc_thread) {
+        pthread_t t;
+        g_wc_thread = pthread_create(&t, NULL, wc_worker, NULL) == 0 ? 1 : -1;
+        if (g_wc_thread > 0)
+            pthread_detach(t);
+    }
+    int ok = g_wc_thread > 0;
+    if (ok) {
+        wb_list(f);
+        f->closing = 1;
+        f->cnext = NULL;
+        if (g_wc_tail)
+            g_wc_tail->cnext = f;
+        else
+            g_wc_head = f;
+        g_wc_tail = f;
+        pthread_cond_signal(&g_wc_cv);
+    }
     pthread_mutex_unlock(&g_wb_lock);
+    return ok;
 }
+
+// host == NULL — все файлы; закрываемые фоном — дождаться
+static void flush_files(const char *host)
+{
+    u64 t0 = 0;
+    pthread_mutex_lock(&g_wb_lock);
+    for (;;) {
+        int pending = 0;
+        for (hfile *f = g_wb_files; f; f = f->wnext)
+            if (!host || !strcmp(f->path, host)) {
+                if (f->closing)
+                    pending = 1;
+                else if (!host || f->wlen || f->lazy)
+                    wb_flush(f);
+            }
+        if (!pending)
+            break;
+        if (!t0)
+            t0 = rt_ticks_ns();
+        pthread_cond_wait(&g_wc_done, &g_wb_lock);
+    }
+    pthread_mutex_unlock(&g_wb_lock);
+    double ms = t0 ? (double)(rt_ticks_ns() - t0) / 1e6 : 0;
+    if (host && (ms >= 1 || (t0 && getenv("SNX_LOG_FILES"))))  // гость ждал фоновое закрытие этого файла
+        fprintf(stderr, "[file] %s: waited %.1f ms for background write\n", host, ms);
+}
+
+void hle_file_flush_all(void) { flush_files(NULL); }
 
 // Только файлы с этим путём хоста: открытию по имени нужно то, что записано в него самого. Открытия идут и посреди
 // игры (Localize читает .int), и сброс всех буферов писал на SD накопленный лог движка — до 20 мс на открытие
-static void flush_path(const char *host)
-{
-    pthread_mutex_lock(&g_wb_lock);
-    for (hfile *f = g_wb_files; f; f = f->wnext)
-        if (f->wlen && !strcmp(f->path, host))
-            wb_flush(f);
-    pthread_mutex_unlock(&g_wb_lock);
-}
+static void flush_path(const char *host) { flush_files(host); }
 
 static _Atomic u64 g_fg_read_ns;  // время последнего чтения гостя с диска (образы пакетов ниже)
 
@@ -473,10 +696,23 @@ static u32 buffered_read(hfile *f, u8 *dst, u32 n)
 
 static u32 g_std[3];  // описатели STD_INPUT/OUTPUT/ERROR
 
+static void close_file_(hfile *f);
+
 static void close_file(void *p)
 {
-    hfile *f = p;
-    if (f->wbuf) {
+    u64 t0 = rt_ticks_ns();
+    close_file_(p);
+    __atomic_add_fetch(&rt_file_ns, rt_ticks_ns() - t0, __ATOMIC_RELAXED);
+}
+
+static void close_file_(hfile *f)
+{
+    sz_close_writer(f);  // размер известен сразу: запись может ещё идти в фоне
+    // не писался фоном по ходу (не сохранение): запись буфера и закрытие — в фоне
+    if (!f->std && (f->wbuf || f->lazy) && !f->wsent && !f->wjob && !f->wstreamed && !f->img && wc_post(f))
+        return;
+    f_open(f);  // отложенное открытие: CREATE_ALWAYS усекает файл и без записи
+    if (f->listed) {
         pthread_mutex_lock(&g_wb_lock);
         u32 tail = f->wlen - f->wsent;
         for (int i = 0; i < f->ndirty; i++)
@@ -486,12 +722,7 @@ static void close_file(void *p)
         if (f->wstreamed)  // большой файл (сохранение): сколько ушло фоном и чего стоило закрытие
             fprintf(stderr, "[file] %s: %llu KB written in background, %u KB at close, %.0f ms\n", f->path,
                     (unsigned long long)(f->wstreamed >> 10), tail >> 10, (double)(rt_ticks_ns() - t0) / 1e6);
-        if (f->wprev)
-            f->wprev->wnext = f->wnext;
-        else
-            g_wb_files = f->wnext;
-        if (f->wnext)
-            f->wnext->wprev = f->wprev;
+        wb_unlist(f);
         pthread_mutex_unlock(&g_wb_lock);
         free(f->wbuf);
     }
@@ -581,7 +812,17 @@ static u32 put_name(u32 dst, u32 cap, const char *s, int wide) { return wide ? h
 #define GENERIC_WRITE 0x40000000u
 enum { CREATE_NEW = 1, CREATE_ALWAYS, OPEN_EXISTING, OPEN_ALWAYS, TRUNCATE_EXISTING };
 
+static u32 create_file_(const char *name, u32 access, u32 disp);
+
 static u32 create_file(const char *name, u32 access, u32 disp)
+{
+    u64 t0 = rt_ticks_ns();
+    u32 h = create_file_(name, access, disp);
+    __atomic_add_fetch(&rt_file_ns, rt_ticks_ns() - t0, __ATOMIC_RELAXED);
+    return h;
+}
+
+static u32 create_file_(const char *name, u32 access, u32 disp)
 {
     char rel[1100], host[1100];
     if (!vfs_rel(name, rel, sizeof rel)) {
@@ -590,15 +831,38 @@ static u32 create_file(const char *name, u32 access, u32 disp)
         rt_set_last_error(ERROR_PATH_NOT_FOUND);
         return 0xFFFFFFFFu;
     }
-    int exists = vfs_find(rel, host, sizeof host);
+    char kind = 0;  // тип по листингу каталога (vfs.c): stat на Switch — пять-шесть запросов к сервисам
+    int exists = vfs_find_kind(rel, host, sizeof host, &kind);
     if (exists)
         flush_path(host);  // с тем, что ещё в буферах открытых файлов
     struct stat st;
-    if (exists && stat(host, &st) == 0 && S_ISDIR(st.st_mode)) {
+    if (exists && kind == '?')
+        kind = stat(host, &st) != 0 ? 0 : S_ISDIR(st.st_mode) ? 'd' : S_ISREG(st.st_mode) ? 'f' : '?';
+    int is_file = exists && kind == 'f';
+    if (exists && kind == 'd') {
         rt_set_last_error(ERROR_ACCESS_DENIED);
         return 0xFFFFFFFFu;
     }
     int write = (access & GENERIC_WRITE) != 0;
+    char game[1100];
+    if (is_file && disp == CREATE_ALWAYS && write && !(access & GENERIC_READ) &&
+        !(vfs_find_game(rel, game, sizeof game) && !strcmp(game, host))) {  // перезапись файла оверлея: f_open
+        hfile *f = calloc(1, sizeof *f);
+        f->fd = -1;
+        f->lazy = 1;
+        f->trunc = 1;
+        snprintf(f->path, sizeof f->path, "%s", host);
+        sz_open_writer(f);
+        pthread_mutex_lock(&g_wb_lock);
+        wb_list(f);
+        pthread_mutex_unlock(&g_wb_lock);
+        if (getenv("SNX_LOG_FILES"))
+            fprintf(stderr, "[file] open %s -> %s (w, deferred)\n", name, host);
+        u32 h = hle_obj_new(OBJ_FILE, f);
+        hle_obj_set_closer(h, close_file);
+        rt_set_last_error(ERROR_ALREADY_EXISTS);
+        return h;
+    }
     int flags;
     if (disp == CREATE_NEW && exists) {
         rt_set_last_error(80);
@@ -632,11 +896,15 @@ static u32 create_file(const char *name, u32 access, u32 disp)
     hfile *f = calloc(1, sizeof *f);
     f->fd = fd;
     snprintf(f->path, sizeof f->path, "%s", host);
-    char game[1100];
-    if (flags == O_RDONLY && vfs_find_game(rel, game, sizeof game) && !strcmp(game, host) &&
-        fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {  // пакет игры (не копия в оверлее) — образ в памяти
+    if (flags != O_RDONLY) {
+        f->trunc = (flags & O_TRUNC) != 0;
+        sz_open_writer(f);
+    }
+    s64 size;
+    if (flags == O_RDONLY && is_file && vfs_find_game(rel, game, sizeof game) && !strcmp(game, host) &&
+        (size = fd_size(f)) >= 0) {  // пакет игры (не копия в оверлее) — образ в памяти
         pthread_mutex_lock(&g_img_lock);
-        f->img = fimg_open(host, (s64)st.st_size);
+        f->img = fimg_open(host, size);
         pthread_mutex_unlock(&g_img_lock);
     }
     u32 h = hle_obj_new(OBJ_FILE, f);
@@ -705,14 +973,8 @@ void hle_kernel32_WriteFile(CPU *c)
         if (f->wlen && !(f->pos >= f->wpos && f->pos <= f->wpos + f->wlen && (u64)(f->pos - f->wpos) + n <= WBUF))
             wb_flush(f);
         if (n < WBUF && !f->wbuf && (f->wbuf = malloc(WBUF)) != NULL) {
-            static int once;
             pthread_mutex_lock(&g_wb_lock);
-            f->wnext = g_wb_files;
-            if (g_wb_files)
-                g_wb_files->wprev = f;
-            g_wb_files = f;
-            if (!once)  // позже atexit(exit_process) из main: идёт раньше него
-                once = atexit(hle_file_flush_all) == 0;
+            wb_list(f);
             pthread_mutex_unlock(&g_wb_lock);
         }
         if (n < WBUF && f->wbuf) {
@@ -724,14 +986,16 @@ void hle_kernel32_WriteFile(CPU *c)
                 ws_dirty(f, at, at + n < f->wsent ? at + n : f->wsent);
             if (at + n > f->wlen)
                 f->wlen = at + n;
-            if (f->wlen - f->wsent >= WS_CHUNK)
+            if (f->wlen - f->wsent >= WS_CHUNK && f_open(f))
                 ws_post(f);
             r = n;
         } else {
-            r = lseek(f->fd, (off_t)f->pos, SEEK_SET) < 0 ? -1 : write(f->fd, g_mem + ARG(1), n);
+            r = !f_open(f) || lseek(f->fd, (off_t)f->pos, SEEK_SET) < 0 ? -1 : write(f->fd, g_mem + ARG(1), n);
         }
         if (r > 0)
             f->pos += r;
+        if (r > 0 && f->pos > f->wend)
+            f->wend = f->pos;
     }
     if (ARG(3))
         wr32(g_mem, ARG(3), r > 0 ? (u32)r : 0);
@@ -751,8 +1015,8 @@ void hle_kernel32_SetFilePointer(CPU *c)
         off = (s64)((u64)rd32(g_mem, ARG(2)) << 32 | ARG(1));
     if (ARG(3) == 2)
         wb_flush(f);
-    struct stat st;
-    s64 r = ARG(3) == 0 ? off : ARG(3) == 1 ? f->pos + off : fstat(f->fd, &st) == 0 ? (s64)st.st_size + off : -1;
+    s64 size = ARG(3) == 2 ? fd_size(f) : 0;
+    s64 r = ARG(3) == 0 ? off : ARG(3) == 1 ? f->pos + off : size >= 0 ? size + off : -1;
     if (r >= 0)
         f->pos = r;
     if (r < 0) {
@@ -769,22 +1033,26 @@ void hle_kernel32_GetFileSize(CPU *c)
 {
     HLE_ENTER("GetFileSize", 2);
     hfile *f = hle_obj_get(ARG(0), OBJ_FILE);
-    struct stat st;
-    if (!f || !wb_flush(f) || fstat(f->fd, &st) != 0) {
+    u64 t0 = rt_ticks_ns();
+    s64 size = f && wb_flush(f) ? fd_size(f) : -1;
+    __atomic_add_fetch(&rt_file_ns, rt_ticks_ns() - t0, __ATOMIC_RELAXED);
+    if (size < 0) {
         rt_set_last_error(ERROR_INVALID_HANDLE);
         RET(2, 0xFFFFFFFFu);
     }
     if (ARG(1))
-        wr32(g_mem, ARG(1), (u32)((u64)st.st_size >> 32));
-    RET(2, (u32)st.st_size);
+        wr32(g_mem, ARG(1), (u32)((u64)size >> 32));
+    RET(2, (u32)size);
 }
 
 void hle_kernel32_SetEndOfFile(CPU *c)
 {
     HLE_ENTER("SetEndOfFile", 1);
     hfile *f = hle_obj_get(ARG(0), OBJ_FILE);
-    if (f)
+    if (f) {
         rb_drop(f);
+        f->size_bad = 1;
+    }
     RET(1, f && wb_flush(f) && ftruncate(f->fd, (off_t)f->pos) == 0);
 }
 
@@ -1206,6 +1474,7 @@ void hle_kernel32_CreateFileMappingA(CPU *c)
         hle_todo("CreateFileMapping without a file (pagefile-backed)");
         RET(6, 0);
     }
+    f->size_bad = 1;  // проекция может менять файл мимо WriteFile
     hmapping *m = calloc(1, sizeof *m);
     m->file = ARG(0);
     m->size = ARG(4) ? ARG(4) : (u32)st.st_size;

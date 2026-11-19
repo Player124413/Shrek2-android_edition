@@ -44,6 +44,11 @@ void rt_register_function(u32 addr, guest_fn fn);
 void rt_dump_cpu(const CPU *c);
 void rt_dump_trace(int n);
 u64 rt_ticks_ns(void);
+// время в открытии, размере и закрытии файлов (runtime/hle/kernel32_file.c; доля в строке [core] SaveConfig)
+extern u64 rt_file_ns;
+// размер файла по имени без открытия (FFileManagerWindows::FileSize, overrides_launch.c): 1 — ответ в *size
+// (-1 — нет файла), 0 — открыть по-настоящему. Ставит host/boot/main.c (hle_file_size_known).
+extern int (*rt_file_size_hook)(u32 wname, s64 *size);
 
 // Перехват ловушек (тесты): если обработчик не возвращается (longjmp), abort не вызывается.
 typedef void (*rt_trap_hook_fn)(CPU *c, u32 addr, const char *what);

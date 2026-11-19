@@ -66,7 +66,7 @@ NRO). Нативный x86-32 код игры переводится в C (`reco
 | Путь | Что там |
 |---|---|
 | `recomp/` | `main.py` (CLI `discover`/`gen`), `image.py`, `x86.py`, `x87.py`, `discover.py`, `flags.py`, `regs.py`, `emit.py`, `gen.py`, `overrides.py`, `addrmap.json` |
-| `runtime/` | `abi.h` (CPU, память, `RT_ICALL`), `gen_rt.h` (макросы сгенерированного кода), `rt.c`, `loader.c`, `vmem.c`, `heap.c`, `process.c`, `overrides_{crt,core,engine}.c`, `crt_math.h` |
+| `runtime/` | `abi.h` (CPU, память, `RT_ICALL`), `gen_rt.h` (макросы сгенерированного кода), `rt.c`, `loader.c`, `vmem.c`, `heap.c`, `process.c`, `overrides_{crt,core,engine,launch}.c`, `ini_cache.h`, `crt_math.h` |
 | `runtime/hle/` | kernel32 (`kernel32.c`, `kernel32_file.c`, `vfs.c`), user32, gdi32, advapi32 (+winmm, ole32, shell32), `misc.c`, `wsock32.c`, `com.c`, ddraw, `d3d8*.c`, `gl_cs.c`, `overlay.c`, dinput8, `openal.c`, `vorbisfile.c`, `bink*.c` |
 | `runtime/game/` | знание о структурах UE2: меню с геймпада (`menu.c`), обход UObject (`uobj.c`) |
 | `host/boot/` | `main.c` (запуск, ловушки, модальные окна), `input.c` (SDL → WM/DirectInput, `Snx.ini`, `SNX_KEYS`), `config.c` (`game.ini`, `User.ini`), `prof.c` |
@@ -137,10 +137,12 @@ EXCEPTION_RECORD/CONTEXT на стеке гостя и зовёт цепочку
 
 **Оверрайды** (`recomp/overrides.py`): замена по экспорту; `WRAPS` — обёртка с оригиналом `ovr_orig_<символ>`;
 `SIGS` — неэкспортированная функция `"Модуль!=имя"` по байтам начала (должна находиться ровно одна, в обеих
-локализациях). Сейчас заменены: CRT (`mem*/str*`, математика с семантикой MSVC в `crt_math.h`, `rand/srand`,
+локализациях). Вызовы экспортов из других модулей прямые: новый оверрайд — перегенерируй все модули. Сейчас заменены: CRT (`mem*/str*`, математика с семантикой MSVC в `crt_math.h`, `rand/srand`,
 статические `memcpy` всех модулей), Hor+ в `FCameraSceneNode::UpdateMatrices`, пропуск `Flush(1)` после
 `SaveGame`, кеш `TFieldIterator<UProperty>` (эпоха — `UStruct::Link`, `CollectGarbage`), быстрый
-`FArchiveFileWriter::Serialize`, `Sleep(500)` в `TryRenderDevice` (по адресу возврата `0x11106a85`).
+`FArchiveFileWriter::Serialize`, `Sleep(500)` в `TryRenderDevice` (по адресу возврата `0x11106a85`),
+`FConfigCacheIni::GetString` (game.exe, по памяти кеша ini), `FFileManagerWindows::FileSize` (game.exe, без открытия
+файла, если размер известен), пропуск перечитывания конфига в `UObject::SaveConfig` и обход классов в нём (ниже).
 
 **Оптимизации.** Соблюдай их условия, иначе ошибки будут тихими:
 
@@ -153,6 +155,9 @@ EXCEPTION_RECORD/CONTEXT на стеке гостя и зовёт цепочку
 | `SNX_PIN` (только GCC/Switch): eax…edi в x19–x26, `m` в x27 | рантайм входит в гостя только через `rt_pin_enter`; код только без закрепления — в `G_(...)`, только с ним — в `P_(...)`; дифф-тестами не покрыт |
 | `FIST/FTRUNC` на месте | вне диапазона и NaN — «неопределённое целое» x87 (`tests/rt/fist_test`) |
 | Порядок горячих функций (`build/hot_order.ld`) | первая строка — `KEEP (*(.crt0))`, иначе elf2nro затрёт функцию заголовком NRO |
+| `SaveConfig` без перечитывания (`ovr_core_save_config`/`ovr_core_load_config`) | `LoadConfig(1)` умолчаний класса из цикла `SaveConfig` пропускается, если хеш секций `[Пакет.Класс]` его цепочки во всех файлах кеша ini не изменился с прошлого перечитывания этого класса (сборка мусора сбрасывает таблицу). Отличие от ПК: умолчание, изменённое скриптом без сохранения, чужой `SaveConfig` к ini не вернёт. Раскладка кеша — `runtime/ini_cache.h`; проверка — `SNX_CFG_CHECK=1` |
+| `FileSize` без открытия (`ovr_launch_file_size` → `hle_file_size_known`) | «нет файла» и «каталог» — по кешу листингов; размер — только файла, записанного через этот слой с усечения (конец записанного) и закрытого, пока к пути нет писателя и не менялось поколение `vfs_changed`; `SetEndOfFile` и проекция делают размер неизвестным. Проверка — `SNX_CFG_CHECK=1`, `tests/rt/wfile_test` |
+| Обход классов в `SaveConfig` (`ovr_core_objit_next`, `TObjectIterator::operator++` Core) | только при вызове из тела `SaveConfig`: индексы подклассов верхнего config-класса из списка, годного, пока не было `UStruct::Link` и сборки мусора (`g_fn_epoch`). Новый класс должен пройти `Link` до исполнения скрипта; индексы из списка перепроверяются. Проверка — `SNX_CFG_CHECK=1` |
 | PGO GCC | сгенерированный C совпадает с профилированным; файлы со `switch` в разных секциях собирает `tools/cc_partition.sh`; `-fprofile-partial-training` не включай; libgcov devkitA64 пишет TLS в `tpidr_el0`, поэтому профайлер косвенных вызовов определён в `host/boot/main.c` |
 
 **Сводки по регистрам.** `touched(F)` — регистры, которые F с вызываемыми читает или пишет; `out(F)` — те, что к
@@ -182,9 +187,13 @@ EXCEPTION_RECORD/CONTEXT на стеке гостя и зовёт цепочку
   трамплины, DllMain в порядке зависимостей. `GetProcAddress`: внешние DLL — `g_dyn` в `kernel32.c`, свои —
   экспорты `<mod>_table.c` (UE2 ищет `int<Pkg><Class>exec*` по имени).
 * **Файлы** (`vfs.c`, `kernel32_file.c`): гость видит `C:\Shrek2`; сначала пользовательский оверлей (`--user`),
-  потом игра, имена без учёта регистра. Чтение — кеш блоков 64 КБ и фоновые образы пакетов
-  (`SNX_FILE_CACHE_MB`). Запись копится в буфере и сбрасывается **перед любым другим обращением к файлу или
-  операцией по имени**; большие файлы пишутся фоном. Меняя это, прогоняй `tests/rt/wfile_test`.
+  потом игра, имена без учёта регистра. Существование и тип записи — по кешу листингов (`d_type`), размер —
+  `lseek` в конец: `stat`/`fstat` на Switch — несколько запросов к сервисам (тип, время, открытие). Чтение — кеш
+  блоков 64 КБ и фоновые образы пакетов (`SNX_FILE_CACHE_MB`). Запись копится в буфере и сбрасывается **перед
+  любым другим обращением к файлу или операцией по имени**; большие файлы пишутся фоном. Перезапись существующего
+  файла оверлея только на запись (`CREATE_ALWAYS`: ini) открывается при первой надобности; файл, не писавшийся
+  фоном по ходу, закрывается в фоне (открытие, запись, закрытие), и обращения по имени и выход его дожидаются.
+  Меняя это, прогоняй `tests/rt/wfile_test`.
 * **Окна** (`user32.c`, `gdi32.c`): классы, очереди по потокам, синтез WM_PAINT, активация, диалоги из ресурсов;
   GDI-шрифты через FreeType. Фатальная ошибка движка идёт в `user32_modal_hook` (`host/boot/main.c: on_modal`).
 * **D3D8 → GL** (`d3d8*.c`). Шейдеры держи в рамках GL 4.1 core (мак), хотя Switch даёт 4.3. Соглашение
@@ -250,6 +259,7 @@ tools/build.sh mac difftest_msvcr70 && UC_IGNORE_REG_BREAK=1 tools/.venv/bin/pyt
 | `SNX_KEYS=<с>:<VK hex>,<с>:@<u>/<v>,<с>:%<кнопка>+,<с>:~LX=<v>` | ввод без рук: клавиши, щелчок, кнопки и стики геймпада |
 | `SNX_SHOT=300,600`, `SNX_SHOT_DIR`, `SNX_DUMP_DRAWS=<кадр>` | PNG заднего буфера; состояние каждой отрисовки (`tools/probe/sheet.py`) |
 | `SNX_EH_TEST=<с>`, `SNX_ERR_TEST=<с>` | исключение C++ в `StaticLoadObject`; фатальная ошибка движка |
+| `SNX_CFG_TEST=<с>[,<n>[,<мс>]]`, `SNX_CFG_CHECK=1` | n подборов монеты бонусного уровня (`bonuscoins`+1 и `SaveConfig` контроллера героя) с паузой (250 мс; 0 — подряд в одном кадре, тогда каждый ждёт запись `User.ini` предыдущего), время — `[core] SaveConfig`; сверка пропусков перечитывания и `GetString` с оригиналом |
 | `SNX_FIELD_CHECK=1` | сверить кеш обхода свойств с полным обходом |
 | `SNX_PERF=1`, `SNX_NOVSYNC=1`, `SNX_PROF=<файл>`, `SNX_CALLSTATS=<файл>` | инструкции и такты на кадр; без vsync; профиль; счётчики входов |
 | `SNX_RENDER_THREAD=0`, `SNX_GLTHREAD=1`, `SNX_FILE_CACHE_MB` | без потока рендера; glthread Mesa; бюджет образов пакетов |
@@ -273,7 +283,10 @@ tools/build.sh mac difftest_msvcr70 && UC_IGNORE_REG_BREAK=1 tools/.venv/bin/pyt
   `tools/probe/profsplit.py --bin <elf> --objs <build>/runtime prof.txt`, `prof.py --thread g|r`, `hitchprof.py`
   (долгие кадры), `callcount.py`, `hotorder.py` (порядок функций для ld).
 * Строки лога: `[hitch]` (долгий кадр: программы GL, чтения, заливки, ожидание рендера), `[cs]`,
-  `[engine] SaveGame(N): M ms`, `[engine] Flush(N) from`, `[file] ... written in background`.
+  `[engine] SaveGame(N): M ms`, `[engine] Flush(N) from`, `[core] SaveConfig(Класс): M ms (files F ms)` (под
+  `SNX_CFG_TEST`/`SNX_CFG_CHECK` или от 30 мс; F — открытие, размер и закрытие файлов),
+  `[file] ... written in background`, `[file] ... written at close in background` (от 50 мс), `[file] ... waited N ms
+  for background write` (гость ждал фоновую запись этого файла, от 1 мс).
 
 ### Switch (запуск вручную)
 

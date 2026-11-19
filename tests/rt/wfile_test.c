@@ -1,6 +1,8 @@
 // Файлы гостя (runtime/hle/kernel32_file.c) против модели в памяти. Запись: буфер, правка накопленного на месте,
 // сброс перед чтением/размером/закрытием, фоновая запись большого файла — случайные позиции (возвраты назад — как SavePackage к заголовку), записи
-// мелкие и больше буфера, чтения посреди записи, размер, закрытие и повторное открытие. Чтение пакета игры: образ
+// мелкие и больше буфера, чтения посреди записи, размер, закрытие и повторное открытие. Перезапись существующего
+// файла (ini): открытие и запись откладываются, закрытие — фоном; открытие того же пути, размер по имени, удаление
+// сразу после закрытия видят новое содержимое. Чтение пакета игры: образ
 // в памяти, который фоновый поток дочитывает, пока идут чтения (из образа и с диска вперемешку), и повторное
 // открытие с готовым образом. Сами функции HLE — через стек гостя, как их зовёт сгенерированный код.
 // Запуск: build/mac/tests/rt/wfile_test <пустой каталог>
@@ -21,6 +23,8 @@ void hle_kernel32_ReadFile(CPU *c);
 void hle_kernel32_SetFilePointer(CPU *c);
 void hle_kernel32_GetFileSize(CPU *c);
 void hle_kernel32_CloseHandle(CPU *c);
+void hle_kernel32_GetFileAttributesExW(CPU *c);
+void hle_kernel32_DeleteFileA(CPU *c);
 
 #define STACK 0x00200000u  // стек вызовов (адреса гостя)
 #define NAME 0x00300000u
@@ -108,6 +112,9 @@ int main(int argc, char **argv)
     snprintf(game, sizeof game, "%s/game", argv[1]);
     mkdir(argv[1], 0755);
     mkdir(game, 0755);
+    char tex[1100];  // каталог игры неизменен (vfs кеширует его листинги): каталог пакета — заранее
+    snprintf(tex, sizeof tex, "%s/Textures", game);
+    mkdir(tex, 0755);
     vfs_init(game, argv[1], "C:\\Shrek2");
     strcpy((char *)g_mem + NAME, "C:\\Shrek2\\System\\Save.tmp");
     model = calloc(MAXF, 1);
@@ -152,6 +159,7 @@ int main(int argc, char **argv)
         check_read(h, 0, model_len, "before close");
         u32 a[1] = {h};
         call(hle_kernel32_CloseHandle, 1, a);
+        hle_file_flush_all();  // закрытие могло уйти в фон
         // с диска после закрытия
         char path[1100];
         snprintf(path, sizeof path, "%s/System/Save.tmp", argv[1]);
@@ -180,6 +188,7 @@ int main(int argc, char **argv)
         write_at(h, 300u << 10, 64);
         u32 a[1] = {h};
         call(hle_kernel32_CloseHandle, 1, a);
+        hle_file_flush_all();
         char path[1100];
         snprintf(path, sizeof path, "%s/System/Save.tmp", argv[1]);
         FILE *f = fopen(path, "rb");
@@ -190,6 +199,101 @@ int main(int argc, char **argv)
         if ((got != model_len || memcmp(disk, model, model_len)) && fails++ < 10)
             printf("save-like: file on disk %zu bytes, want %u\n", got, model_len);
         free(disk);
+    }
+    // перезапись ini (SaveConfig на каждой монете): только запись, CREATE_ALWAYS поверх существующего файла
+    {
+        char path[1100];
+        snprintf(path, sizeof path, "%s/System/User.ini", argv[1]);
+        FILE *pf0 = fopen(path, "wb");
+        fputs("[Old]\r\nKey=1\r\n", pf0);
+        fclose(pf0);
+        strcpy((char *)g_mem + NAME, "C:\\Shrek2\\System\\User.ini");
+        const char *wname = "C:\\Shrek2\\System\\User.ini";
+        u32 wn = NAME + 0x200;
+        for (u32 i = 0; i <= strlen(wname); i++)
+            wr16(g_mem, wn + 2 * i, (u8)wname[i]);
+        u32 hold = 0xFFFFFFFFu;  // открытый на запись, пока читается
+        for (int round = 0; round < 300; round++, ops++) {
+            u32 aw[7] = {NAME, 0x40000000u /* GENERIC_WRITE */, 0, 0, 2 /* CREATE_ALWAYS */, 0x80, 0};
+            u32 h = call(hle_kernel32_CreateFileA, 7, aw);
+            if (h == 0xFFFFFFFFu) {
+                printf("ini round %d: rewrite open failed\n", round);
+                return 1;
+            }
+            model_len = 0;
+            u32 kind = rnd(10);
+            if (kind == 0) {  // читатель при открытом писателе: CREATE_ALWAYS уже усёк файл
+                u32 ar[7] = {NAME, 0x80000000u, 1, 0, 3 /* OPEN_EXISTING */, 0x80, 0};
+                hold = call(hle_kernel32_CreateFileA, 7, ar);
+                check_read(hold, 0, 100, "ini while writer open");
+                u32 a1[1] = {hold};
+                call(hle_kernel32_CloseHandle, 1, a1);
+            }
+            if (kind != 1)  // 1 — пустая перезапись
+                for (u32 left = 1 + rnd(12000); left;) {  // кусками, как FArchiveFileWriter
+                    u32 n = left < 4096 ? left : 4096;
+                    write_at(h, model_len, n);
+                    left -= n;
+                }
+            s64 known;
+            if (hle_file_size_known(wn, &known) && fails++ < 10)  // писатель открыт: размер неизвестен
+                printf("ini round %d: size known with a writer open\n", round);
+            u32 a[1] = {h};
+            call(hle_kernel32_CloseHandle, 1, a);
+            // записан с усечения через этот слой: размер без открытия (FileSize, overrides_launch.c), запись может идти фоном
+            if ((!hle_file_size_known(wn, &known) || known != model_len) && fails++ < 10)
+                printf("ini round %d: known size %lld, want %u\n", round, (long long)known, model_len);
+            if (kind < 5) {  // сразу открыть заново и прочитать
+                u32 ar[7] = {NAME, 0x80000000u, 1, 0, 3, 0x80, 0};
+                u32 r = call(hle_kernel32_CreateFileA, 7, ar);
+                check_size(r);
+                check_read(r, 0, model_len + 10, "ini reopened");
+                u32 a1[1] = {r};
+                call(hle_kernel32_CloseHandle, 1, a1);
+            } else if (kind < 7) {  // размер по имени
+                u32 ax[3] = {wn, 0, IO};
+                if (!call(hle_kernel32_GetFileAttributesExW, 3, ax) || rd32(g_mem, IO + 32) != model_len)
+                    if (fails++ < 10)
+                        printf("ini round %d: size by name %u, want %u\n", round, rd32(g_mem, IO + 32), model_len);
+            }
+        }
+        hle_file_flush_all();
+        // кеш размеров: после изменения оверлея — неизвестно; нет файла и каталог — -1 по листингу
+        s64 known;
+        vfs_changed();
+        if (hle_file_size_known(wn, &known) && fails++ < 10)
+            printf("ini: size known after vfs_changed\n");
+        const char *names[] = {"C:\\Shrek2\\System\\NoSuch.ini", "C:\\Shrek2\\SYSTEM", "D:\\Other\\User.ini"};
+        for (int i = 0; i < 3; i++) {
+            u32 w = NAME + 0x400;
+            for (u32 j = 0; j <= strlen(names[i]); j++)
+                wr16(g_mem, w + 2 * j, (u8)names[i][j]);
+            if ((!hle_file_size_known(w, &known) || known != -1) && fails++ < 10)
+                printf("ini: %s: want -1 without opening\n", names[i]);
+        }
+        FILE *f = fopen(path, "rb");
+        u8 *disk = malloc(MAXF);
+        size_t got = f ? fread(disk, 1, MAXF, f) : 0;
+        if (f)
+            fclose(f);
+        if ((got != model_len || memcmp(disk, model, model_len)) && fails++ < 10)
+            printf("ini: file on disk %zu bytes, want %u\n", got, model_len);
+        free(disk);
+        // удаление сразу после фонового закрытия
+        u32 aw[7] = {NAME, 0x40000000u, 0, 0, 2, 0x80, 0};
+        u32 h = call(hle_kernel32_CreateFileA, 7, aw);
+        write_at(h, 0, 5000);
+        u32 a[1] = {h};
+        call(hle_kernel32_CloseHandle, 1, a);
+        u32 ad[1] = {NAME};
+        if (!call(hle_kernel32_DeleteFileA, 1, ad) && fails++ < 10)
+            printf("ini: delete after close failed\n");
+        u32 ar[7] = {NAME, 0x80000000u, 1, 0, 3, 0x80, 0};
+        if (call(hle_kernel32_CreateFileA, 7, ar) != 0xFFFFFFFFu && fails++ < 10)
+            printf("ini: file still there after delete\n");
+        hle_file_flush_all();
+        if (!access(path, F_OK) && fails++ < 10)
+            printf("ini: file on disk after delete\n");
     }
     // чтение пакета из каталога игры: образ в памяти
     char pkg[1100];
@@ -218,12 +322,23 @@ int main(int argc, char **argv)
             check_read(h, rnd(model_len + 1000), n, "package");
         }
         check_read(h, 0, model_len, "package whole");
+        check_size(h);  // размер — lseek в конец (fd_size), позиция чтения после него та же
+        u32 ae[4] = {h, 0, 0, 2 /* FILE_END */};
+        if (call(hle_kernel32_SetFilePointer, 4, ae) != model_len && fails++ < 10)
+            printf("package: FILE_END seek, want %u\n", model_len);
+        check_read(h, 1000, 5000, "package after size");
         u32 a[1] = {h};
         call(hle_kernel32_CloseHandle, 1, a);
         const char *cm = getenv("SNX_FILE_CACHE_MB");  // 0 — без образов: проверяются только данные
         if (round && !(cm && !atoi(cm)) && g_hitch.reads != reads0 && fails++ < 10)  // образ готов — с диска ничего
             printf("package round %d: %llu disk reads with a ready image\n", round, g_hitch.reads - reads0);
     }
+    // тип записи — из листинга каталога (vfs.c, без stat): каталог открыть нельзя (open(O_RDONLY) каталога на
+    // POSIX прошёл бы), имя без учёта регистра. GetLastError без потока гостя не хранится.
+    strcpy((char *)g_mem + NAME, "C:\\Shrek2\\textures");
+    u32 ad7[7] = {NAME, 0x80000000u, 1, 0, 3, 0x80, 0};
+    if (call(hle_kernel32_CreateFileA, 7, ad7) != 0xFFFFFFFFu && fails++ < 10)
+        printf("directory: open must fail\n");
     printf("wfile_test: %d operations, %d failed\n", ops, fails);
     return fails != 0;
 }

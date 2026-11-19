@@ -17,6 +17,14 @@ SIGS["field_next"] = "56 8B F1 83 3E 00 74 ? 57 BF 00 80 00 00 8B FF 8B 46 04 85
 OVERRIDES["Core.dll!=field_next"] = ("ovr_core_field_next", 0)
 WRAPS["Core.dll!?CollectGarbage@UObject@@SAXK@Z"] = ("ovr_core_collect_garbage", 0)
 WRAPS["Core.dll!?Link@UStruct@@UAEXAAVFArchive@@H@Z"] = ("ovr_core_struct_link", 0)
+# Core: SaveConfig без перечитывания конфига в умолчания классов, чьи секции ini не менялись (подбор монет на
+# бонусных уровнях; runtime/overrides_core.c)
+WRAPS["Core.dll!?SaveConfig@UObject@@QAEXKPBG@Z"] = ("ovr_core_save_config", 0)
+WRAPS["Core.dll!?LoadConfig@UObject@@QAEXHPAVUClass@@PBG@Z"] = ("ovr_core_load_config", 0)
+# Core: TObjectIterator<T>::operator++ (общая копия шаблона): обход классов в SaveConfig — по списку подклассов
+SIGS["objit_next"] = ("8B 41 04 40 89 41 04 3B 05 ? ? ? ? 7D ? 8B 15 ? ? ? ? 8B 04 82 85 C0 74 ? 8B 40 24 85 C0 8B 11 "
+                      "74 ? 3B C2 74 ? 8B 40 2C 85 C0 75 ? 33 C0 85 D2 0F 94 C0 85 C0 74 ? C3")
+WRAPS["Core.dll!=objit_next"] = ("ovr_core_objit_next", 0)
 # memcpy из статического CRT — своя копия у каждого модуля, хвосты — переходами по вычисленному адресу
 SIGS["memcpy"] = "55 8B EC 53 56 57 A1 ? ? ? ? 83 38 00 0F 84 ? ? ? ? 8B 4D 10 8B 7D 08 8B 75 0C 8B D9 FC"
 for _m in ["Engine.dll", "D3DDrv.dll", "ALAudio.dll", "Fire.dll", "GUI.dll", "IpDrv.dll", "KWGame.dll", "Window.dll",
@@ -25,6 +33,14 @@ for _m in ["Engine.dll", "D3DDrv.dll", "ALAudio.dll", "Fire.dll", "GUI.dll", "Ip
 # game.exe: FArchiveFileWriter::Serialize — копия в буфер архива без вызовов гостя
 SIGS["file_write"] = "53 8B 5C 24 0C 55 8B 6C 24 0C 56 8B F1 8B 56 48 8B 4E 4C 57 BF 00 10 00 00"
 WRAPS["game.exe!=file_write"] = ("ovr_launch_file_write", 0)
+# game.exe: FConfigCacheIni::GetString — по памяти кеша ini без вызовов гостя (runtime/overrides_core.c)
+SIGS["cfg_get_string"] = ("55 8B EC 6A FF 68 ? ? ? ? 64 A1 00 00 00 00 50 64 89 25 00 00 00 00 83 EC 18 8B 45 18 53 56 "
+                          "57 8B 7D 10 33 DB 89 65 F0 53 50 89 5D FC 66 89 1F E8")
+WRAPS["game.exe!=cfg_get_string"] = ("ovr_launch_cfg_get_string", 0)
+# game.exe: FFileManagerWindows::FileSize — размер без открытия, если он известен (runtime/overrides_launch.c)
+SIGS["file_size"] = ("55 8B EC 6A FF 68 ? ? ? ? 64 A1 00 00 00 00 50 64 89 25 00 00 00 00 83 EC 0C A1 ? ? ? ? 8B 08 53 "
+                     "56 57 33 FF 3B CF 89 65 F0 89 7D FC 74 ? 8B 4D 08 57 68 80 00 00 00 6A 03 57 6A 01 68 00 00 00 80 51 FF 15")
+WRAPS["game.exe!=file_size"] = ("ovr_launch_file_size", 0)
 
 # Engine: Hor+ для широкого экрана (runtime/overrides_engine.c)
 WRAPS["Engine.dll!?UpdateMatrices@FCameraSceneNode@@UAEXXZ"] = ("ovr_engine_camera_matrices", 0)

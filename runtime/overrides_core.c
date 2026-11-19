@@ -1,9 +1,12 @@
-// Нативные замены функций Core.dll и копий memcpy в модулях (таблица — recomp/overrides.py).
+// Нативные замены функций Core.dll и копий memcpy в модулях (таблица — recomp/overrides.py; game.exe —
+// overrides_launch.c).
 #include <stdio.h>
 #include <stdlib.h>
 
 #include "runtime/abi.h"
+#include "runtime/ini_cache.h"
 #include "runtime/process.h"
+#include "runtime/rt.h"
 
 // ---------------------------------------------------------------- обход свойств класса
 // TFieldIterator<UProperty> (Core.dll, не экспорт): от текущего поля по цепочке Children/Next, затем в
@@ -126,8 +129,11 @@ store:
 extern void (*const ovr_orig_ovr_core_collect_garbage)(CPU *c);
 extern void (*const ovr_orig_ovr_core_struct_link)(CPU *c);
 
+static u32 g_gc_epoch = 1;  // сборки мусора: классы могли освободиться (перечитывание конфига ниже)
+
 void ovr_core_collect_garbage(CPU *c)
 {
+    g_gc_epoch++;
     __atomic_add_fetch(&g_fn_epoch, 1, __ATOMIC_RELAXED);
     RT_ENTER_GEN(c, ovr_orig_ovr_core_collect_garbage);  // оригинал — код гостя
     __atomic_add_fetch(&g_fn_epoch, 1, __ATOMIC_RELAXED);
@@ -140,6 +146,336 @@ void ovr_core_struct_link(CPU *c)
     __atomic_add_fetch(&g_fn_epoch, 1, __ATOMIC_RELAXED);
 }
 
+// ---------------------------------------------------------------- SaveConfig: перечитывание конфига в умолчания
+// UObject::SaveConfig пишет config-свойства объекта в кеш ini (GConfig), сбрасывает изменённые файлы на диск и
+// перечитывает конфиг в умолчания всех классов под верхним config-классом цепочки: LoadConfig(1) умолчаний каждого,
+// рекурсивно по уровням до верхнего, на каждом — обход всех полей цепочки и GetString на каждое config-свойство. У
+// контроллеров это Controller и 51 подкласс. Скрипты SHGame на картах BEANSTALK* (Coin, CoinStack, MoneyBag,
+// EnergyKeg, EnergyBar: AnnouncePickup) зовут SaveConfig контроллера героя на каждом подборе: на маке ≈2 мс, три
+// четверти из них — это перечитывание. С пропуском ниже и GetString по памяти (overrides_launch.c) — 0,7 мс
+// (SNX_CFG_TEST); запись User.ini уходит в фон (runtime/hle/kernel32_file.c).
+// LoadConfig умолчаний класса читает только секции [Пакет.Класс] классов своей цепочки (globalconfig — секцию
+// класса-владельца, он тоже в цепочке). Перед перечитыванием считается хеш содержимого этих секций во всех файлах
+// кеша; совпал с хешем прошлого перечитывания этого класса — значения из ini те же, вызов пропускается. Подбор
+// монеты меняет только [ShGame.ShHeroController]: перечитываются 3 класса из 51. Отличие от ПК: умолчание,
+// изменённое скриптом без сохранения (default.X = ...), чужой SaveConfig к значению из ini не вернёт.
+// SNX_CFG_CHECK=1 — пропусков нет: умолчания пропущенного класса сравниваются до и после LoadConfig.
+// Раскладка кеша ini — runtime/ini_cache.h.
+extern void (*const ovr_orig_ovr_core_save_config)(CPU *c);
+extern void (*const ovr_orig_ovr_core_load_config)(CPU *c);
+
+#define OBJ_INDEX 0x04u
+#define OBJ_OUTER 0x18u
+#define OBJ_NAME 0x20u
+#define FIELD_SUPER 0x2Cu
+#define CLASS_DEFAULTS 0x4ECu  // TArray<BYTE> Defaults: данные, число
+
+#define SC_SECS 512u
+#define SC_CLASSES 4096u
+
+typedef struct {
+    u64 name, body;  // хеш имени (без учёта регистра) и содержимого, body = 0 — ещё не считан
+    u32 sec;
+} sc_sec;
+
+static struct {
+    u32 body_lo, gconfig_va, names_va;  // SaveConfig (тело), адрес GConfig, FName::Names
+    int depth, ready;                   // вложенность SaveConfig; таблица секций собрана
+    u32 obj;                            // объект текущего SaveConfig (обход классов ниже)
+    u32 nsec, loaded, skipped;
+    sc_sec sec[SC_SECS];
+    struct {
+        u32 cls, epoch;
+        u64 hash;
+    } cls[SC_CLASSES];
+} g_sc;
+
+#define FNV_INIT 0xcbf29ce484222325ull
+static inline u64 fnv(u64 h, u32 v) { return (h ^ v) * 0x100000001b3ull; }
+
+static u64 hash_wstr(u64 h, u32 p, u32 n, int fold)  // FString гостя: n символов с нулём
+{
+    for (u32 i = 0; p && i < n; i++) {
+        u32 ch = rd16(g_mem, p + 2 * i);
+        if (!ch)
+            break;
+        h = fnv(h, fold && ch >= 'A' && ch <= 'Z' ? ch + 32 : ch);
+    }
+    return h;
+}
+
+static u64 hash_fname(u64 h, u32 obj)  // имя объекта (FNameEntry: строка с +0xC)
+{
+    u32 idx = rd32(g_mem, obj + OBJ_NAME), n = rd32(g_mem, g_sc.names_va + TARRAY_NUM);
+    u32 e = idx < n ? rd32(g_mem, rd32(g_mem, g_sc.names_va) + 4 * idx) : 0;
+    return e ? hash_wstr(h, e + 0xC, 1024, 1) : fnv(h, 0xFFFFFFFFu);
+}
+
+// все секции всех файлов кеша: хеш имени; содержимое — при первом запросе
+static int sc_collect(void)
+{
+    u32 cfg = rd32(g_mem, g_sc.gconfig_va), files = rd32(g_mem, cfg + CFG_FILES);
+    u32 nf = rd32(g_mem, cfg + CFG_FILES + TARRAY_NUM);
+    g_sc.nsec = 0;
+    for (u32 i = 0; i < nf; i++) {
+        u32 f = files + i * CFG_FILE_SIZE, secs = rd32(g_mem, f + CFG_FILE_SECS);
+        u32 ns = rd32(g_mem, f + CFG_FILE_SECS + TARRAY_NUM);
+        for (u32 j = 0; j < ns; j++) {
+            if (g_sc.nsec == SC_SECS)
+                return 0;
+            u32 s = secs + j * CFG_SEC_SIZE;
+            g_sc.sec[g_sc.nsec++] = (sc_sec){hash_wstr(FNV_INIT, rd32(g_mem, s + 4), rd32(g_mem, s + 8), 1), 0, s};
+        }
+    }
+    return 1;
+}
+
+static u64 sc_body(sc_sec *s)
+{
+    if (!s->body) {
+        u32 kv = rd32(g_mem, s->sec + CFG_SEC_PAIRS), n = rd32(g_mem, s->sec + CFG_SEC_PAIRS + TARRAY_NUM);
+        u64 h = fnv(FNV_INIT, n);
+        for (u32 i = 0; i < n; i++) {
+            u32 p = kv + i * CFG_KV_SIZE;
+            h = fnv(hash_wstr(h, rd32(g_mem, p + 4), rd32(g_mem, p + 8), 0), '=');
+            h = fnv(hash_wstr(h, rd32(g_mem, p + 0x10), rd32(g_mem, p + 0x14), 0), '\n');
+        }
+        s->body = h | 1;
+    }
+    return s->body;
+}
+
+// GetPathName: имена внешних объектов от самого внешнего через точку
+static u64 hash_path(u64 h, u32 obj, int depth)
+{
+    u32 outer = rd32(g_mem, obj + OBJ_OUTER);
+    if (outer && depth < 16)
+        h = fnv(hash_path(h, outer, depth + 1), '.');
+    return hash_fname(h, obj);
+}
+
+// содержимое секций [Пакет.Класс] цепочки класса во всех файлах кеша
+static u64 sc_class_hash(u32 cls)
+{
+    u64 h = FNV_INIT;
+    for (u32 k = cls, depth = 0; k && depth < 64; k = rd32(g_mem, k + FIELD_SUPER), depth++) {
+        u64 name = hash_path(FNV_INIT, k, 0);
+        h = fnv(h, (u32)name);
+        for (u32 i = 0; i < g_sc.nsec; i++)
+            if (g_sc.sec[i].name == name) {
+                u64 b = sc_body(&g_sc.sec[i]);
+                h = fnv(fnv(fnv(h, i), (u32)b), (u32)(b >> 32));
+            }
+    }
+    return h;
+}
+
+void ovr_core_save_config(CPU *c)
+{
+    u32 obj = c->ecx;
+    if (!g_sc.gconfig_va) {
+        rt_module *core = rt_module_by_name("Core");
+        u32 ex = rt_module_export(core, "?SaveConfig@UObject@@QAEXKPBG@Z", 0);
+        g_sc.gconfig_va = rt_module_export(core, "?GConfig@@3PAVFConfigCache@@A", 0);
+        g_sc.names_va = rt_module_export(core, "?Names@FName@@0V?$TArray@PAUFNameEntry@@@@A", 0);
+        // экспорт — переходник инкрементальной компоновки (jmp rel32) на тело
+        g_sc.body_lo = ex && g_mem[ex] == 0xE9 ? ex + 5 + rd32(g_mem, ex + 1) : ex;
+        if (!g_sc.gconfig_va || !g_sc.names_va)
+            g_sc.body_lo = 0;  // кеш не найти — без пропусков
+    }
+    u32 loaded = g_sc.loaded, skipped = g_sc.skipped, outer = g_sc.obj;
+    g_sc.obj = obj;
+    g_sc.ready = 0;
+    g_sc.loaded = g_sc.skipped = 0;
+    g_sc.depth++;
+    u64 t0 = rt_ticks_ns(), file0 = __atomic_load_n(&rt_file_ns, __ATOMIC_RELAXED);
+    RT_ENTER_GEN(c, ovr_orig_ovr_core_save_config);  // оригинал — код гостя
+    g_sc.depth--;
+    // строка — только для замеров или долгого вызова: на Switch fprintf через nxlink или в snx.log на SD стоит
+    // больше миллисекунды, а скрипт зовёт SaveConfig на каждой монете
+    static int verbose = -1;
+    if (verbose < 0)
+        verbose = getenv("SNX_CFG_TEST") || cfg_check();
+    double ms = (double)(rt_ticks_ns() - t0) / 1e6;
+    if (verbose || ms >= 30) {
+        char cls[64] = "";
+        u32 k = rd32(g_mem, obj + OBJ_CLASS), idx = rd32(g_mem, k + OBJ_NAME);
+        u32 e = g_sc.names_va && idx < rd32(g_mem, g_sc.names_va + 4) ? rd32(g_mem, rd32(g_mem, g_sc.names_va) + 4 * idx) : 0;
+        for (u32 i = 0; e && i < sizeof cls - 1; i++)
+            if (!(cls[i] = (char)rd16(g_mem, e + 0xC + 2 * i)))
+                break;
+        fprintf(stderr, "[core] SaveConfig(%s): %.1f ms (files %.1f ms), defaults reloaded for %u of %u classes\n", cls,
+                ms, (double)(__atomic_load_n(&rt_file_ns, __ATOMIC_RELAXED) - file0) / 1e6, g_sc.loaded,
+                g_sc.loaded + g_sc.skipped);
+    }
+    g_sc.ready = 0;  // таблица секций — только на время одного SaveConfig (вложенный собирает свою)
+    g_sc.loaded = loaded;
+    g_sc.obj = outer;
+    g_sc.skipped = skipped;
+}
+
+void ovr_core_load_config(CPU *c)
+{
+    u32 obj = c->ecx, ret = rd32(g_mem, c->esp);
+    u32 propagate = rd32(g_mem, c->esp + 4), cls_arg = rd32(g_mem, c->esp + 8), file = rd32(g_mem, c->esp + 12);
+    // только перечитывание из цикла SaveConfig: LoadConfig(1, NULL, NULL) у умолчаний класса
+    if (!g_sc.depth || !g_sc.body_lo || ret - g_sc.body_lo >= 0x600u || propagate != 1 || cls_arg || file ||
+        rd32(g_mem, obj + OBJ_INDEX) != 0xFFFFFFFFu) {
+        RT_ENTER_GEN(c, ovr_orig_ovr_core_load_config);  // оригинал — код гостя
+        return;
+    }
+    if (!g_sc.ready)
+        g_sc.ready = sc_collect() ? 1 : -1;
+    u32 cls = rd32(g_mem, obj + OBJ_CLASS);
+    if (g_sc.ready < 0) {  // секций больше таблицы — без пропусков
+        g_sc.loaded++;
+        RT_ENTER_GEN(c, ovr_orig_ovr_core_load_config);  // оригинал — код гостя
+        return;
+    }
+    u64 h = sc_class_hash(cls);
+    u32 slot = (cls * 0x9E3779B1u) >> 20;  // 12 бит: SC_CLASSES
+    for (u32 n = 0; n < SC_CLASSES && g_sc.cls[slot].cls && g_sc.cls[slot].cls != cls; n++)
+        slot = (slot + 1) & (SC_CLASSES - 1);
+    if (g_sc.cls[slot].cls && g_sc.cls[slot].cls != cls) {  // таблица полна — заново
+        memset(g_sc.cls, 0, sizeof g_sc.cls);
+        slot = (cls * 0x9E3779B1u) >> 20;
+    }
+    int same = g_sc.cls[slot].cls == cls && g_sc.cls[slot].epoch == g_gc_epoch && g_sc.cls[slot].hash == h;
+    g_sc.cls[slot].cls = cls;
+    g_sc.cls[slot].epoch = g_gc_epoch;
+    g_sc.cls[slot].hash = h;
+    if (same && !cfg_check()) {
+        g_sc.skipped++;
+        c->esp += 16;  // thiscall, три аргумента: ret 12
+        return;
+    }
+    if (!same) {
+        g_sc.loaded++;
+        RT_ENTER_GEN(c, ovr_orig_ovr_core_load_config);  // оригинал — код гостя
+        return;
+    }
+    // SNX_CFG_CHECK: пропустили бы — умолчания должны остаться прежними
+    g_sc.skipped++;
+    u32 data = rd32(g_mem, cls + CLASS_DEFAULTS), size = rd32(g_mem, cls + CLASS_DEFAULTS + TARRAY_NUM);
+    u8 *before = size ? calloc(1, size + 4) : NULL;
+    if (before)
+        memcpy(before, g_mem + data, size);
+    RT_ENTER_GEN(c, ovr_orig_ovr_core_load_config);  // оригинал — код гостя
+    for (u32 i = 0; before && i < size && data == rd32(g_mem, cls + CLASS_DEFAULTS); i += 4)
+        if (memcmp(before + i, g_mem + data + i, size - i < 4 ? size - i : 4))
+            fprintf(stderr, "[core] SNX_CFG_CHECK: class %08x defaults +%x changed: %08x -> %08x\n", cls, i,
+                    rd32(before, i), rd32(g_mem, data + i));
+    free(before);
+}
+
+// ---------------------------------------------------------------- обход классов из SaveConfig
+// Core.dll!0x10125a00 — TObjectIterator<T>::operator++ (одна копия шаблона на все T; итератор: Class, Index):
+// следующий объект GObjObjects, который IsA(Class), или Index = Num. SaveConfig после записи ini обходит так все
+// классы (TObjectIterator<UClass>) и перечитывает умолчания тех, что IsChildOf(верхний config-класс цепочки
+// объекта): на каждой монете — весь массив объектов, у каждого читается Class; на Switch ≈2,8 мс промахов кеша.
+// Для вызовов из SaveConfig (по адресу возврата) следующий индекс берётся из списка подклассов верхнего класса:
+// остальные классы цикл SaveConfig всё равно пропускает. Список строится полным обходом и годен, пока не было
+// UStruct::Link и сборки мусора (g_fn_epoch): класс из пакета до исполнения скрипта проходит Link
+// (ULinkerLoad::Preload в EndLoad), нативные регистрируются при старте. Каждый индекс из списка проверяется заново
+// (объект на месте, IsA, IsChildOf). SNX_CFG_CHECK=1 — каждый шаг сверяется с оригиналом.
+extern void (*const ovr_orig_ovr_core_objit_next)(CPU *c);
+
+#define CLASS_FLAGS 0x49Cu
+#define CLASS_CONFIG 0x4u
+
+static struct {
+    u32 objs_va, uclass;  // GObjObjects (TArray), UClass::PrivateStaticClass; uclass = 1 — не найдены
+    u32 base, epoch, n, cap;
+    u32 *idx;  // индексы подклассов base по возрастанию (эпоха epoch)
+} g_oi;
+
+static int oi_child(u32 k, u32 base)  // UStruct::IsChildOf: цепочка SuperField
+{
+    for (u32 d = 0; k && d < 64; k = rd32(g_mem, k + FIELD_SUPER), d++)
+        if (k == base)
+            return 1;
+    return 0;
+}
+
+// объект i — класс (IsA(UClass)) и подкласс base
+static int oi_match(u32 arr, u32 num, u32 i, u32 base)
+{
+    u32 o = i < num ? rd32(g_mem, arr + 4 * i) : 0;
+    return o && oi_child(rd32(g_mem, o + OBJ_CLASS), g_oi.uclass) && oi_child(o, base);
+}
+
+void ovr_core_objit_next(CPU *c)
+{
+    u32 it = c->ecx, ret = rd32(g_mem, c->esp);
+    if (g_sc.depth && !g_oi.uclass) {
+        rt_module *core = rt_module_by_name("Core");
+        g_oi.objs_va = core ? rt_module_export(core, "?GObjObjects@UObject@@0V?$TArray@PAVUObject@@@@A", 0) : 0;
+        g_oi.uclass = core ? rt_module_export(core, "?PrivateStaticClass@UClass@@0V1@A", 0) : 0;
+        if (!g_oi.objs_va || !g_oi.uclass)
+            g_oi.uclass = 1;
+    }
+    if (!g_sc.depth || !g_sc.obj || !g_sc.body_lo || ret - g_sc.body_lo >= 0x600u || g_oi.uclass <= 1 ||
+        rd32(g_mem, it) != g_oi.uclass) {
+        RT_ENTER_GEN(c, ovr_orig_ovr_core_objit_next);  // оригинал — код гостя
+        return;
+    }
+    // верхний config-класс, как в SaveConfig (Core.dll!0x10165071): пока у предка есть CLASS_Config
+    u32 base = rd32(g_mem, g_sc.obj + OBJ_CLASS);
+    for (u32 s, d = 0; d < 64 && (s = rd32(g_mem, base + FIELD_SUPER)) && (rd32(g_mem, s + CLASS_FLAGS) & CLASS_CONFIG); d++)
+        base = s;
+    u32 arr = rd32(g_mem, g_oi.objs_va), num = rd32(g_mem, g_oi.objs_va + TARRAY_NUM);
+    u32 epoch = __atomic_load_n(&g_fn_epoch, __ATOMIC_RELAXED);
+    if (!g_oi.idx || g_oi.base != base || g_oi.epoch != epoch) {
+        g_oi.n = 0;
+        for (u32 i = 0; i < num; i++)
+            if (oi_match(arr, num, i, base)) {
+                if (g_oi.n == g_oi.cap) {
+                    u32 *p = realloc(g_oi.idx, (g_oi.cap = g_oi.cap ? 2 * g_oi.cap : 64) * sizeof *p);
+                    if (!p) {
+                        free(g_oi.idx);
+                        g_oi.idx = NULL, g_oi.n = g_oi.cap = 0;
+                        RT_ENTER_GEN(c, ovr_orig_ovr_core_objit_next);  // оригинал — код гостя
+                        return;
+                    }
+                    g_oi.idx = p;
+                }
+                g_oi.idx[g_oi.n++] = i;
+            }
+        g_oi.base = base, g_oi.epoch = epoch;
+    }
+    s32 index = (s32)rd32(g_mem, it + 4);
+    u32 lo = 0, hi = g_oi.n;  // первый индекс списка больше index
+    while (lo < hi) {
+        u32 mid = (lo + hi) / 2;
+        if ((s64)g_oi.idx[mid] <= (s64)index)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    u32 next = num;
+    for (; lo < g_oi.n; lo++)
+        if (oi_match(arr, num, g_oi.idx[lo], base)) {
+            next = g_oi.idx[lo];
+            break;
+        }
+    if (cfg_check()) {  // оригинал: шаги до подкласса base или конца
+        u32 sp = c->esp, want;
+        for (;;) {
+            RT_ENTER_GEN(c, ovr_orig_ovr_core_objit_next);  // оригинал — код гостя; адрес возврата остаётся на sp
+            c->esp = sp;
+            want = rd32(g_mem, it + 4);
+            if (want >= num || oi_match(arr, num, want, base))
+                break;
+        }
+        if (want != next)
+            fprintf(stderr, "[core] SNX_CFG_CHECK: class iterator after %d: %u, original %u\n", index, next, want);
+    }
+    wr32(g_mem, it + 4, next);
+    c->eax = next < num ? g_oi.uclass : next;  // как у оригинала: найденный класс цепочки или индекс конца
+    c->edx = g_oi.uclass;
+    c->esp += 4;
+}
+
 // ---------------------------------------------------------------- memcpy модулей
 // Своя копия у каждой DLL (из статического CRT, cdecl dst, src, n): на SSE — выравнивание и хвост переходами по
 // вычисленному адресу (jmp ecx), а это поиск функции по адресу на каждом переходе. Зовут её и на 1–4 байта
@@ -150,29 +486,4 @@ void ovr_memcpy(CPU *c)
     memmove(g_mem + dst, g_mem + src, n);
     c->eax = dst;
     c->esp += 4;
-}
-
-// ---------------------------------------------------------------- запись файла (game.exe)
-// FArchiveFileWriter::Serialize(V, Length): копия в буфер 4 КБ архива, полный буфер — виртуальный Flush (WriteFile).
-// Сохранение пишет так каждое поле по 1–4 байта; помещается в буфер — копия здесь же, иначе — оригинал.
-#define FW_POS 0x48u
-#define FW_COUNT 0x4Cu
-#define FW_BUF 0x50u
-#define FW_BUF_SIZE 0x1000u
-
-extern void (*const ovr_orig_ovr_launch_file_write)(CPU *c);
-
-void ovr_launch_file_write(CPU *c)
-{
-    u8 *m = g_mem;
-    u32 ar = c->ecx, v = rd32(m, c->esp + 4);
-    s32 len = (s32)rd32(m, c->esp + 8), cnt = (s32)rd32(m, ar + FW_COUNT);
-    if (len < 0 || cnt < 0 || len > (s32)FW_BUF_SIZE - cnt) {
-        RT_ENTER_GEN(c, ovr_orig_ovr_launch_file_write);  // оригинал — код гостя
-        return;
-    }
-    wr32(m, ar + FW_POS, rd32(m, ar + FW_POS) + (u32)len);
-    memmove(m + ar + FW_BUF + (u32)cnt, m + v, (u32)len);
-    wr32(m, ar + FW_COUNT, (u32)(cnt + len));
-    c->esp += 12;  // thiscall, два аргумента: ret 8
 }

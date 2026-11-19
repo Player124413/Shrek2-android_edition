@@ -32,6 +32,8 @@ void hle_todo(const char *what);
 
 // Отложенная запись файлов гостя (kernel32_file.c) — на диск; при выходе — сама (atexit), при ловушке — вызвать
 void hle_file_flush_all(void);
+// размер файла по имени (UTF-16 гостя) без открытия, если он известен (kernel32_file.c): 1 — *size (-1 — нет файла)
+int hle_file_size_known(u32 wname, s64 *size);
 
 // Долгие кадры (строка [hitch] в d3d8_present): счётчики с начала работы, кадр берёт разность
 typedef struct {

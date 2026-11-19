@@ -1,4 +1,4 @@
-add_library(snx_runtime STATIC rt.c loader.c overrides_crt.c overrides_core.c overrides_engine.c vmem.c heap.c process.c hle/vfs.c)
+add_library(snx_runtime STATIC rt.c loader.c overrides_crt.c overrides_core.c overrides_engine.c overrides_launch.c vmem.c heap.c process.c hle/vfs.c)
 if(NINTENDO_SWITCH)
   target_sources(snx_runtime PRIVATE ${PROJECT_SOURCE_DIR}/platform/switch/mem.c)
 endif()
