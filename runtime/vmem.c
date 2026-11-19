@@ -3,7 +3,7 @@
 #include "runtime/vmem.h"
 
 #include <pthread.h>
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__ANDROID__)
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -59,7 +59,7 @@ void vm_zero(u32 addr, u32 size)
 {
     if (!size)
         return;
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__ANDROID__)
     // целые страницы хоста заменяем свежим анонимным отображением: нули и возврат памяти системе
     size_t pg = (size_t)getpagesize();
     size_t lo = ((size_t)addr + pg - 1) & ~(pg - 1), hi = ((size_t)addr + size) & ~(pg - 1);

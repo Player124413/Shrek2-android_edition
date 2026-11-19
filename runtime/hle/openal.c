@@ -16,6 +16,11 @@
 #include <AL/alc.h>
 #endif
 
+#ifndef ALC_APIENTRY
+#define ALC_APIENTRY
+#endif
+
+#include "platform/window.h"
 #include "runtime/heap.h"
 #include "runtime/hle/hle.h"
 
@@ -104,10 +109,32 @@ static u32 guest_str(const char *s, size_t len)
 }
 
 // ---------------------------------------------------------------- ALC
+// приложение в фоне (Android: свёрнуто) — вывод звука на паузе (ALC_SOFT_pause_device), иначе он играет дальше
+static ALCdevice *g_pause_dev;
+
+static void on_pause(int paused)
+{
+    ALCdevice *d = g_pause_dev;
+    if (!d || !alcIsExtensionPresent(d, "ALC_SOFT_pause_device"))
+        return;
+    void(ALC_APIENTRY * fn)(ALCdevice *) =
+        (void(ALC_APIENTRY *)(ALCdevice *))alcGetProcAddress(d, paused ? "alcDevicePauseSOFT" : "alcDeviceResumeSOFT");
+    if (fn)
+        fn(d);
+}
+
 static void alc_OpenDevice(CPU *c)
 {
     const char *want = ARG(0) ? hle_cstr(ARG(0)) : "(default)";
     ALCdevice *d = alcOpenDevice(NULL);
+    static int hooked;
+    if (d) {
+        g_pause_dev = d;
+        if (!hooked) {
+            hooked = 1;
+            plat_add_pause_hook(on_pause);
+        }
+    }
     fprintf(stderr, "[openal] alcOpenDevice(%s) -> %s\n", want,
             d ? alcGetString(d, ALC_DEVICE_SPECIFIER) : "failed");
     RET(0, handle_of(d));
@@ -116,6 +143,8 @@ static void alc_OpenDevice(CPU *c)
 static void alc_CloseDevice(CPU *c)
 {
     ALCdevice *d = host_of(ARG(0));
+    if (d == g_pause_dev)
+        g_pause_dev = NULL;
     ALCboolean r = d ? alcCloseDevice(d) : ALC_FALSE;
     handle_drop(d);
     RET(0, r);

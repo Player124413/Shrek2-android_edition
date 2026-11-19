@@ -470,6 +470,22 @@ static FT_Face open_face(const char *name, int bold, int *synth_bold)
         *synth_bold = bold;
         return f;
     }
+#elif defined(__ANDROID__)
+    // Tahoma/Arial в Android нет: Roboto (с кириллицей — для русской версии), на старых — Droid Sans. Свой шрифт
+    // (например, Tahoma с ПК) — SNX_GDI_FONT, его ставит лаунчер, если файл лежит в папке игры
+    (void)name;
+    static const char *const reg[] = {"/system/fonts/Roboto-Regular.ttf", "/system/fonts/RobotoStatic-Regular.ttf",
+                                      "/system/fonts/DroidSans.ttf", "/system/fonts/NotoSans-Regular.ttf"};
+    static const char *const bld[] = {"/system/fonts/Roboto-Bold.ttf", "/system/fonts/DroidSans-Bold.ttf"};
+    if (bold)
+        for (size_t i = 0; i < sizeof bld / sizeof bld[0]; i++)
+            if (!FT_New_Face(g_ft, bld[i], 0, &f))
+                return f;
+    for (size_t i = 0; i < sizeof reg / sizeof reg[0]; i++)
+        if (!FT_New_Face(g_ft, reg[i], 0, &f)) {
+            *synth_bold = bold;
+            return f;
+        }
 #else
     static const char dir[] = "/System/Library/Fonts/Supplemental/";
     const char *files[2][2] = {{"Arial.ttf", "Arial Bold.ttf"}, {"Tahoma.ttf", "Tahoma Bold.ttf"}};

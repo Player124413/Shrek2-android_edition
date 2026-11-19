@@ -92,6 +92,14 @@ static FT_Face open_font(FT_Library ft)
         R_SUCCEEDED(plGetSharedFontByType(&fd, PlSharedFontType_Standard)) &&
         !FT_New_Memory_Face(ft, (const FT_Byte *)fd.address, (FT_Long)fd.size, 0, &face))
         return face;
+#elif defined(__ANDROID__)
+    // системные шрифты Android разных лет: Roboto (5+, на 12+ — переменный и RobotoStatic), Droid Sans (старые)
+    static const char *const paths[] = {"/system/fonts/Roboto-Bold.ttf", "/system/fonts/RobotoStatic-Regular.ttf",
+                                        "/system/fonts/Roboto-Regular.ttf", "/system/fonts/DroidSans-Bold.ttf",
+                                        "/system/fonts/DroidSans.ttf", "/system/fonts/NotoSans-Regular.ttf"};
+    for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++)
+        if (!FT_New_Face(ft, paths[i], 0, &face))
+            return face;
 #else
     static const char *const paths[] = {"/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf",
                                         "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
@@ -286,8 +294,8 @@ static GLint g_loc_size;
 static GLuint shader(GLenum type, const char *src)
 {
     GLuint s = glCreateShader(type);
-    const char *srcs[2] = {SNX_GLSL_HEADER, src};
-    glShaderSource(s, 2, srcs, NULL);
+    const char *srcs[3] = {SNX_GLSL_HEADER, SNX_GLSL_PRECISION, src};
+    glShaderSource(s, 3, srcs, NULL);
     glCompileShader(s);
     GLint ok = 0;
     glGetShaderiv(s, GL_COMPILE_STATUS, &ok);

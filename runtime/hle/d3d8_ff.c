@@ -1,4 +1,4 @@
-// HLE Direct3D 8: отрисовка поверх GL 4.1 core — цели рендера, состояние GL, фиксированный конвейер D3D
+// HLE Direct3D 8: отрисовка поверх GL 4.1 core (Android — ES 3.0, platform/gles_shim.h) — цели рендера, состояние GL, фиксированный конвейер D3D
 // (преобразования, освещение по формулам D3D, туман, генерация/матрицы текстурных координат, текстурные стадии,
 // альфа-тест), сгенерированный в GLSL по ключу состояния с кешем программ; Present.
 // Матрицы D3D (строки, вектор-строка) загружаются в GL как есть: GL читает их по столбцам, получается
@@ -8,6 +8,7 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #ifdef __APPLE__
 #include <libproc.h>
 #include <sys/resource.h>
@@ -15,6 +16,9 @@
 #endif
 
 #include "platform/window.h"
+#ifdef __ANDROID__
+#include "platform/android/perf.h"
+#endif
 #include "runtime/hle/d3d8.h"
 #include "runtime/game/menu.h"
 #include "runtime/hle/overlay.h"
@@ -97,6 +101,10 @@ typedef struct {
     u8 light[MAX_LIGHTS];  // 0 выкл, 1 point, 2 spot, 3 directional
     u32 ps;                // пиксельный шейдер (0 — стадии)
     stagekey st[MAX_STAGES];
+#ifdef SNX_GLES
+    u16 bgra;              // входы D3DCOLOR (B,G,R,A в памяти): в ES нет размера GL_BGRA — переставляет шейдер
+    u8 clipvary;           // плоскости отсечения без GL_EXT_clip_cull_distance: varying и discard
+#endif
 } ffkey;
 
 typedef struct {
@@ -134,6 +142,10 @@ static void make_key(d3ddev *d, const vdecl *decl, ffkey *k)
             static const u8 comps[8] = {1, 2, 3, 4, 4, 4, 2, 4};
             k->tcsize[r - 7] = comps[decl->e[i].type & 7];
         }
+#ifdef SNX_GLES
+        if (r < 16 && decl->e[i].type == 4)
+            k->bgra |= (u16)(1u << r);
+#endif
     }
     const u32 *rs = d->rs;
     k->rhw = (u8)decl->rhw;
@@ -171,6 +183,9 @@ static void make_key(d3ddev *d, const vdecl *decl, ffkey *k)
     if (k->alphafunc == 8)
         k->alphafunc = 0;
     k->clipmask = decl->rhw ? 0 : (u8)(rs[152] & 0x3F);
+#ifdef SNX_GLES
+    k->clipvary = k->clipmask && !gles_caps.clip_distance;
+#endif
     k->ps = d->ps;
     int nst = 0;
     for (int s = 0; s < MAX_STAGES; s++) {
@@ -223,19 +238,44 @@ static void put(sbuf *b, const char *fmt, ...)
     }
 }
 
+// вход D3DCOLOR в ES (ffkey.bgra): атрибут читается как есть под именем <имя>_in, а в начале main — перестановка
+static int in_bgra(const ffkey *k, int reg)
+{
+#ifdef SNX_GLES
+    return (k->bgra >> reg) & 1;
+#else
+    (void)k;
+    (void)reg;
+    return 0;
+#endif
+}
+
+static int clip_vary(const ffkey *k)
+{
+#ifdef SNX_GLES
+    return k->clipvary;
+#else
+    (void)k;
+    return 0;
+#endif
+}
+
 static void gen_vs(const ffkey *k, sbuf *b)
 {
     put(b, SNX_GLSL_HEADER);
+    if (k->clipmask && !clip_vary(k) && SNX_IS_GLES)
+        put(b, "#extension GL_EXT_clip_cull_distance : enable\n");
+    put(b, SNX_GLSL_PRECISION);
     put(b, "layout(location=0) in vec4 a_pos;\n");
     if (k->inputs & (1u << 3))
         put(b, "layout(location=3) in vec3 a_nrm;\n");
     if (k->inputs & (1u << 5))
-        put(b, "layout(location=5) in vec4 a_col0;\n");
+        put(b, "layout(location=5) in vec4 a_col0%s;\n", in_bgra(k, 5) ? "_in" : "");
     if (k->inputs & (1u << 6))
-        put(b, "layout(location=6) in vec4 a_col1;\n");
+        put(b, "layout(location=6) in vec4 a_col1%s;\n", in_bgra(k, 6) ? "_in" : "");
     for (int i = 0; i < 8; i++)
         if (k->inputs & (1u << (7 + i)))
-            put(b, "layout(location=%d) in vec4 a_tc%d;\n", 7 + i, i);
+            put(b, "layout(location=%d) in vec4 a_tc%d%s;\n", 7 + i, i, in_bgra(k, 7 + i) ? "_in" : "");
     put(b, "uniform mat4 u_wv, u_proj, u_world, u_texm[8];\n"
            "uniform vec4 u_vp; uniform vec2 u_depth;\n"
            "uniform vec4 u_mat[4]; uniform float u_power; uniform vec4 u_ambient;\n"
@@ -244,9 +284,18 @@ static void gen_vs(const ffkey *k, sbuf *b)
            "out vec4 v_col0, v_col1; out float v_fog;\n");
     for (int s = 0; s < k->nstages; s++)
         put(b, "out vec4 v_tc%d;\n", s);
-    if (k->clipmask)
+    if (clip_vary(k))
+        put(b, "out float v_clip[6];\n");
+    else if (k->clipmask && !SNX_IS_GLES)
         put(b, "out float gl_ClipDistance[6];\n");
     put(b, "void main() {\n");
+    if (in_bgra(k, 5) && (k->inputs & (1u << 5)))
+        put(b, "  vec4 a_col0 = a_col0_in.zyxw;\n");
+    if (in_bgra(k, 6) && (k->inputs & (1u << 6)))
+        put(b, "  vec4 a_col1 = a_col1_in.zyxw;\n");
+    for (int i = 0; i < 8; i++)
+        if (in_bgra(k, 7 + i) && (k->inputs & (1u << (7 + i))))
+            put(b, "  vec4 a_tc%d = a_tc%d_in.zyxw;\n", i, i);
     if (k->rhw) {
         // экранные координаты D3D -> NDC; центры пикселей D3D целые (GL: +0,5)
         put(b, "  float w = a_pos.w != 0.0 ? 1.0 / a_pos.w : 1.0;\n"
@@ -268,7 +317,7 @@ static void gen_vs(const ffkey *k, sbuf *b)
                "  gl_Position = cp;\n");
         for (int i = 0; i < 6; i++)
             if (k->clipmask & (1u << i))
-                put(b, "  gl_ClipDistance[%d] = dot(u_world * pos, u_clip[%d]);\n", i, i);
+                put(b, "  %s[%d] = dot(u_world * pos, u_clip[%d]);\n", clip_vary(k) ? "v_clip" : "gl_ClipDistance", i, i);
     }
     int need_en = k->lighting;
     for (int s = 0; s < k->nstages; s++)
@@ -429,7 +478,10 @@ static void stage_op(sbuf *b, const char *dst, u32 op, const char *a1, const cha
 static void gen_fs(const ffkey *k, sbuf *b)
 {
     put(b, SNX_GLSL_HEADER);
+    put(b, SNX_GLSL_PRECISION);
     put(b, "in vec4 v_col0, v_col1; in float v_fog;\n");
+    if (clip_vary(k))
+        put(b, "in float v_clip[6];\n");
     for (int s = 0; s < k->nstages; s++)
         put(b, "in vec4 v_tc%d;\n", s);
     for (int s = 0; s < k->nstages; s++)
@@ -439,6 +491,10 @@ static void gen_fs(const ffkey *k, sbuf *b)
            "out vec4 o_color;\n"
            "void main() {\n"
            "  vec4 cur = v_col0, tmp = vec4(0.0), tex = vec4(1.0);\n");
+    if (clip_vary(k))  // плоскости отсечения D3D (ES без GL_EXT_clip_cull_distance)
+        for (int i = 0; i < 6; i++)
+            if (k->clipmask & (1u << i))
+                put(b, "  if (v_clip[%d] < 0.0) discard;\n", i);
     if (k->ps) {
         // интерфейс тела ps.1.x (d3d8_ps.c): v0, v1, tc0..tc5, u_tex0..5, u_psc[]; результат — в cur
         put(b, "  vec4 v0 = v_col0, v1 = v_col1;\n");
@@ -540,17 +596,31 @@ typedef struct {
 static void link_body(link_args *a)
 {
     ffprog *p = a->p;
-    GLuint v = compile(GL_VERTEX_SHADER, a->vs), f = compile(GL_FRAGMENT_SHADER, a->fs);
-    if (!v || !f)
-        return;
-    p->prog = glCreateProgram();
-    glAttachShader(p->prog, v);
-    glAttachShader(p->prog, f);
-    glLinkProgram(p->prog);
-    glDeleteShader(v);
-    glDeleteShader(f);
     GLint ok = 0;
-    glGetProgramiv(p->prog, GL_LINK_STATUS, &ok);
+#ifdef SNX_GLES
+    // собранная в прошлый раз программа (glProgramBinary): без компиляции шейдеров драйвером
+    p->prog = gles_program_load(a->vs, a->fs);
+    ok = p->prog != 0;
+#endif
+    if (!ok) {
+        GLuint v = compile(GL_VERTEX_SHADER, a->vs), f = compile(GL_FRAGMENT_SHADER, a->fs);
+        if (!v || !f)
+            return;
+        p->prog = glCreateProgram();
+        glAttachShader(p->prog, v);
+        glAttachShader(p->prog, f);
+#ifdef SNX_GLES
+        gles_program_hint(p->prog);
+#endif
+        glLinkProgram(p->prog);
+        glDeleteShader(v);
+        glDeleteShader(f);
+        glGetProgramiv(p->prog, GL_LINK_STATUS, &ok);
+#ifdef SNX_GLES
+        if (ok)
+            gles_program_store(p->prog, a->vs, a->fs);
+#endif
+    }
     if (!ok) {
         char log[2048];
         glGetProgramInfoLog(p->prog, sizeof log, NULL, log);
@@ -950,6 +1020,9 @@ static void vertex_count(u32 prim, u32 count, GLenum *mode, u32 *n)
 
 static u32 g_attr_enabled;
 
+// ES без glDrawElementsBaseVertex: базовая вершина — сдвигом указателей атрибутов (вершин от начала буфера)
+static u32 g_attr_base;
+
 static void setup_attribs(d3ddev *d, const vdecl *decl, const void *up, u32 up_stride, u32 up_bytes)
 {
     u32 want = 0;
@@ -974,7 +1047,7 @@ static void setup_attribs(d3ddev *d, const vdecl *decl, const void *up, u32 up_s
             glBindBuffer(GL_ARRAY_BUFFER, b->gl);
             stride = d->stride[e->stream];
         }
-        const void *off = (const void *)(uintptr_t)e->offset;
+        const void *off = (const void *)(uintptr_t)(e->offset + (up ? 0 : g_attr_base * stride));
         switch (e->type) {
         case 0: case 1: case 2: case 3:
             glVertexAttribPointer(e->reg, e->type + 1, GL_FLOAT, GL_FALSE, (GLsizei)stride, off);
@@ -1096,6 +1169,18 @@ void d3d8_draw(d3ddev *d, u32 prim, u32 count, int indexed, u32 first, u32 min_i
         if (!ib)
             return;
         u32 isize = ib->fmt == FMT_INDEX32 ? 4 : 2;
+#ifdef SNX_GLES
+        if (!gles_caps.base_vertex && d->base_vertex) {
+            g_attr_base = d->base_vertex;
+            setup_attribs(d, &decl, NULL, 0, 0);
+            g_attr_base = 0;  // указатели атрибутов ставятся заново при каждой отрисовке
+            d3d8_buf_sync(ib);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib->gl);
+            glDrawElements(mode, (GLsizei)n, isize == 4 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT,
+                           (const void *)(uintptr_t)(first * isize));
+            return;
+        }
+#endif
         setup_attribs(d, &decl, NULL, 0, 0);
         d3d8_buf_sync(ib);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib->gl);
@@ -1239,6 +1324,44 @@ static void maybe_shot(d3ddev *d)
 }
 
 // ================================================================ Present
+// Ограничение частоты кадров (SNX_FPS_CAP=30 и т. п.; лаунчер Android — «Ограничение FPS»: меньше нагрев и
+// троттлинг телефона) и подсказки производительности Android (ADPF): длительность работы кадра потоком гостя —
+// без ожиданий потока рендера и ограничителя.
+static void frame_pace(void)
+{
+    static int cap = -1;
+    static u64 next, last;
+#ifdef __ANDROID__
+    static u64 last_wait;
+#endif
+    if (cap < 0) {
+        const char *e = getenv("SNX_FPS_CAP");
+        cap = e ? atoi(e) : 0;
+        cap = cap < 0 ? 0 : cap;
+#ifdef __ANDROID__
+        android_perf_target(cap > 0 ? 1000000000ull / (u64)cap : 16666667ull);
+#endif
+    }
+    u64 now = rt_ticks_ns();
+#ifdef __ANDROID__
+    u64 wait = cs_wait_total_ns();
+    if (last) {
+        u64 dt = now - last, idle = wait - last_wait;
+        android_perf_frame(dt > idle ? dt - idle : 0);
+    }
+    last_wait = wait;
+#endif
+    if (cap > 0) {
+        u64 period = 1000000000ull / (u64)cap;
+        next = next && now < next + period ? next + period : now + period;
+        if (next > now) {
+            struct timespec ts = {(time_t)((next - now) / 1000000000ull), (long)((next - now) % 1000000000ull)};
+            nanosleep(&ts, NULL);
+        }
+    }
+    last = rt_ticks_ns();
+}
+
 // счётчик кадров: семисегментные цифры прямоугольниками glClear с ножницами (без шейдеров и текстур)
 static _Atomic int g_fps_overlay;
 void d3d8_set_fps_overlay(int on) { g_fps_overlay = on; }
@@ -1383,6 +1506,7 @@ void d3d8_present(d3ddev *d)
     }
     d->draws = 0;
     cs_swap();
+    frame_pace();
     glBindFramebuffer(GL_FRAMEBUFFER, d->fbo);
     g_applied_gen = 0xFFFFFFFFu;
     d->frame++;

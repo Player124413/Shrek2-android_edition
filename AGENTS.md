@@ -70,7 +70,9 @@ NRO). Нативный x86-32 код игры переводится в C (`reco
 | `runtime/hle/` | kernel32 (`kernel32.c`, `kernel32_file.c`, `vfs.c`), user32, gdi32, advapi32 (+winmm, ole32, shell32), `misc.c`, `wsock32.c`, `com.c`, ddraw, `d3d8*.c`, `gl_cs.c`, `overlay.c`, dinput8, `openal.c`, `vorbisfile.c`, `bink*.c` |
 | `runtime/game/` | знание о структурах UE2: меню с геймпада (`menu.c`), обход UObject (`uobj.c`) |
 | `host/boot/` | `main.c` (запуск, ловушки, модальные окна), `input.c` (SDL → WM/DirectInput, `Snx.ini`, `SNX_KEYS`), `config.c` (`game.ini`, `User.ini`), `prof.c` |
-| `host/hello/`, `platform/` | проверка GL/DXT1; окно SDL и контекст GL |
+| `host/hello/`, `platform/` | проверка GL/DXT1; окно SDL и контекст GL; `gles_shim.{h,c}` — GL 4.1 поверх ES 3.0, `android/` — потоки и ADPF |
+| `host/boot/android.c`, `touch.h` | JNI экранного управления (Kotlin → `input.c`) |
+| `android/` | проект Gradle: лаунчер, редактор раскладки, `GameActivity` (SDLActivity) на Kotlin — `docs/ANDROID.md` |
 | `tests/` | `rt/` (CTest), `bink/` (сверка с ffmpeg), `difftest/` (unicorn, нужна игра), `test_public.py` |
 | `tools/` | `build.sh`, `check_public.py`, `switch_upload.py`, `pgo_fetch.py`, `make_rus.sh`, `make_icon.sh`, `cc_partition.sh`, `probe/` (профили, дизассемблер), `recon/` (PE, MSI, пакеты `.u`) |
 
@@ -208,6 +210,7 @@ EXCEPTION_RECORD/CONTEXT на стеке гостя и зовёт цепочку
 
 ```sh
 tools/build.sh mac|mac-rus|switch|switch-rus|switch-pgo [цели]   # каталог build/<вариант>
+tools/android_deps.sh [--ffmpeg] && tools/build.sh android|android-rus   # APK, docs/ANDROID.md
 tools/.venv/bin/python -I recomp/main.py discover --game game/System [модули]
 tools/.venv/bin/python -I recomp/main.py gen --game game/System --out build/gen [модули]
 build/mac/host/boot/snx_boot [--game game] [--user DIR] [--dlls-only] [--headless] [--seconds N] [-- карта]
@@ -250,6 +253,7 @@ tools/build.sh mac difftest_msvcr70 && UC_IGNORE_REG_BREAK=1 tools/.venv/bin/pyt
 | `SNX_FIELD_CHECK=1` | сверить кеш обхода свойств с полным обходом |
 | `SNX_PERF=1`, `SNX_NOVSYNC=1`, `SNX_PROF=<файл>`, `SNX_CALLSTATS=<файл>` | инструкции и такты на кадр; без vsync; профиль; счётчики входов |
 | `SNX_RENDER_THREAD=0`, `SNX_GLTHREAD=1`, `SNX_FILE_CACHE_MB` | без потока рендера; glthread Mesa; бюджет образов пакетов |
+| `SNX_RENDER_SCALE`, `SNX_FPS_CAP`, `SNX_TEX16`, `SNX_GLES_S3TC=0`, `SNX_SHADER_CACHE`, `SNX_AFFINITY=0`, `SNX_ADPF=0`, `SNX_SHOW_FPS` | Android (`docs/ANDROID.md`): доля разрешения, ограничение FPS, DXT→16 бит, кэш программ, ядра, ADPF |
 | `SNX_UO_DUMP=<с>`, `SNX_UO_CLASS`, `SNX_UO_ALL`, `SNX_FONT`, `SNX_GDI_FONT`, `SNX_QUIET_LOG`, `SNX_FULLSCREEN` | дамп объектов UE2; шрифты оверлея и GDI; без `[log]`; полный экран на маке |
 
 ### Отладка
@@ -310,5 +314,9 @@ FDIV, `fnstenv/fldenv` (не реализованы), `_j0/_j1/_jn` на кра�
   нативное чтение `FArchive`, старт игры. Выбирай по свежему профилю.
 * D3D8: недостающие методы (выше); проверить тени в катсцене полёта Осла после исправления полупикселя.
 * 2D-интерфейс растянут в 16:9.
+* **Android (не проверен ни разу):** C проверен только синтаксически (zig cc, musl, заголовки Khronos);
+  CMake-ветка `cmake/android.cmake`, Gradle и Kotlin не собирались. Сначала — сборка и запуск на телефоне, затем
+  прослойка ES (`gles_shim.c`: смещение LOD, чтение DXT и глубины, `glCompressedTexSubImage2D`), кольцевой
+  буфер для `STREAM`-вершин, замер на слабом телефоне.
 * Не проверены: загрузка сейвов, переходы между уровнями (`3_The_Hunt_Part4`), окно фатальной ошибки на Switch,
   HOME и сон (`docs/CONSOLE.md`), визуальная сверка с ПК.

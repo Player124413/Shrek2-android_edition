@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <time.h>
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__ANDROID__)
 #include <sys/mman.h>
 #endif
 
@@ -48,7 +48,7 @@ static void cnt_init(void);
 int rt_mem_init(void)
 {
     cnt_init();
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__ANDROID__)
     // 4 ГБ виртуального адреса: любой u32-адрес попадает в резерв, мусорный указатель даёт SIGSEGV,
     // а не порчу хостовой памяти. Рабочее окно [64 КБ, RT_WINDOW) — чтение/запись, страница 0 закрыта.
     void *p = mmap(NULL, 0x100000000ull, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
@@ -298,8 +298,8 @@ static rt_jmp *setjmp_continuation(const CPU *c, u32 target)
 
 static _Noreturn void host_longjmp(rt_jmp *j)
 {
-#ifdef __APPLE__
-    _longjmp(j->buf, 1);
+#if defined(__APPLE__) || defined(__ANDROID__)
+    _longjmp(j->buf, 1);  // без восстановления маски сигналов (системного вызова)
 #else
     longjmp(j->buf, 1);
 #endif

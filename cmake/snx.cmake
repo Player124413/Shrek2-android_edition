@@ -1,7 +1,14 @@
 # snx_add_app(<target> SOURCES ... [LIBS ...] [TITLE имя] [ICON jpg 256x256]): исполняемый файл для mac,
-# .nro для Switch (без ICON — иконка libnx по умолчанию).
+# .nro для Switch (без ICON — иконка libnx по умолчанию), libmain.so для Android (SDLActivity зовёт SDL_main).
 function(snx_add_app target)
   cmake_parse_arguments(PARSE_ARGV 1 APP "" "TITLE;ICON" "SOURCES;LIBS")
+  if(ANDROID)
+    add_library(${target} SHARED ${APP_SOURCES})
+    set_target_properties(${target} PROPERTIES OUTPUT_NAME main)
+    target_include_directories(${target} PRIVATE ${PROJECT_SOURCE_DIR})
+    target_link_libraries(${target} PRIVATE ${APP_LIBS})
+    return()
+  endif()
   add_executable(${target} ${APP_SOURCES})
   target_include_directories(${target} PRIVATE ${PROJECT_SOURCE_DIR})
   target_link_libraries(${target} PRIVATE ${APP_LIBS})

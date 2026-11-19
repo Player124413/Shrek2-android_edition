@@ -132,8 +132,8 @@ static __attribute__((noinline)) void rt_icall_slow(CPU *restrict c, u32 t, u64 
 #endif
 
 // setjmp гостя (см. recomp/gen.py SETJMP_EXPORTS): хостовый setjmp — прямо в кадре вызывающей функции
-#ifdef __APPLE__
-#define RT_SETJMP(j) _setjmp((j)->buf)  // без сохранения маски сигналов (setjmp на маке — системный вызов)
+#if defined(__APPLE__) || defined(__ANDROID__)
+#define RT_SETJMP(j) _setjmp((j)->buf)  // без сохранения маски сигналов (setjmp на маке и в bionic — системный вызов)
 #else
 #define RT_SETJMP(j) setjmp((j)->buf)
 #endif

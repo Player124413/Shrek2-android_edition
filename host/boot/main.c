@@ -9,6 +9,13 @@
 // Switch (NRO): игра — sdmc:/switch/shrek2/game, запись — sdmc:/switch/shrek2/user; при запуске через nxlink
 // stdout/stderr идут в терминал Мака. Русская версия (SNX_VARIANT=rus) — то же в shrek2rus, на маке —
 // build/game-rus и build/userdata-rus.
+// Android (libmain.so, SDL_main): каталоги игры и записи, разрешение и переменные SNX_* передаёт лаунчер
+// (android/…/GameActivity.kt: --game, --user, --res, --env); лог — <user>/snx.log (прошлый — snx.log.old).
+#ifdef __ANDROID__
+#include <SDL_main.h>  // main -> SDL_main: её зовёт SDLActivity
+#include <SDL_messagebox.h>
+#include <sys/stat.h>
+#endif
 #include <pthread.h>
 #include <stdalign.h>
 #include <stdio.h>
@@ -20,7 +27,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #else
+#if !defined(__ANDROID__) || __ANDROID_API__ >= 33
 #include <execinfo.h>
+#define SNX_HAVE_BACKTRACE 1
+#endif
 #include <signal.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -67,7 +77,7 @@ static void stack_report(void)
 {
     size_t pg = (size_t)getpagesize(), n = g_stack_size / pg, lo = n;
     char *v = malloc(n);
-    if (v && mincore(g_stack, g_stack_size, v) == 0)
+    if (v && mincore(g_stack, g_stack_size, (void *)v) == 0)
         for (size_t i = 0; i < n && lo == n; i++)
             if (v[i] & 0x7F)  // в памяти, сжата или выгружена (0x80 — просто «анонимная»)
                 lo = i;
@@ -273,8 +283,10 @@ static void on_fault(int sig, siginfo_t *si, void *uc)
     }
     char what[96];
     snprintf(what, sizeof what, "guest access violation at %08x (host signal %d; registers are stale)", (u32)(a - g_mem), sig);
+#ifdef SNX_HAVE_BACKTRACE
     void *bt[48];
     backtrace_symbols_fd(bt, backtrace(bt, 48), 2);  // где в сгенерированном коде (f_<адрес>)
+#endif
     on_trap(&t->cpu, 0, what);
 }
 #endif
@@ -419,7 +431,10 @@ int main(int argc, char **argv)
             return 2;
         }
     }
-#ifdef __SWITCH__
+#ifdef __ANDROID__
+    int nxlink = -1;  // вывод в logcat не идёт: в файл, как на Switch
+#endif
+#if defined(__SWITCH__) || defined(__ANDROID__)
     // запуск из hbmenu без nxlink: stdout/stderr — в <user>/snx.log (прошлый — snx.log.old), по строкам: после
     // зависания или падения в файле есть всё до последней строки
     if (nxlink < 0) {
@@ -434,6 +449,16 @@ int main(int argc, char **argv)
             dup2(fileno(stderr), fileno(stdout));
         }
     }
+#endif
+#ifdef SNX_NO_GAME
+    // APK из CI без файлов игры (host/boot/CMakeLists.txt): код порта собран, модулей игры нет
+    fprintf(stderr, "[boot] сборка без модулей игры (SNX_NO_GAME): нужен APK, собранный из своей копии игры\n");
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "shrekNX",
+                             "Этот APK собран без игры: в нём только лаунчер, управление и движок порта.\n\n"
+                             "Код игры переводится из DLL вашей копии Shrek 2 и входит в APK при сборке — "
+                             "соберите APK сами (docs/ANDROID.md).",
+                             NULL);
+    return 0;
 #endif
     g_hle_trace = getenv("SNX_HLE_TRACE") != NULL;
     rt_check_abi = getenv("SNX_CHECK_ABI") != NULL;
@@ -482,6 +507,22 @@ int main(int argc, char **argv)
     // игра рисует в разрешении экрана (1280x720 в руках, 1920x1080 в доке), а не 800x600 с полосами
     if (g_res_w < 0 && !g_headless)
         plat_screen_size(&g_res_w, &g_res_h);
+#elif defined(__ANDROID__)
+    // по умолчанию — экран телефона с масштабом SNX_RENDER_SCALE (лаунчер: «Качество картинки»); кадр
+    // растягивается на экран при показе. Чётные размеры, не меньше 640x360
+    if (g_res_w < 0 && !g_headless) {
+        plat_screen_size(&g_res_w, &g_res_h);
+        const char *sc = getenv("SNX_RENDER_SCALE");
+        float k = sc ? (float)atof(sc) : 1.0f;
+        k = k < 0.25f ? 0.25f : k > 1.0f ? 1.0f : k;
+        g_res_w = (int)((float)g_res_w * k) & ~1;
+        g_res_h = (int)((float)g_res_h * k) & ~1;
+        if (g_res_h < 360) {
+            g_res_w = g_res_w * 360 / (g_res_h ? g_res_h : 1) & ~1;
+            g_res_h = 360;
+        }
+        fprintf(stderr, "[boot] render %dx%d (scale %.2f)\n", g_res_w, g_res_h, (double)k);
+    }
 #endif
     if (g_res_w > 0)
         user32_set_screen(g_res_w, g_res_h);

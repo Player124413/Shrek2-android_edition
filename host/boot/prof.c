@@ -142,6 +142,29 @@ static int start_sampler(void)
     return R_FAILED(r) ? -1 : 0;
 }
 
+#elif defined(__ANDROID__)
+// Android: профайлер выборками не реализован (нужна остановка потока по ptrace или сигналу) — SNX_PROF игнорируется;
+// для замеров — simpleperf из NDK
+static void self_info(uintptr_t *h, uintptr_t *lo, uintptr_t *hi) { *h = *lo = *hi = 0; }
+static int t_pause(uintptr_t h) { (void)h; return -1; }
+static void t_resume(uintptr_t h) { (void)h; }
+static int t_regs(uintptr_t h, uintptr_t *pc, uintptr_t *lr, uintptr_t *fp)
+{
+    (void)h;
+    *pc = *lr = *fp = 0;
+    return -1;
+}
+static void image_base(uintptr_t *base, uintptr_t *slide) { *base = *slide = 0; }
+static void sleep_1ms(void) {}
+static void sampler(void *arg);
+
+static int start_sampler(void)
+{
+    (void)sampler;
+    fprintf(stderr, "[prof] sampling profiler is not available on Android (use simpleperf)\n");
+    return -1;
+}
+
 #else  // mac: thread_suspend / thread_get_state (выборки по SIGPROF липли к выходам из системных вызовов)
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
@@ -258,7 +281,7 @@ static void sampler(void *arg)
     prof_dump();
 }
 
-#ifndef __SWITCH__
+#if !defined(__SWITCH__) && !defined(__ANDROID__)
 static void *sampler_main(void *arg)
 {
     sampler(arg);

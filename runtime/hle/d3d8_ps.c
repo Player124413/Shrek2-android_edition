@@ -84,7 +84,7 @@ static void dst_write(sb *b, u32 tok, const char *expr)
         shift -= 16;
     float scale = shift >= 0 ? (float)(1 << shift) : 1.0f / (float)(1 << -shift);
     if (shift)
-        snprintf(e, sizeof e, "(%s) * %g", expr, scale);
+        snprintf(e, sizeof e, "(%s) * %#g", expr, scale);  // с точкой: в GLSL ES нет неявного int -> float
     else
         snprintf(e, sizeof e, "%s", expr);
     const char *lo = (mod & 1) ? "0.0" : "-8.0", *hi = (mod & 1) ? "1.0" : "8.0";

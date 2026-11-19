@@ -116,6 +116,15 @@ tools/.venv/bin/python -I tools/switch_upload.py --host <SWITCH_IP> game /switch
 
 PGO — отдельный необязательный этап: [AGENTS.md](../AGENTS.md), раздел «Switch». `tools/build.sh switch` использует локальный `build/pgo`, когда найден `stamp`; `SNX_PGO= tools/build.sh switch` отключает его. Профиль и `build/hot_order.ld` не распространяются вместе с исходниками.
 
+## Android
+
+Отдельная инструкция: [ANDROID.md](ANDROID.md). Кратко — после генерации модулей:
+
+```sh
+tools/android_deps.sh --ffmpeg
+tools/build.sh android        # или android-rus
+```
+
 ## Русская версия
 
 DLL локализации «Новый Диск» от 2004-12-13 отличаются от английских, поэтому нужна отдельная генерация. Скрипту передаются каталог установленной русской игры и совместимый распакованный английский launcher из своей копии:

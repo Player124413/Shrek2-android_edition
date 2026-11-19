@@ -1,0 +1,133 @@
+# Сборка APK для Android (docs/ANDROID.md).
+# Без файлов игры (обычный случай, публичный репозиторий) собирается APK «без игры»: весь код порта, SDL2, OpenAL,
+# FFmpeg, лаунчер и редактор управления; «Играть» сообщает, что модулей игры в сборке нет (SNX_NO_GAME).
+# С игрой — только в приватном репозитории: секрет SNX_GAME_SYSTEM_URL — прямая ссылка на zip с папкой System
+# своей копии игры (DLL и game.exe); код игры генерируется рекомпилятором прямо здесь. Такой APK содержит код,
+# полученный из игры, — не публикуйте его. [проверить: путь с игрой в CI не запускался]
+name: Android APK
+
+on:
+  push:
+    paths:
+      - 'android/**'
+      - 'cmake/**'
+      - 'CMakeLists.txt'
+      - 'platform/**'
+      - 'runtime/**'
+      - 'host/**'
+      - 'recomp/**'
+      - 'tools/android_deps.sh'
+      - 'tools/build.sh'
+      - '.github/workflows/android.yml'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      NDK_VERSION: 27.2.12479018
+      SNX_GAME_SYSTEM_URL: ${{ secrets.SNX_GAME_SYSTEM_URL }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK (NDK 27, CMake 3.22.1, API 35)
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses >/dev/null || true
+          "$SDKM" --install "platforms;android-35" "build-tools;35.0.0" "ndk;$NDK_VERSION" "cmake;3.22.1" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Кэш библиотек (SDL2, OpenAL, ogg/vorbis, FreeType, FFmpeg)
+        uses: actions/cache@v6
+        with:
+          path: build/android-deps
+          key: android-deps-${{ hashFiles('tools/android_deps.sh') }}-ndk${{ env.NDK_VERSION }}
+
+      - name: Кэш Gradle
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            build/gradle
+          key: gradle-${{ hashFiles('android/**/*.gradle', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+
+      - name: Библиотеки
+        run: tools/android_deps.sh --ffmpeg
+
+      - name: Модули игры (только приватный репозиторий с секретом SNX_GAME_SYSTEM_URL)
+        if: env.SNX_GAME_SYSTEM_URL != ''
+        run: |
+          if [ "${{ github.event.repository.private }}" != "true" ]; then
+            echo "::error::Репозиторий публичный: APK с кодом игры здесь собирать нельзя (артефакты видны всем)"
+            exit 1
+          fi
+          curl -fsSL "$SNX_GAME_SYSTEM_URL" -o "$RUNNER_TEMP/system.zip"
+          mkdir -p "$RUNNER_TEMP/system" game
+          unzip -q "$RUNNER_TEMP/system.zip" -d "$RUNNER_TEMP/system"
+          SYS=$(dirname "$(find "$RUNNER_TEMP/system" -iname core.dll | head -1)")
+          [ -n "$SYS" ] && [ "$SYS" != . ] || { echo "::error::в архиве нет System/Core.dll"; exit 1; }
+          mv "$SYS" game/System
+          python3 -m venv tools/.venv
+          tools/.venv/bin/python -m pip install -q -r tools/requirements.txt
+          tools/.venv/bin/python -I recomp/main.py gen --game game/System --out build/gen
+
+      - name: Сборка APK
+        run: tools/build.sh android --no-daemon --stacktrace
+
+      - name: Проверка APK
+        run: |
+          APK=build/shrekNX-eng.apk
+          ls -l "$APK"
+          unzip -l "$APK" > "$RUNNER_TEMP/apk.txt"
+          for f in lib/arm64-v8a/libmain.so lib/arm64-v8a/libSDL2.so classes.dex AndroidManifest.xml; do
+            grep -q " $f\$" "$RUNNER_TEMP/apk.txt" || { echo "::error::в APK нет $f"; cat "$RUNNER_TEMP/apk.txt"; exit 1; }
+          done
+          BT="$ANDROID_HOME/build-tools/35.0.0"
+          "$BT/aapt2" dump badging "$APK" | head -5
+          "$BT/apksigner" verify --print-certs "$APK" | head -3
+          # libmain.so: все JNI-функции экранного управления и SDL_main на месте, неразрешённых — только из системы
+          TC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          unzip -o -q "$APK" lib/arm64-v8a/libmain.so -d "$RUNNER_TEMP/apk"
+          SO="$RUNNER_TEMP/apk/lib/arm64-v8a/libmain.so"
+          "$TC/llvm-nm" -D --defined-only "$SO" > "$RUNNER_TEMP/syms.txt"
+          for s in SDL_main Java_com_shreknx_game_SnxNative_pad Java_com_shreknx_game_SnxNative_look \
+                   Java_com_shreknx_game_SnxNative_key Java_com_shreknx_game_SnxNative_state; do
+            grep -q " T $s\$" "$RUNNER_TEMP/syms.txt" || { echo "::error::в libmain.so нет $s"; exit 1; }
+          done
+          "$TC/llvm-readelf" -d "$SO" | grep NEEDED
+          "$TC/llvm-readelf" -lW "$SO" | grep LOAD | awk '{ if ($NF != "0x4000") bad=1 } END { exit bad }' \
+            || { echo "::error::LOAD-сегменты не выровнены на 16 КБ"; exit 1; }
+          ls -l "$SO"
+
+      - name: APK без игры
+        if: env.SNX_GAME_SYSTEM_URL == ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: shrekNX-android-nogame
+          path: build/shrekNX-eng.apk
+          retention-days: 14
+
+      - name: APK с игрой (приватный репозиторий)
+        if: env.SNX_GAME_SYSTEM_URL != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: shrekNX-android
+          path: build/shrekNX-eng.apk
+          retention-days: 3

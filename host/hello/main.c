@@ -16,11 +16,11 @@
 #define GL_COMPRESSED_RGB_S3TC_DXT1_EXT 0x83F0
 #endif
 
-static const char *vs_src = SNX_GLSL_HEADER
+static const char *vs_src = SNX_GLSL_HEADER SNX_GLSL_PRECISION
     "layout(location=0) in vec2 pos;\n"
     "out vec2 uv;\n"
     "void main(){ uv = pos*0.5+0.5; gl_Position = vec4(pos,0.0,1.0); }\n";
-static const char *fs_src = SNX_GLSL_HEADER
+static const char *fs_src = SNX_GLSL_HEADER SNX_GLSL_PRECISION
     "in vec2 uv; uniform sampler2D tex; uniform float t;\n"
     "out vec4 color;\n"
     "void main(){ color = texture(tex, uv) * vec4(1.0, 0.5+0.5*sin(t), 1.0, 1.0); }\n";

@@ -5,12 +5,14 @@
 #include <SDL.h>
 #include <ctype.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
 #include "host/boot/input.h"
+#include "host/boot/touch.h"
 #include "runtime/hle/d3d8.h"
 #include "runtime/hle/dinput8.h"
 #include "runtime/hle/user32.h"
@@ -313,7 +315,7 @@ static int load_settings(const char *text, const char *src)
     return version == SNX_INI_VERSION;
 }
 
-void input_init(const char *user_dir)
+static void input_load(const char *user_dir)
 {
     char path[1100], old[1100];
     snprintf(path, sizeof path, "%s/System/Snx.ini", user_dir);
@@ -339,6 +341,14 @@ void input_init(const char *user_dir)
         fputs(g_snx_default, f);
         fclose(f);
     }
+}
+
+void input_init(const char *user_dir)
+{
+    input_load(user_dir);
+    const char *e = getenv("SNX_SHOW_FPS");  // поверх Snx.ini: лаунчер Android («Счётчик FPS»)
+    if (e)
+        d3d8_set_fps_overlay(*e == '1');
 }
 
 static u32 g_joy_buttons;  // кнопки джойстика (биты Joy1..Joy12) и крестовины (биты 16..19: вверх, вниз, влево, вправо)
@@ -629,9 +639,106 @@ static void scripted_keys(void)
     p = *p == ',' ? p + 1 : NULL;
 }
 
+// ---------------------------------------------------------------- сенсорный экран (host/boot/touch.h)
+// Пишут потоки лаунчера (JNI), читает input_tick: состояние под замком, применение — только в главном потоке.
+static pthread_mutex_t g_touch_lock = PTHREAD_MUTEX_INITIALIZER;
+static u32 g_touch_buttons, g_touch_applied;
+static float g_touch_axis[4];
+static float g_look_x, g_look_y;
+static struct {
+    short vk;
+    char down;
+} g_touch_keys[32];
+static int g_ntouch_keys;
+static volatile int g_touch_menu, g_touch_ready;
+
+void touch_pad(uint32_t buttons, float lx, float ly, float rx, float ry)
+{
+    pthread_mutex_lock(&g_touch_lock);
+    g_touch_buttons = buttons & ((1u << PB_N) - 1);
+    g_touch_axis[0] = lx;
+    g_touch_axis[1] = ly;
+    g_touch_axis[2] = rx;
+    g_touch_axis[3] = ry;
+    pthread_mutex_unlock(&g_touch_lock);
+}
+
+void touch_look(float dx, float dy)
+{
+    pthread_mutex_lock(&g_touch_lock);
+    g_look_x += dx;
+    g_look_y += dy;
+    pthread_mutex_unlock(&g_touch_lock);
+}
+
+void touch_key(int vk, int down)
+{
+    pthread_mutex_lock(&g_touch_lock);
+    if (g_ntouch_keys < 32 && vk > 0 && vk < 256) {
+        g_touch_keys[g_ntouch_keys].vk = (short)vk;
+        g_touch_keys[g_ntouch_keys].down = (char)(down != 0);
+        g_ntouch_keys++;
+    }
+    pthread_mutex_unlock(&g_touch_lock);
+}
+
+int touch_state(void) { return (g_touch_menu ? 1 : 0) | (g_touch_ready ? 2 : 0); }
+
+// оси экранных стиков: поверх физического геймпада — тот, что отклонён сильнее
+static float g_touch_ax[4];
+
+static void touch_tick(void)
+{
+    u32 buttons;
+    float look_x, look_y;
+    int nkeys;
+    short vks[32];
+    char downs[32];
+    pthread_mutex_lock(&g_touch_lock);
+    buttons = g_touch_buttons;
+    memcpy(g_touch_ax, g_touch_axis, sizeof g_touch_ax);
+    look_x = g_look_x;
+    look_y = g_look_y;
+    g_look_x = g_look_y = 0;
+    nkeys = g_ntouch_keys;
+    for (int i = 0; i < nkeys; i++) {
+        vks[i] = g_touch_keys[i].vk;
+        downs[i] = g_touch_keys[i].down;
+    }
+    g_ntouch_keys = 0;
+    pthread_mutex_unlock(&g_touch_lock);
+    int x, y;
+    g_touch_ready = d3d8_window_to_target(0.5f, 0.5f, &x, &y);
+    u32 diff = buttons ^ g_touch_applied;
+    for (int b = 0; diff && b < PB_N; b++)
+        if (diff & (1u << b))
+            pad_button(b, (buttons >> b) & 1);
+    g_touch_applied = buttons;
+    for (int i = 0; i < nkeys; i++)
+        key((u32)vks[i], downs[i]);
+    // камера пальцем: смещение мыши DirectInput (в меню — не нужно, там касание — щелчок)
+    static float rx_, ry_;
+    if (!g_menu && (look_x != 0.0f || look_y != 0.0f)) {
+        rx_ += look_x;
+        ry_ += (g_invert_y ? -look_y : look_y);
+        int dx = (int)rx_, dy = (int)ry_;
+        rx_ -= (float)dx;
+        ry_ -= (float)dy;
+        if (dx || dy)
+            dinput8_mouse_move(dx, dy, 0);
+    }
+}
+
+static float axis_of(int a)
+{
+    float p = g_axis[a], t = a < 4 ? g_touch_ax[a] : 0.0f;
+    return fabsf(t) > fabsf(p) ? t : p;
+}
+
 void input_tick(void)
 {
     scripted_keys();
+    touch_tick();
     static u64 last;
     static float fx, fy;  // дробные остатки смещения мыши
     u64 now = SDL_GetPerformanceCounter();
@@ -641,6 +748,7 @@ void input_tick(void)
         dt = 0.1f;
     click_tick();
     int menu = game_menu_open(NULL);
+    g_touch_menu = menu;
     if (menu != g_menu) {
         release_all();
         g_menu = menu;
@@ -655,8 +763,8 @@ void input_tick(void)
             pad_button(PB_ZL + i, g_trig[i] = on);
     }
     float lx, ly, rx, ry;
-    stick(g_axis[SDL_CONTROLLER_AXIS_LEFTX], g_axis[SDL_CONTROLLER_AXIS_LEFTY], 0, &lx, &ly);
-    stick(g_axis[SDL_CONTROLLER_AXIS_RIGHTX], g_axis[SDL_CONTROLLER_AXIS_RIGHTY], 1, &rx, &ry);
+    stick(axis_of(SDL_CONTROLLER_AXIS_LEFTX), axis_of(SDL_CONTROLLER_AXIS_LEFTY), 0, &lx, &ly);
+    stick(axis_of(SDL_CONTROLLER_AXIS_RIGHTX), axis_of(SDL_CONTROLLER_AXIS_RIGHTY), 1, &rx, &ry);
     if (!g_menu) {
         // джойстик: lX lY — левый стик, lRy lRz (JoyU, JoyV) — правый; крестовина — POV
         static const int pov_of[16] = {-1, 0, 18000, -1, 27000, 31500, 22500, 27000,

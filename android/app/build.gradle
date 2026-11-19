@@ -1,0 +1,114 @@
+// Приложение: лаунчер (com.shreknx.game.LauncherActivity) и игра (GameActivity — SDLActivity в отдельном
+// процессе). Нативная часть — корневой CMakeLists.txt (ANDROID: cmake/android.cmake): libSDL2.so + libmain.so
+// со сгенерированным кодом игры из build/gen (eng) или build/gen-rus (rus).
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+def repoRoot = file('../..')
+def depsDir = project.hasProperty('snx.deps') ? file(project.property('snx.deps')) : new File(repoRoot, 'build/android-deps')
+def sdlJava = new File(depsDir, 'SDL/android-project/app/src/main/java')
+if (!sdlJava.exists()) {
+    throw new GradleException("Нет ${sdlJava}: сначала запусти tools/android_deps.sh")
+}
+
+android {
+    namespace 'com.shreknx.game'
+    compileSdk 35
+    ndkVersion '27.2.12479018'
+
+    defaultConfig {
+        applicationId 'com.shreknx.game'
+        minSdk 24          // Android 7.0: OpenGL ES 3.0 есть везде, AAudio — с 8.1 (иначе OpenSL ES)
+        targetSdk 35
+        versionCode 1
+        versionName '0.1.0'
+        ndk {
+            abiFilters 'arm64-v8a'  // окно гостя — 4 ГБ адресов: только 64-битные телефоны
+        }
+        externalNativeBuild {
+            cmake {
+                arguments "-DSNX_ANDROID_DEPS=${depsDir.absolutePath}", '-DANDROID_STL=c++_static',
+                          '-DANDROID_PLATFORM=android-24', '-DCMAKE_BUILD_TYPE=Release'
+                targets 'snx_boot', 'SDL2'
+            }
+        }
+    }
+
+    flavorDimensions 'lang'
+    productFlavors {
+        eng {
+            dimension 'lang'
+            resValue 'string', 'app_name', 'Shrek 2'
+            buildConfigField 'String', 'VARIANT', '"eng"'
+        }
+        rus {
+            dimension 'lang'
+            applicationIdSuffix '.rus'   // ставится рядом с английской
+            resValue 'string', 'app_name', 'Шрек 2'
+            buildConfigField 'String', 'VARIANT', '"rus"'
+            externalNativeBuild { cmake { arguments '-DSNX_VARIANT=rus' } }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path new File(repoRoot, 'CMakeLists.txt')
+            version '3.22.1'
+            buildStagingDirectory new File(repoRoot, 'build/android-cxx')
+        }
+    }
+
+    sourceSets {
+        main {
+            java.srcDirs += sdlJava  // org.libsdl.app.* — из исходников SDL той же версии, что и libSDL2.so
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            // подпись: android/keystore.properties (см. docs/ANDROID.md); без неё — отладочным ключом
+            signingConfig signingConfigs.debug
+        }
+        debug {
+            // сгенерированный код без оптимизаций слишком медленный даже для отладки лаунчера
+            externalNativeBuild { cmake { arguments '-DCMAKE_BUILD_TYPE=Release' } }
+        }
+    }
+
+    def ks = new File(projectDir.parentFile, 'keystore.properties')
+    if (ks.exists()) {
+        def p = new Properties()
+        ks.withInputStream { p.load(it) }
+        signingConfigs {
+            snx {
+                storeFile new File(projectDir.parentFile, p['storeFile'])
+                storePassword p['storePassword']
+                keyAlias p['keyAlias']
+                keyPassword p['keyPassword']
+            }
+        }
+        buildTypes.release.signingConfig signingConfigs.snx
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging false  // .so несжатыми в APK: грузятся прямо из него, быстрее старт
+        }
+    }
+    lint {
+        abortOnError false
+    }
+}

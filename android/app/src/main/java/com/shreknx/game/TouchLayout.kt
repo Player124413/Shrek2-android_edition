@@ -1,0 +1,113 @@
+package com.shreknx.game
+
+import android.content.Context
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+
+// Раскладка экранного управления: элементы и их положение (доли экрана — не зависит от разрешения).
+// Файл filesDir/touch_layout.json правят и лаунчер (редактор), и игра (редактор поверх игры) — поэтому файл, а не
+// SharedPreferences (у тех свой кеш в каждом процессе). Сохраняются только изменяемые поля по id: новые элементы
+// из будущих версий появляются со значениями по умолчанию.
+enum class Kind { BUTTON, STICK, DPAD }
+
+class Control(
+    val id: String,
+    val kind: Kind,
+    val label: String,
+    var x: Float,              // центр: доля ширины экрана
+    var y: Float,              // центр: доля высоты экрана
+    var size: Float,           // диаметр: доля высоты экрана
+    var visible: Boolean = true,
+    var opacity: Float = 1f,   // множитель общей прозрачности
+    val button: Int = -1,      // бит кнопки геймпада (SnxNative.*) или -1
+    val vk: Int = 0,           // клавиша Windows (VK_*), если не кнопка
+    val rightStick: Boolean = false,
+    var floating: Boolean = false,  // стик появляется там, где коснулись (в своей половине экрана)
+    var toggle: Boolean = false,    // кнопка залипает: нажал — держится до следующего нажатия
+) {
+    fun copy() = Control(id, kind, label, x, y, size, visible, opacity, button, vk, rightStick, floating, toggle)
+}
+
+object TouchLayout {
+    private const val FILE = "touch_layout.json"
+    private const val VERSION = 1
+
+    // По умолчанию — как на геймпаде Switch (docs/CONSOLE.md, «Раскладка»): A — удар, B — прыжок, X — действие,
+    // Y — камера за спину, L/R — колесо мыши, Plus — меню, ZL — второй слой (с ним X/A/B/Y — зелья 5–8)
+    fun defaults(): List<Control> = listOf(
+        Control("lstick", Kind.STICK, "", 0.14f, 0.70f, 0.38f, floating = true),
+        Control("a", Kind.BUTTON, "Удар", 0.915f, 0.66f, 0.17f, button = SnxNative.A),
+        Control("b", Kind.BUTTON, "Прыжок", 0.825f, 0.83f, 0.17f, button = SnxNative.B),
+        Control("x", Kind.BUTTON, "Действие", 0.735f, 0.66f, 0.15f, button = SnxNative.X),
+        Control("y", Kind.BUTTON, "Камера", 0.825f, 0.49f, 0.13f, button = SnxNative.Y),
+        Control("l", Kind.BUTTON, "L", 0.07f, 0.13f, 0.12f, button = SnxNative.L),
+        Control("r", Kind.BUTTON, "R", 0.93f, 0.13f, 0.12f, button = SnxNative.R),
+        Control("zl", Kind.BUTTON, "Зелья", 0.64f, 0.86f, 0.12f, button = SnxNative.ZL),
+        Control("plus", Kind.BUTTON, "Меню", 0.58f, 0.07f, 0.10f, button = SnxNative.PLUS),
+        // скрытые по умолчанию: включаются в редакторе
+        Control("dpad", Kind.DPAD, "", 0.30f, 0.78f, 0.26f, visible = false),
+        Control("rstick", Kind.STICK, "", 0.62f, 0.62f, 0.30f, visible = false, rightStick = true),
+        Control("zr", Kind.BUTTON, "ZR", 0.70f, 0.13f, 0.11f, visible = false, button = SnxNative.ZR),
+        Control("minus", Kind.BUTTON, "−", 0.42f, 0.07f, 0.10f, visible = false, button = SnxNative.MINUS),
+        Control("rs", Kind.BUTTON, "Центр", 0.93f, 0.33f, 0.11f, visible = false, button = SnxNative.RSTICK),
+        Control("esc", Kind.BUTTON, "Esc", 0.50f, 0.07f, 0.10f, visible = false, vk = 0x1B),
+        Control("enter", Kind.BUTTON, "Ввод", 0.36f, 0.07f, 0.10f, visible = false, vk = 0x0D),
+    ) + (1..9).map { n ->
+        // зелья 1–9 — цифры клавиатуры (как в игре на ПК)
+        Control("potion$n", Kind.BUTTON, "$n", 0.30f + 0.055f * (n - 1), 0.30f, 0.09f, visible = false, vk = 0x30 + n)
+    }
+
+    fun load(ctx: Context): MutableList<Control> {
+        val list = defaults().map { it.copy() }.toMutableList()
+        val f = File(ctx.filesDir, FILE)
+        if (!f.exists()) return list
+        try {
+            val root = JSONObject(f.readText())
+            val arr = root.optJSONArray("controls") ?: return list
+            val byId = list.associateBy { it.id }
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                val c = byId[o.optString("id")] ?: continue
+                c.x = o.optDouble("x", c.x.toDouble()).toFloat().coerceIn(0f, 1f)
+                c.y = o.optDouble("y", c.y.toDouble()).toFloat().coerceIn(0f, 1f)
+                c.size = o.optDouble("size", c.size.toDouble()).toFloat().coerceIn(MIN_SIZE, MAX_SIZE)
+                c.visible = o.optBoolean("visible", c.visible)
+                c.opacity = o.optDouble("opacity", c.opacity.toDouble()).toFloat().coerceIn(0.1f, 1f)
+                c.floating = o.optBoolean("floating", c.floating)
+                c.toggle = o.optBoolean("toggle", c.toggle)
+            }
+        } catch (e: Exception) {
+            // повреждённый файл — раскладка по умолчанию
+        }
+        return list
+    }
+
+    fun save(ctx: Context, list: List<Control>) {
+        val arr = JSONArray()
+        for (c in list) {
+            arr.put(JSONObject().apply {
+                put("id", c.id)
+                put("x", c.x.toDouble())
+                put("y", c.y.toDouble())
+                put("size", c.size.toDouble())
+                put("visible", c.visible)
+                put("opacity", c.opacity.toDouble())
+                put("floating", c.floating)
+                put("toggle", c.toggle)
+            })
+        }
+        val root = JSONObject().put("version", VERSION).put("controls", arr)
+        val f = File(ctx.filesDir, FILE)
+        val tmp = File(ctx.filesDir, "$FILE.tmp")
+        tmp.writeText(root.toString(1))
+        tmp.renameTo(f)
+    }
+
+    fun reset(ctx: Context) {
+        File(ctx.filesDir, FILE).delete()
+    }
+
+    const val MIN_SIZE = 0.06f
+    const val MAX_SIZE = 0.55f
+}

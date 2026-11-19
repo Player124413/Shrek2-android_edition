@@ -1,0 +1,128 @@
+package com.shreknx.game
+
+import android.app.ActivityManager
+import android.content.Context
+import android.content.SharedPreferences
+import java.io.File
+
+// Настройки лаунчера (SharedPreferences). Пишутся сразу (commit): процесс игры (:game) стартует следом и читает
+// их с диска. Раскладка экранного управления — отдельным файлом (TouchLayout): её правят оба процесса.
+class Settings(private val ctx: Context) {
+    @Suppress("DEPRECATION")
+    private val p: SharedPreferences = ctx.getSharedPreferences("snx", Context.MODE_MULTI_PROCESS)  // лаунчер и :game
+
+    var gameDir: String
+        get() = p.getString("gameDir", null) ?: defaultGameDir(ctx).absolutePath
+        set(v) { p.edit().putString("gameDir", v).commit() }
+
+    // графика
+    var renderScale: Float
+        get() = p.getFloat("renderScale", Device.tier(ctx).scale)
+        set(v) { p.edit().putFloat("renderScale", v).commit() }
+    var fpsCap: Int  // 0 — без ограничения (по частоте экрана, vsync)
+        get() = p.getInt("fpsCap", Device.tier(ctx).fps)
+        set(v) { p.edit().putInt("fpsCap", v).commit() }
+    var tex16: Boolean  // DXT -> 16 бит при распаковке на ЦП: вдвое меньше видеопамяти
+        get() = p.getBoolean("tex16", Device.tier(ctx).tex16)
+        set(v) { p.edit().putBoolean("tex16", v).commit() }
+    var showFps: Boolean
+        get() = p.getBoolean("showFps", false)
+        set(v) { p.edit().putBoolean("showFps", v).commit() }
+    var sustained: Boolean  // стабильная производительность: ниже пик, зато без троттлинга (если телефон умеет)
+        get() = p.getBoolean("sustained", false)
+        set(v) { p.edit().putBoolean("sustained", v).commit() }
+    var fileCacheMb: Int
+        get() = p.getInt("fileCacheMb", Device.tier(ctx).fileCacheMb)
+        set(v) { p.edit().putInt("fileCacheMb", v).commit() }
+    var extraEnv: String  // строки ИМЯ=ЗНАЧЕНИЕ (для опытных: переменные SNX_* из docs/CONSOLE.md)
+        get() = p.getString("extraEnv", "") ?: ""
+        set(v) { p.edit().putString("extraEnv", v).commit() }
+
+    // управление
+    var touchEnabled: Boolean
+        get() = p.getBoolean("touchEnabled", true)
+        set(v) { p.edit().putBoolean("touchEnabled", v).commit() }
+    var hideWithGamepad: Boolean
+        get() = p.getBoolean("hideWithGamepad", true)
+        set(v) { p.edit().putBoolean("hideWithGamepad", v).commit() }
+    var opacity: Float
+        get() = p.getFloat("opacity", 0.6f)
+        set(v) { p.edit().putFloat("opacity", v).commit() }
+    var lookSensitivity: Float
+        get() = p.getFloat("lookSens", 1.0f)
+        set(v) { p.edit().putFloat("lookSens", v).commit() }
+    var haptics: Boolean
+        get() = p.getBoolean("haptics", true)
+        set(v) { p.edit().putBoolean("haptics", v).commit() }
+
+    fun applyTier(t: Device.Tier) {
+        renderScale = t.scale
+        fpsCap = t.fps
+        tex16 = t.tex16
+        fileCacheMb = t.fileCacheMb
+    }
+
+    // аргументы libmain.so (host/boot/main.c)
+    fun gameArgs(): Array<String> {
+        val user = userDir(ctx)
+        user.mkdirs()
+        val a = arrayListOf("--game", gameDir, "--user", user.absolutePath)
+        fun env(k: String, v: String) { a += "--env"; a += "$k=$v" }
+        env("SNX_RENDER_SCALE", "%.3f".format(java.util.Locale.ROOT, renderScale))
+        if (fpsCap > 0) env("SNX_FPS_CAP", fpsCap.toString())
+        if (tex16) env("SNX_TEX16", "1")
+        env("SNX_SHOW_FPS", if (showFps) "1" else "0")
+        env("SNX_FILE_CACHE_MB", fileCacheMb.toString())
+        env("SNX_SHADER_CACHE", File(ctx.cacheDir, "shaders").absolutePath)
+        val tahoma = File(gameDir, "System/tahoma.ttf")
+        if (tahoma.exists()) env("SNX_GDI_FONT", tahoma.absolutePath)
+        for (line in extraEnv.lines()) {
+            val s = line.trim()
+            if (s.isNotEmpty() && !s.startsWith("#") && s.contains('=')) { a += "--env"; a += s }
+        }
+        return a.toTypedArray()
+    }
+
+    companion object {
+        fun variant(): String = BuildConfig.VARIANT
+        fun defaultGameDir(ctx: Context): File = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "game")
+        fun userDir(ctx: Context): File = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "user")
+        fun logFile(ctx: Context): File = File(userDir(ctx), "snx.log")
+    }
+}
+
+// Оценка телефона по памяти и ЦП: стартовые настройки, чтобы игра шла и на слабых
+object Device {
+    data class Tier(val name: String, val scale: Float, val fps: Int, val tex16: Boolean, val fileCacheMb: Int)
+
+    val LOW = Tier("Слабый", 0.5f, 30, true, 96)
+    val MID = Tier("Средний", 0.75f, 0, false, 256)
+    val HIGH = Tier("Мощный", 1.0f, 0, false, 512)
+
+    fun ramMb(ctx: Context): Long {
+        val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val mi = ActivityManager.MemoryInfo()
+        am.getMemoryInfo(mi)
+        return mi.totalMem / (1024 * 1024)
+    }
+
+    fun maxFreqMhz(): Int {
+        var best = 0
+        for (c in 0 until Runtime.getRuntime().availableProcessors()) {
+            val f = File("/sys/devices/system/cpu/cpu$c/cpufreq/cpuinfo_max_freq")
+            val v = try { f.readText().trim().toInt() / 1000 } catch (e: Exception) { 0 }
+            if (v > best) best = v
+        }
+        return best
+    }
+
+    fun tier(ctx: Context): Tier {
+        val ram = ramMb(ctx)
+        val mhz = maxFreqMhz()
+        return when {
+            ram < 3500 || (mhz in 1..2000) -> LOW
+            ram < 7000 || (mhz in 1..2600) -> MID
+            else -> HIGH
+        }
+    }
+}

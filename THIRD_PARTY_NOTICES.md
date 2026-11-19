@@ -9,11 +9,12 @@
 | libnx | Системные функции Switch | ISC — https://github.com/switchbrew/libnx |
 | devkitA64 / GCC | Компилятор и библиотеки поддержки | GPL с применимыми исключениями для runtime — https://gcc.gnu.org/onlinedocs/libstdc++/manual/license.html |
 | glad | Загрузчик OpenGL на Switch | Лицензии зависят от генератора и спецификаций Khronos — https://github.com/Dav1dde/glad |
-| OpenAL Soft | Звук на Switch | LGPL — https://openal-soft.org/ |
+| OpenAL Soft | Звук на Switch и Android (на Android — статически, нужна возможность перелинковки по LGPL) | LGPL — https://openal-soft.org/ |
 | OpenAL.framework | Звук на macOS | Системный компонент Apple SDK |
 | libogg / libvorbis | Музыка Ogg Vorbis | BSD — https://xiph.org/licenses/ |
 | FFmpeg, libavcodec / libavutil | Декодирование видео Bink | LGPL либо GPL в зависимости от конфигурации — https://ffmpeg.org/legal.html |
 | FreeType | Растеризация шрифтов | FreeType License либо GPL — https://freetype.org/license.html |
+| Android Gradle Plugin, Kotlin | Сборка APK, стандартная библиотека Kotlin в APK | Apache-2.0 — https://developer.android.com/studio/releases/gradle-plugin, https://kotlinlang.org/ |
 | zlib | Зависимости сборки Switch | zlib — https://zlib.net/zlib_license.html |
 | pefile | Чтение PE | MIT — https://github.com/erocarrera/pefile |
 | Capstone | Декодирование x86 | BSD — https://www.capstone-engine.org/ |

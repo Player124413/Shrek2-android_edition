@@ -1,0 +1,18 @@
+// Android-проект shrekNX: лаунчер (Kotlin) + игра (libmain.so из корневого CMakeLists.txt, SDL2).
+// Сборка — tools/build.sh android (или android-rus); вручную: gradle -p android assembleEngRelease.
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+rootProject.name = "shrekNX"
+include ':app'
