@@ -317,6 +317,7 @@ class LauncherActivity : Activity() {
         c.addView(row)
         c.addView(Ui.button(this, L.t("Очистить кэш шейдеров", "Clear shader cache")) {
             File(cacheDir, "shaders").deleteRecursively()
+            File(Settings.userDir(this), "System/SnxPrograms.bin").delete()  // список программ для фоновой сборки
             toastDialog(L.t("Кэш шейдеров очищен: при следующем запуске они соберутся заново.", "Shader cache cleared: shaders will be rebuilt on the next start."))
         }.apply { layoutParams = wrapGap().apply { topMargin = Ui.dp(this@LauncherActivity, 8f) } })
         return c
