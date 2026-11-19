@@ -54,7 +54,8 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
 
       - name: Кэш библиотек (SDL2, OpenAL, ogg/vorbis, FreeType, FFmpeg)
-        uses: actions/cache@v6
+        id: deps-cache
+        uses: actions/cache/restore@v6
         with:
           path: build/android-deps
           key: android-deps-${{ hashFiles('tools/android_deps.sh') }}-ndk${{ env.NDK_VERSION }}
@@ -70,6 +71,13 @@ jobs:
 
       - name: Библиотеки
         run: tools/android_deps.sh --ffmpeg
+
+      - name: Сохранить кэш библиотек
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: build/android-deps
+          key: ${{ steps.deps-cache.outputs.cache-primary-key }}
 
       - name: Модули игры (только приватный репозиторий с секретом SNX_GAME_SYSTEM_URL)
         if: env.SNX_GAME_SYSTEM_URL != ''
@@ -89,7 +97,22 @@ jobs:
           tools/.venv/bin/python -I recomp/main.py gen --game game/System --out build/gen
 
       - name: Сборка APK
-        run: tools/build.sh android --no-daemon --stacktrace
+        shell: bash
+        run: |
+          set -o pipefail
+          tools/build.sh android --no-daemon --stacktrace 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Ошибки сборки — в аннотации
+        if: failure()
+        shell: bash
+        run: |
+          L="$RUNNER_TEMP/build.log"
+          [ -f "$L" ] || exit 0
+          esc() { sed -e 's/%/%25/g' | awk 'BEGIN{ORS="%0A"} {print}'; }
+          grep -nE "error:|FAILED|What went wrong|CMake Error|undefined (symbol|reference)" "$L" | head -60 | cut -c1-400 \
+            > "$RUNNER_TEMP/err.txt" || true
+          echo "::error title=build errors::$(esc < "$RUNNER_TEMP/err.txt")"
+          echo "::error title=build tail::$(tail -n 80 "$L" | cut -c1-300 | esc)"
 
       - name: Проверка APK
         run: |
