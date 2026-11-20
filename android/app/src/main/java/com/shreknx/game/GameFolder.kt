@@ -2,7 +2,6 @@ package com.shreknx.game
 
 import android.content.ContentResolver
 import android.net.Uri
-import android.os.Environment
 import android.provider.DocumentsContract
 import java.io.File
 
@@ -17,23 +16,11 @@ object GameFolder {
     fun check(path: String): String? {
         val dir = File(path)
         if (!dir.isDirectory) return L.t("Папка не найдена: $path", "Folder not found: $path")
-        if (dir.listFiles() == null) return L.t("Нет доступа к папке (дай разрешение на файлы или используй «Импорт»)", "No access to the folder (grant file access or use “Import”)")
+        if (dir.listFiles() == null) return L.t("Нет доступа к папке — используй «Импорт»", "No access to the folder — use “Import”")
         val sys = child(dir, "System") ?: return L.t("В папке нет System — нужна папка установленной игры с ПК", "No System folder — select the folder of the game installed on a PC")
         for (f in listOf("Core.u", "Engine.u")) if (child(sys, f) == null) return L.t("В System нет $f", "System has no $f")
         if (child(dir, "Maps") == null) return L.t("В папке нет Maps", "No Maps folder")
         return null
-    }
-
-    // content://…/tree/primary:Games/Shrek2 -> /storage/emulated/0/Games/Shrek2 (карта памяти — /storage/XXXX-XXXX)
-    fun pathOfTree(uri: Uri): String? {
-        val id = try { DocumentsContract.getTreeDocumentId(uri) } catch (e: Exception) { return null }
-        val colon = id.indexOf(':')
-        if (colon < 0) return null
-        val vol = id.substring(0, colon)
-        val rel = id.substring(colon + 1)
-        val base = if (vol.equals("primary", ignoreCase = true)) Environment.getExternalStorageDirectory().absolutePath
-                   else "/storage/$vol"
-        return if (rel.isEmpty()) base else "$base/$rel"
     }
 
     class Progress(var files: Int = 0, var bytes: Long = 0, var current: String = "")

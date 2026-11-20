@@ -1,6 +1,5 @@
 package com.shreknx.game
 
-import android.Manifest
 import android.app.Activity
 import android.app.ActivityManager
 import android.app.AlertDialog
@@ -8,7 +7,6 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -17,7 +15,6 @@ import android.os.Handler
 import android.os.Looper
 import android.os.Process
 import android.os.SystemClock
-import android.provider.Settings as SysSettings
 import android.text.InputType
 import android.text.method.LinkMovementMethod
 import android.text.util.Linkify
@@ -42,6 +39,10 @@ class LauncherActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         s = Settings(this)
+        // «Указать папку…» (чтение игры по пути, «Доступ ко всем файлам») убрано: Play Protect предупреждал об
+        // опасном разрешении. Папка вне каталога приложения без разрешения не читается — снова папка по умолчанию
+        val def = Settings.defaultGameDir(this)
+        if (s.gameDir != def.absolutePath && GameFolder.check(s.gameDir) != null) s.gameDir = def.absolutePath
         build()
         // при первом запуске и после обновления — кто сделал порт и кому спасибо
         if (s.creditsShownVersion != BuildConfig.VERSION_CODE) {
@@ -138,7 +139,6 @@ class LauncherActivity : Activity() {
             dim = true, size = 12f).apply { setPadding(0, Ui.dp(this@LauncherActivity, 6f), 0, Ui.dp(this@LauncherActivity, 8f)) })
         val row1 = Ui.hbox(this)
         row1.addView(Ui.button(this, L.t("Импорт из папки…", "Import from folder…")) { pickImport() }, wrapGap())
-        row1.addView(Ui.button(this, L.t("Указать папку…", "Choose folder…")) { pickPath() }, wrapGap())
         c.addView(row1)
         val row2 = Ui.hbox(this).apply { setPadding(0, Ui.dp(this@LauncherActivity, 8f), 0, 0) }
         row2.addView(Ui.button(this, L.t("По умолчанию", "Default")) {
@@ -169,54 +169,13 @@ class LauncherActivity : Activity() {
         startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQ_IMPORT)
     }
 
-    private fun pickPath() {
-        if (!haveFileAccess()) {
-            requestFileAccess()
-            return
-        }
-        startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQ_PATH)
-    }
-
-    private fun haveFileAccess(): Boolean = if (Build.VERSION.SDK_INT >= 30) Environment.isExternalStorageManager()
-        else checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
-
-    private fun requestFileAccess() {
-        AlertDialog.Builder(this).setTitle(L.t("Доступ к файлам", "File access"))
-            .setMessage(L.t("Чтобы игра читала файлы прямо из выбранной папки, нужно разрешение на доступ ко всем файлам. " +
-                "Без него используй «Импорт» — файлы скопируются в папку приложения.",
-                "To read the files right from the chosen folder the game needs the “All files access” permission. " +
-                "Without it, use “Import” — the files will be copied into the app folder."))
-            .setPositiveButton(L.t("Разрешить", "Allow")) { _, _ ->
-                if (Build.VERSION.SDK_INT >= 30) {
-                    try {
-                        startActivity(Intent(SysSettings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                            Uri.parse("package:$packageName")))
-                    } catch (e: Exception) {
-                        startActivity(Intent(SysSettings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
-                    }
-                } else requestPermissions(arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE,
-                    Manifest.permission.WRITE_EXTERNAL_STORAGE), REQ_PERM)
-            }.setNegativeButton(L.t("Отмена", "Cancel"), null).show()
-    }
-
     @Deprecated("Activity API")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         @Suppress("DEPRECATION")
         super.onActivityResult(requestCode, resultCode, data)
         val uri = data?.data ?: return
         if (resultCode != RESULT_OK) return
-        when (requestCode) {
-            REQ_PATH -> {
-                val p = GameFolder.pathOfTree(uri)
-                if (p == null) {
-                    toastDialog(L.t("Эту папку нельзя открыть по пути. Используй «Импорт».", "This folder can't be opened by path. Use “Import”."))
-                    return
-                }
-                s.gameDir = p
-                refreshStatus()
-            }
-            REQ_IMPORT -> runImport(uri)
-        }
+        if (requestCode == REQ_IMPORT) runImport(uri)
     }
 
     private fun runImport(tree: Uri) {
@@ -457,7 +416,5 @@ class LauncherActivity : Activity() {
 
     companion object {
         private const val REQ_IMPORT = 1
-        private const val REQ_PATH = 2
-        private const val REQ_PERM = 3
     }
 }
