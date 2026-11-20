@@ -34,7 +34,7 @@ import android.widget.TextView
 
 // Окно «О порте» (первый запуск, обновление, кнопка «О порте»): тёмно-зелёная карточка с тонкой зелёной рамкой,
 // сверху на рамке — зелёный значок с головой огра; заголовок, автор порта, Telegram-канал, благодарность
-// репозиторию shrekNX и кнопки «OK» / «Открыть канал». Строки — по языку телефона (L.t).
+// репозиторию shrekNX и автору дизайна окна (@base64E), кнопки «OK» / «Открыть канал». Строки — по языку телефона (L.t).
 object CreditsDialog {
     private const val CARD_BG = 0xFF111A0E.toInt()
     private const val CARD_LINE = 0xFF34501C.toInt()
@@ -150,6 +150,20 @@ object CreditsDialog {
             setLineSpacing(0f, 1.1f)
             movementMethod = LinkMovementMethod.getInstance()
             highlightColor = Color.TRANSPARENT
+            setPadding(dp(4f), 0, dp(4f), 0)
+        }, lp(bottom = dp(8f)))
+
+        // благодарность за дизайн окна: ник — зелёный жирный
+        card.addView(TextView(act).apply {
+            val sb = SpannableStringBuilder(L.t("Спасибо ", "Thanks to "))
+            val st = sb.length
+            sb.append(L.DESIGNER)
+            sb.setSpan(StyleSpan(Typeface.BOLD), st, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            sb.setSpan(ForegroundColorSpan(GREEN), st, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            sb.append(L.t(" за редизайн всплывающего окна.", " for the redesign of this pop-up window."))
+            text = sb
+            setTextColor(GREY)
+            textSize = 12.5f
             setPadding(dp(4f), 0, dp(4f), 0)
         }, lp(bottom = dp(8f)))
 

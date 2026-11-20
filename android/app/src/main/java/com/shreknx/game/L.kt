@@ -16,4 +16,5 @@ object L {
     const val AUTHOR = "Player1444"
     const val TG_CHANNEL = "https://t.me/player1444ports"
     const val UPSTREAM = "https://github.com/Ananasiy/shrekNX"
+    const val DESIGNER = "@base64E"  // редизайн окна «О порте» (CreditsDialog)
 }
