@@ -13,18 +13,22 @@ if (!sdlJava.exists()) {
     throw new GradleException("Нет ${sdlJava}: сначала запусти tools/android_deps.sh")
 }
 
-// versionCode растёт с каждым коммитом (обновление ставится поверх старой версии, без удаления): число коммитов
-// ветки; -Psnx.versionCode=N — вручную. В CI нужен полный клон (fetch-depth: 0), иначе число — 1.
-def gitCommits = {
+// versionCode — минуты от 2026-01-01 до времени последнего коммита: растёт с каждым коммитом и больше любого
+// прежнего (раньше было число коммитов, ≤ 19), поэтому новая сборка всегда ставится поверх старой, а не
+// «Приложение не установлено» из-за понижения версии. versionName — 0.1.0-<число коммитов>, как в именах APK.
+// -Psnx.versionCode=N — вручную. В CI нужен полный клон (fetch-depth: 0), иначе число коммитов — 1.
+def git = { List<String> args, int fallback ->
     try {
-        def p = ['git', '-C', repoRoot.absolutePath, 'rev-list', '--count', 'HEAD'].execute()
+        def p = (['git', '-C', repoRoot.absolutePath] + args).execute()
         def out = p.text.trim()
-        p.waitFor() == 0 && out ? out.toInteger() : 1
+        p.waitFor() == 0 && out ? out.toLong() : fallback
     } catch (Exception ignored) {
-        1
+        fallback
     }
 }
-def snxVersionCode = project.hasProperty('snx.versionCode') ? project.property('snx.versionCode').toString().toInteger() : gitCommits()
+def snxCommits = git(['rev-list', '--count', 'HEAD'], 1)
+def snxCommitMinutes = Math.max(1000L, (git(['log', '-1', '--format=%ct'], 0) - 1767225600L).intdiv(60) as long)
+def snxVersionCode = project.hasProperty('snx.versionCode') ? project.property('snx.versionCode').toString().toInteger() : (snxCommitMinutes as int)
 
 android {
     namespace 'com.shreknx.game'
@@ -36,7 +40,7 @@ android {
         minSdk 24          // Android 7.0: OpenGL ES 3.0 есть везде, AAudio — с 8.1 (иначе OpenSL ES)
         targetSdk 35
         versionCode snxVersionCode
-        versionName "0.1.0-${snxVersionCode}"
+        versionName "0.1.0-${snxCommits}"
         ndk {
             abiFilters 'arm64-v8a'  // окно гостя — 4 ГБ адресов: только 64-битные телефоны
         }

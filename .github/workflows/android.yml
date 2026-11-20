@@ -4,7 +4,7 @@
 # С игрой — «Run workflow» со ссылкой на архив своей копии игры (или секрет SNX_GAME_SYSTEM_URL): код игры
 # генерируется рекомпилятором из её System (tools/fetch_game.sh).
 # Артефакт — сам APK (без zip), подписанный постоянным ключом (android/shreknx-release.jks.b64): новая сборка
-# ставится поверх старой без удаления; versionCode — число коммитов (нужен полный клон).
+# ставится поверх старой без удаления; versionCode — по времени коммита (растёт с каждым коммитом).
 name: Android APK
 
 on:
@@ -179,6 +179,8 @@ jobs:
           D=$(sed -n 's/.*certificate SHA-256 digest: //p' "$RUNNER_TEMP/cert.txt" | head -1)
           [ "$D" = 90071132e1f6152373649029ee9c3f41cf5feba67132318a3186e0ff4f491a2f ] \
             || { echo "::error::APK подписан не ключом android/shreknx-release.jks.b64 ($D)"; exit 1; }
+          # выравнивание в zip (несжатые .so — по 16 КБ): иначе установщик отвечает «Приложение не установлено»
+          "$BT/zipalign" -c -P 16 4 "$APK" || { echo "::error::APK не выровнен (zipalign -c -P 16 4)"; exit 1; }
           # libmain.so: JNI экранного управления и SDL_main на месте, выравнивание 16 КБ, ролики (FFmpeg)
           TC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
           unzip -o -q "$APK" lib/arm64-v8a/libmain.so -d "$RUNNER_TEMP/apk"
