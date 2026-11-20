@@ -28,6 +28,8 @@ object SnxNative {
     @JvmStatic external fun look(dx: Float, dy: Float)
     @JvmStatic external fun key(vk: Int, down: Boolean)
     @JvmStatic external fun state(): Int
+    // частота экрана и ограничение FPS: равны — кадры отмеряет vsync (platform/window.c plat_set_display)
+    @JvmStatic external fun display(hz: Float, fpsCap: Int)
     // сбросить файлы гостя и завершить процесс :game (выход кнопкой «Назад»)
     @JvmStatic external fun exitNow()
 }

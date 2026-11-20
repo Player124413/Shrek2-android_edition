@@ -21,6 +21,13 @@ void plat_screen_size(int *w, int *h);    // после plat_init: режим э
 void plat_drawable_size(int *w, int *h);  // размер кадра окна в пикселях
 void plat_swap(void);                     // показать кадр (поток с текущим контекстом)
 
+// Частота экрана и ограничение FPS (Android: GameActivity выбирает режим экрана под ограничение и сообщает частоту;
+// любой поток). Частота равна ограничению (60 FPS при 60 Гц) — кадры отмеряет vsync: ровно, без сна ограничителя
+// между обновлениями экрана (рывки 8/17/25 мс на 90/120 Гц). Интервал обмена 2 и больше Android не умеет
+// (ANativeWindow: 0 или 1), поэтому при 120 Гц — прежний ограничитель.
+void plat_set_display(float hz, int fps_cap);
+int plat_vsync_paced(void);  // 1 — ограничение держит vsync, сон ограничителя не нужен
+
 // Событие SDL (SDL_Event *) — в главном потоке, для перевода в ввод гостя.
 typedef void (*plat_event_fn)(const void *sdl_event);
 extern plat_event_fn plat_on_event;

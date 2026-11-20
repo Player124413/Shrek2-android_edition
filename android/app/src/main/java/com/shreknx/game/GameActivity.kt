@@ -2,12 +2,15 @@ package com.shreknx.game
 
 import android.app.AlertDialog
 import android.content.Context
+import android.hardware.display.DisplayManager
 import android.hardware.input.InputManager
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.os.Process
+import android.view.Display
 import android.view.InputDevice
+import android.view.Surface
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -16,11 +19,12 @@ import org.libsdl.app.SDLActivity
 
 // Игра: SDLActivity (libSDL2.so + libmain.so, SDL_main из host/boot/main.c) в отдельном процессе :game.
 // Поверх поверхности SDL — экранное управление (TouchControlsView) и, по шестерёнке, редактор раскладки.
-class GameActivity : SDLActivity(), InputManager.InputDeviceListener {
+class GameActivity : SDLActivity(), InputManager.InputDeviceListener, DisplayManager.DisplayListener {
     private lateinit var settings: Settings
     private var touch: TouchControlsView? = null
     private var editor: LayoutEditor? = null
     private var inputManager: InputManager? = null
+    private var displayManager: DisplayManager? = null
     private val poll = object : Runnable {
         override fun run() {
             val t = touch ?: return
@@ -53,10 +57,64 @@ class GameActivity : SDLActivity(), InputManager.InputDeviceListener {
         }
         updateGamepad()
         t.post(poll)
+        pickDisplayMode()
+        displayManager = (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager).also {
+            it.registerDisplayListener(this, null)
+        }
+        reportDisplay()
+    }
+
+    // Режим экрана под ограничение FPS: частота, равная ему (60 Гц при 60 FPS), иначе самая низкая кратная.
+    // Без этого на экране 90/120 Гц ограничитель засыпал между обновлениями экрана и кадры шли рывками
+    // (8/17/25 мс вперемешку), а при равной частоте кадры ровно отмеряет vsync (platform/window.c plat_set_display).
+    private fun pickDisplayMode() {
+        val cap = settings.fpsCap
+        if (cap <= 0 || Build.VERSION.SDK_INT < 23) return
+        @Suppress("DEPRECATION")
+        val d = windowManager.defaultDisplay ?: return
+        val cur = d.mode
+        fun mult(m: Display.Mode): Int {
+            val k = Math.round(m.refreshRate / cap)
+            return if (k in 1..4 && Math.abs(m.refreshRate - k * cap) < 1.5f) k else 0
+        }
+        val best = d.supportedModes
+            .filter { it.physicalWidth == cur.physicalWidth && it.physicalHeight == cur.physicalHeight && mult(it) > 0 }
+            .minByOrNull { it.refreshRate } ?: return
+        val lp = window.attributes
+        lp.preferredDisplayModeId = best.modeId
+        lp.preferredRefreshRate = best.refreshRate
+        window.attributes = lp
+    }
+
+    // Частота поверхности (Android 11+): системе — что игра идёт ровно cap кадров в секунду
+    private fun setSurfaceFrameRate() {
+        val cap = settings.fpsCap
+        if (cap <= 0 || Build.VERSION.SDK_INT < 30) return
+        try {
+            val s = SDLActivity.mSurface?.holder?.surface ?: return
+            if (s.isValid) s.setFrameRate(cap.toFloat(), Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun reportDisplay() {
+        @Suppress("DEPRECATION")
+        val hz = windowManager.defaultDisplay?.refreshRate ?: return
+        try {
+            SnxNative.display(hz, settings.fpsCap)
+        } catch (e: UnsatisfiedLinkError) {
+        }
+    }
+
+    override fun onDisplayAdded(displayId: Int) {}
+    override fun onDisplayRemoved(displayId: Int) {}
+    override fun onDisplayChanged(displayId: Int) {
+        if (displayId == Display.DEFAULT_DISPLAY) reportDisplay()
     }
 
     override fun onDestroy() {
         inputManager?.unregisterInputDeviceListener(this)
+        displayManager?.unregisterDisplayListener(this)
         // libmain.so не умеет запускаться второй раз в том же процессе (окно гостя, глобальные состояния):
         // процесс :game завершается вместе с игрой, следующий запуск — с чистого листа. Сразу, до
         // SDLActivity.onDestroy: тот ждёт конца потока SDL без срока, а игра на SDL_QUIT может и не выйти
@@ -89,7 +147,11 @@ class GameActivity : SDLActivity(), InputManager.InputDeviceListener {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) immersive()
+        if (hasFocus) {
+            immersive()
+            setSurfaceFrameRate()
+            reportDisplay()
+        }
     }
 
     @Suppress("DEPRECATION")

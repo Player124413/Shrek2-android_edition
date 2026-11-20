@@ -1325,7 +1325,7 @@ static void maybe_shot(d3ddev *d)
 
 // ================================================================ Present
 // Ограничение частоты кадров (SNX_FPS_CAP=30 и т. п.; лаунчер Android — «Ограничение FPS»: меньше нагрев и
-// троттлинг телефона) и подсказки производительности Android (ADPF): длительность работы кадра потоком гостя —
+// троттлинг телефона; если частота экрана равна ему — только vsync, platform/window.c plat_set_display) и подсказки производительности Android (ADPF): длительность работы кадра потоком гостя —
 // без ожиданий потока рендера и ограничителя.
 static void frame_pace(void)
 {
@@ -1351,7 +1351,7 @@ static void frame_pace(void)
     }
     last_wait = wait;
 #endif
-    if (cap > 0) {
+    if (cap > 0 && !plat_vsync_paced()) {  // частота экрана равна ограничению — кадры отмеряет vsync
         u64 period = 1000000000ull / (u64)cap;
         next = next && now < next + period ? next + period : now + period;
         if (next > now) {

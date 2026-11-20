@@ -11,6 +11,15 @@ class Settings(private val ctx: Context) {
     @Suppress("DEPRECATION")
     private val p: SharedPreferences = ctx.getSharedPreferences("snx", Context.MODE_MULTI_PROCESS)  // лаунчер и :game
 
+    init {
+        // прежние сборки: «без ограничения» по умолчанию у среднего и мощного пресетов — один раз на 60
+        if (!p.getBoolean("fps60", false)) {
+            val e = p.edit().putBoolean("fps60", true)
+            if (p.getInt("fpsCap", -1) == 0) e.putInt("fpsCap", 60)
+            e.commit()
+        }
+    }
+
     var gameDir: String
         get() = p.getString("gameDir", null) ?: defaultGameDir(ctx).absolutePath
         set(v) { p.edit().putString("gameDir", v).commit() }
@@ -99,8 +108,10 @@ object Device {
     data class Tier(val name: String, val scale: Float, val fps: Int, val tex16: Boolean, val fileCacheMb: Int)
 
     val LOW = Tier(L.t("Слабый", "Low"), 0.5f, 30, true, 96)
-    val MID = Tier(L.t("Средний", "Medium"), 0.75f, 0, false, 256)
-    val HIGH = Tier(L.t("Мощный", "High"), 1.0f, 0, false, 512)
+    // 60 FPS по умолчанию: экран переключается на 60 Гц, кадры отмеряет vsync — без рывков, которые были
+    // без ограничения на экранах 90/120 Гц (игра не держит 120 — кадры по 8/17/25 мс вперемешку)
+    val MID = Tier(L.t("Средний", "Medium"), 0.75f, 60, false, 256)
+    val HIGH = Tier(L.t("Мощный", "High"), 1.0f, 60, false, 512)
 
     fun ramMb(ctx: Context): Long {
         val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager

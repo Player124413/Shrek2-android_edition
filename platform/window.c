@@ -7,7 +7,9 @@
 #ifdef __SWITCH__
 #include <switch.h>
 #endif
+#include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <time.h>
 
 #include "platform/gl.h"
@@ -307,6 +309,22 @@ void plat_drawable_size(int *w, int *h)
 }
 
 static int g_seen_gen;  // поколение поверхности, привязанной потоком с контекстом
+
+static _Atomic int g_vsync_paced;  // ограничение FPS держит vsync (частота экрана равна ему)
+
+void plat_set_display(float hz, int fps_cap)
+{
+    int paced = fps_cap > 0 && hz > 0 && fabsf(hz - (float)fps_cap) < 1.5f && !SDL_getenv("SNX_NOVSYNC");
+    static float old_hz = -1;
+    static int old_cap = -1;
+    if (fabsf(old_hz - hz) > 0.5f || old_cap != fps_cap)
+        SDL_Log("display %.1f Hz, FPS cap %d: %s", (double)hz, fps_cap, paced ? "vsync pacing" : "sleep pacing");
+    old_hz = hz;
+    old_cap = fps_cap;
+    atomic_store(&g_vsync_paced, paced);
+}
+
+int plat_vsync_paced(void) { return atomic_load_explicit(&g_vsync_paced, memory_order_relaxed); }
 
 void plat_swap(void)
 {

@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include "host/boot/touch.h"
+#include "platform/window.h"
 #include "runtime/hle/hle.h"
 
 #define JNI_FN(name) Java_com_shreknx_game_SnxNative_##name
@@ -46,4 +47,12 @@ JNIEXPORT jint JNICALL JNI_FN(state)(JNIEnv *env, jclass cls)
     (void)env;
     (void)cls;
     return touch_state();
+}
+
+// Частота экрана (режим, выбранный GameActivity под ограничение FPS, или смена частоты системой) и ограничение
+JNIEXPORT void JNICALL JNI_FN(display)(JNIEnv *env, jclass cls, jfloat hz, jint fps_cap)
+{
+    (void)env;
+    (void)cls;
+    plat_set_display(hz, fps_cap);
 }
