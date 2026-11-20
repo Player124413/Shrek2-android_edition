@@ -306,10 +306,20 @@ void hle_binkw32__BinkGetTrackData_8(CPU *c)
     RET(2, bytes);
 }
 
+static _Atomic u64 g_movie_ns;  // последнее декодирование кадра видео (bink_movie_playing)
+
+int bink_movie_playing(void)
+{
+    u64 t = g_movie_ns;
+    return t && rt_ticks_ns() - t < 300000000ull;
+}
+
 void hle_binkw32__BinkDoFrame_4(CPU *c)
 {
     HLE_ENTER("BinkDoFrame", 1);
     bink *b = by_obj(ARG(0));
+    if (b && b->vid)
+        g_movie_ns = rt_ticks_ns();
     if (b)
         video_decode_to(b, b->frame);
     RET(1, 0);

@@ -31,7 +31,9 @@ class Control(
 
 object TouchLayout {
     private const val FILE = "touch_layout.json"
-    private const val VERSION = 2  // 2: стики по умолчанию статичные (в 1 левый был плавающим)
+    // 2: стики по умолчанию статичные (в 1 левый был плавающим); 3: «Пропуск» (Minus) виден (был скрыт — ролики
+    // и сценки было не пропустить)
+    private const val VERSION = 3
 
     // По умолчанию — как на геймпаде Switch (docs/CONSOLE.md, «Раскладка»): A — удар, B — прыжок, X — действие,
     // Plus — меню, ZL — второй слой (с ним X/A/B/Y — зелья 5–8). L/R (колесо мыши: смена
@@ -44,11 +46,12 @@ object TouchLayout {
         Control("x", Kind.BUTTON, L.t("Действие", "Action"), 0.735f, 0.66f, 0.15f, button = SnxNative.X),
         Control("zl", Kind.BUTTON, L.t("Зелья", "Potions"), 0.64f, 0.86f, 0.12f, button = SnxNative.ZL),
         Control("plus", Kind.BUTTON, L.t("Меню", "Menu"), 0.58f, 0.07f, 0.10f, button = SnxNative.PLUS),
+        // Minus — пропустить ролик или сценку (BypassCutscene | StopMoviePlayback, host/boot/config.c)
+        Control("minus", Kind.BUTTON, L.t("Пропуск", "Skip"), 0.42f, 0.07f, 0.10f, button = SnxNative.MINUS),
         // скрытые по умолчанию: включаются в редакторе
         Control("dpad", Kind.DPAD, "", 0.30f, 0.78f, 0.26f, visible = false),
         Control("rstick", Kind.STICK, "", 0.62f, 0.62f, 0.30f, visible = false, rightStick = true),
         Control("zr", Kind.BUTTON, "ZR", 0.70f, 0.13f, 0.11f, visible = false, button = SnxNative.ZR),
-        Control("minus", Kind.BUTTON, "−", 0.42f, 0.07f, 0.10f, visible = false, button = SnxNative.MINUS),
         Control("rs", Kind.BUTTON, L.t("Центр", "Center"), 0.93f, 0.33f, 0.11f, visible = false, button = SnxNative.RSTICK),
         Control("esc", Kind.BUTTON, "Esc", 0.50f, 0.07f, 0.10f, visible = false, vk = 0x1B),
         Control("enter", Kind.BUTTON, L.t("Ввод", "Enter"), 0.36f, 0.07f, 0.10f, visible = false, vk = 0x0D),
@@ -72,7 +75,7 @@ object TouchLayout {
                 c.x = o.optDouble("x", c.x.toDouble()).toFloat().coerceIn(0f, 1f)
                 c.y = o.optDouble("y", c.y.toDouble()).toFloat().coerceIn(0f, 1f)
                 c.size = o.optDouble("size", c.size.toDouble()).toFloat().coerceIn(MIN_SIZE, MAX_SIZE)
-                c.visible = o.optBoolean("visible", c.visible)
+                if (ver >= 3 || c.id != "minus") c.visible = o.optBoolean("visible", c.visible)
                 c.opacity = o.optDouble("opacity", c.opacity.toDouble()).toFloat().coerceIn(0.1f, 1f)
                 if (ver >= 2) c.floating = o.optBoolean("floating", c.floating)
                 c.toggle = o.optBoolean("toggle", c.toggle)
