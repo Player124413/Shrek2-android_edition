@@ -62,10 +62,10 @@ object CreditsDialog {
             orientation = LinearLayout.VERTICAL
             background = GradientDrawable().apply {
                 setColor(CARD_BG)
-                cornerRadius = dp(28f).toFloat()
+                cornerRadius = dp(22f).toFloat()
                 setStroke(dp(1.5f), CARD_LINE)
             }
-            setPadding(dp(20f), dp(50f), dp(20f), dp(14f))
+            setPadding(dp(16f), dp(36f), dp(16f), dp(8f))
         }
         // заголовок: «Shrek 2» белым жирным, « · shrekNX Android» зелёным
         card.addView(TextView(act).apply {
@@ -76,9 +76,9 @@ object CreditsDialog {
             sb.setSpan(ForegroundColorSpan(GREEN), st, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             text = sb
             setTextColor(Color.WHITE)
-            textSize = 22f
+            textSize = 18f
             gravity = Gravity.CENTER
-        }, lp(bottom = dp(18f)))
+        }, lp(bottom = dp(10f)))
 
         // автор
         card.addView(TextView(act).apply {
@@ -89,38 +89,38 @@ object CreditsDialog {
             sb.setSpan(ForegroundColorSpan(GREEN), st, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             text = sb
             setTextColor(Color.WHITE)
-            textSize = 17f
+            textSize = 14f
             gravity = Gravity.CENTER
             background = box(act, BOX_GREEN, BOX_GREEN_LINE)
-            setPadding(dp(14f), dp(14f), dp(14f), dp(14f))
-        }, lp(bottom = dp(12f)))
+            setPadding(dp(10f), dp(8f), dp(10f), dp(8f))
+        }, lp(bottom = dp(8f)))
 
         // Telegram-канал: 📢, подпись капсом, ссылка; нажатие — открыть канал
         val tg = LinearLayout(act).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             background = box(act, BOX_DARK, BOX_DARK_LINE)
-            setPadding(dp(16f), dp(12f), dp(16f), dp(12f))
+            setPadding(dp(12f), dp(7f), dp(12f), dp(7f))
             isClickable = true
             setOnClickListener { openChannel() }
         }
-        tg.addView(TextView(act).apply { text = "📢"; textSize = 26f }, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(14f) })
+        tg.addView(TextView(act).apply { text = "📢"; textSize = 20f }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(10f) })
         val tgText = LinearLayout(act).apply { orientation = LinearLayout.VERTICAL }
         tgText.addView(TextView(act).apply {
             text = L.t("TELEGRAM-КАНАЛ", "TELEGRAM CHANNEL")
             setTextColor(GREY)
-            textSize = 12f
+            textSize = 10f
             letterSpacing = 0.08f
         })
         tgText.addView(TextView(act).apply {
             text = L.TG_CHANNEL.removePrefix("https://")
             setTextColor(GREEN)
-            textSize = 17f
+            textSize = 14f
             setTypeface(typeface, Typeface.BOLD)
         })
         tg.addView(tgText)
-        card.addView(tg, lp(bottom = dp(14f)))
+        card.addView(tg, lp(bottom = dp(8f)))
 
         // благодарность: ссылка на репозиторий — зелёная жирная, нажимается
         card.addView(TextView(act).apply {
@@ -146,16 +146,16 @@ object CreditsDialog {
                 " repository — without it the Android port would not exist."))
             text = sb
             setTextColor(GREY)
-            textSize = 15f
-            setLineSpacing(0f, 1.15f)
+            textSize = 12.5f
+            setLineSpacing(0f, 1.1f)
             movementMethod = LinkMovementMethod.getInstance()
             highlightColor = Color.TRANSPARENT
             setPadding(dp(4f), 0, dp(4f), 0)
-        }, lp(bottom = dp(16f)))
+        }, lp(bottom = dp(8f)))
 
         // разделитель
         card.addView(View(act).apply { setBackgroundColor(BOX_DARK_LINE) },
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1f)).apply { bottomMargin = dp(12f) })
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1f)).apply { bottomMargin = dp(4f) })
 
         // кнопки: «OK» — текстом, «Открыть канал» — зелёная «таблетка» со значком Telegram
         val buttons = LinearLayout(act).apply {
@@ -165,28 +165,28 @@ object CreditsDialog {
         buttons.addView(TextView(act).apply {
             text = "OK"
             setTextColor(0xFFB8C2B0.toInt())
-            textSize = 16f
+            textSize = 13f
             setTypeface(typeface, Typeface.BOLD)
             gravity = Gravity.CENTER
-            setPadding(dp(22f), dp(12f), dp(22f), dp(12f))
+            setPadding(dp(16f), dp(8f), dp(16f), dp(8f))
             isClickable = true
             setOnClickListener { d.dismiss() }
         }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(8f) })
         buttons.addView(TextView(act).apply {
             text = L.t("ОТКРЫТЬ КАНАЛ", "OPEN CHANNEL")
             setTextColor(BTN_TEXT)
-            textSize = 15f
+            textSize = 12f
             setTypeface(typeface, Typeface.BOLD)
             letterSpacing = 0.03f
             gravity = Gravity.CENTER
-            val ic = TelegramIcon(dp(20f))
+            val ic = TelegramIcon(dp(16f))
             setCompoundDrawablesRelative(ic, null, null, null)
-            compoundDrawablePadding = dp(10f)
+            compoundDrawablePadding = dp(7f)
             background = GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(0xFFA6D650.toInt(), 0xFF6E9E26.toInt())).apply {
-                cornerRadius = dp(26f).toFloat()
+                cornerRadius = dp(20f).toFloat()
             }
-            elevation = dp(6f).toFloat()
-            setPadding(dp(22f), dp(13f), dp(24f), dp(13f))
+            elevation = dp(4f).toFloat()
+            setPadding(dp(14f), dp(8f), dp(16f), dp(8f))
             isClickable = true
             setOnClickListener { openChannel(); d.dismiss() }
         })
@@ -195,9 +195,9 @@ object CreditsDialog {
         // значок поверх верхней рамки карточки
         val frame = FrameLayout(act).apply { clipChildren = false; clipToPadding = false }
         frame.addView(card, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-            topMargin = dp(38f)
+            topMargin = dp(28f)
         })
-        frame.addView(Badge(act), FrameLayout.LayoutParams(dp(84f), dp(84f), Gravity.TOP or Gravity.CENTER_HORIZONTAL))
+        frame.addView(Badge(act), FrameLayout.LayoutParams(dp(62f), dp(62f), Gravity.TOP or Gravity.CENTER_HORIZONTAL))
 
         // в альбомной ориентации окно может не влезть по высоте — прокрутка
         val scroll = ScrollView(act).apply {
@@ -211,7 +211,7 @@ object CreditsDialog {
         d.window?.let { w ->
             w.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
             val m = act.resources.displayMetrics
-            val width = minOf((m.widthPixels * 0.92f).toInt(), dp(440f))
+            val width = minOf((m.widthPixels * 0.9f).toInt(), dp(340f))
             w.setLayout(width, ViewGroup.LayoutParams.WRAP_CONTENT)
             w.setDimAmount(0.75f)
         }
@@ -238,17 +238,17 @@ object CreditsDialog {
         }
 
         override fun onDraw(canvas: Canvas) {
-            val pad = 8f * density
+            val pad = 6f * density
             rect.set(pad, pad, width - pad, height - pad)
-            val rr = 20f * density
+            val rr = 15f * density
             // кайма (тёмная) со свечением
             p.shader = null
             p.style = Paint.Style.FILL
             p.color = 0xFF0B1007.toInt()
-            p.setShadowLayer(9f * density, 0f, 0f, 0x998DC63F.toInt())
+            p.setShadowLayer(6f * density, 0f, 0f, 0x998DC63F.toInt())
             canvas.drawRoundRect(rect, rr, rr, p)
             p.clearShadowLayer()
-            val inset = 3.5f * density
+            val inset = 2.5f * density
             rect.inset(inset, inset)
             p.shader = LinearGradient(rect.left, rect.top, rect.right, rect.bottom, 0xFFA6D650.toInt(), 0xFF5E8A22.toInt(), Shader.TileMode.CLAMP)
             canvas.drawRoundRect(rect, rr - inset, rr - inset, p)

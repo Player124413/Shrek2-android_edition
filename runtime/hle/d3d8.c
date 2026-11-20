@@ -1,6 +1,7 @@
 // HLE Direct3D 8: IDirect3D8 (адаптер, режимы, форматы, caps). Профиль — GeForce4 Ti 4600 (NV25, 128 МБ):
 // HW T&L, vs.1.1, ps.1.3, DXT1-5, 4 текстуры за проход — карта «высокой детализации» 2004 года, которой нет
 // в VideoCard.ini (значит, без ограничений). Устройство — d3d8_dev.c, отрисовка — d3d8_ff.c.
+#include <stdio.h>
 #include <string.h>
 
 #include "runtime/hle/com.h"
@@ -24,6 +25,41 @@ static const u16 g_modes[][2] = {
 };
 #define NMODES (int)(sizeof g_modes / sizeof g_modes[0])
 static const u32 g_mode_fmts[2] = {FMT_X8R8G8B8, FMT_R5G6B5};
+
+// Список режимов = таблица + размер экрана порта (user32_screen: на телефоне — экран x доля разрешения, например
+// 1200x540 на 20:9), если его нет в таблице; по возрастанию ширины, затем высоты. Полноэкранный D3DRenderDevice
+// берёт из списка ближайший к FullscreenViewportX/Y режим: без размера экрана в списке кадр на 20:9–21:9
+// становился 16:9 (1280x720 / 1920x1080) с чёрными полосами по бокам даже в режиме «Весь экран».
+// Возвращает число режимов одного формата; mode_at — i-й из них.
+static int mode_list(u16 out[NMODES + 1][2])
+{
+    int sw, sh, n = 0, extra = 1;
+    user32_screen(&sw, &sh);
+    for (int i = 0; i < NMODES; i++)
+        if (g_modes[i][0] == sw && g_modes[i][1] == sh)
+            extra = 0;
+    if (sw <= 0 || sh <= 0 || sw > 0xFFFF || sh > 0xFFFF)
+        extra = 0;
+    for (int i = 0; i < NMODES; i++) {
+        if (extra && (sw < g_modes[i][0] || (sw == g_modes[i][0] && sh < g_modes[i][1]))) {
+            out[n][0] = (u16)sw;
+            out[n++][1] = (u16)sh;
+            extra = 0;
+        }
+        out[n][0] = g_modes[i][0];
+        out[n++][1] = g_modes[i][1];
+    }
+    if (extra) {
+        out[n][0] = (u16)sw;
+        out[n++][1] = (u16)sh;
+    }
+    static int logged;
+    if (!logged && n > NMODES) {
+        logged = 1;
+        fprintf(stderr, "[d3d8] display modes: + screen %dx%d\n", sw, sh);
+    }
+    return n;
+}
 
 static void put_mode(u32 p, u32 w, u32 h, u32 fmt)
 {
@@ -136,15 +172,20 @@ static void d3d_GetAdapterIdentifier(CPU *c)
     RET(4, D3D_OK);
 }
 
-static void d3d_GetAdapterModeCount(CPU *c) { RET(2, ARG(1) == 0 ? (u32)(NMODES * 2) : 0); }
+static void d3d_GetAdapterModeCount(CPU *c)
+{
+    u16 l[NMODES + 1][2];
+    RET(2, ARG(1) == 0 ? (u32)(mode_list(l) * 2) : 0);
+}
 
 // EnumAdapterModes(this, adapter, mode, D3DDISPLAYMODE*): сначала все 32-битные, потом 16-битные
 static void d3d_EnumAdapterModes(CPU *c)
 {
-    u32 m = ARG(2);
-    if (ARG(1) != 0 || m >= (u32)(NMODES * 2))
+    u16 l[NMODES + 1][2];
+    u32 m = ARG(2), n = (u32)mode_list(l);
+    if (ARG(1) != 0 || m >= n * 2)
         RET(4, D3DERR_INVALIDCALL);
-    put_mode(ARG(3), g_modes[m % NMODES][0], g_modes[m % NMODES][1], g_mode_fmts[m / NMODES]);
+    put_mode(ARG(3), l[m % n][0], l[m % n][1], g_mode_fmts[m / n]);
     RET(4, D3D_OK);
 }
 
