@@ -48,8 +48,10 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
     private val rect = RectF()
 
     // ---------------------------------------------------------------- состояние пальцев (игра)
-    private enum class Bind { NONE, CONTROL, LOOK, GEAR }
-    private class Finger(var bind: Bind = Bind.NONE, var ctl: Control? = null, var lastX: Float = 0f, var lastY: Float = 0f)
+    private enum class Bind { NONE, CONTROL, LOOK, GEAR, SLOT }
+    // combo — пока палец держал «Зелья», жали другую кнопку (ZL+A и т. п.): тогда при отпускании слот не пьётся
+    private class Finger(var bind: Bind = Bind.NONE, var ctl: Control? = null, var lastX: Float = 0f, var lastY: Float = 0f,
+                         var combo: Boolean = false)
     private val fingers = HashMap<Int, Finger>()
 
     private class StickState(var pointer: Int = -1, var cx: Float = 0f, var cy: Float = 0f, var vx: Float = 0f, var vy: Float = 0f)
@@ -117,6 +119,42 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
         val pressed = isPressed(c)
         ShrekIcons.drawButton(canvas, cx(c), cy(c), radius(c), ShrekIcons.iconFor(c.id), c.label, pressed,
             c.toggle && c.id in latched, alpha(if (pressed) min(1f, a * 1.2f) else a))
+        if (c.id == POTION_ID) drawSlot(canvas, c, a)
+    }
+
+    // ---------------------------------------------------------------- слот зелья у кнопки «Зелья»
+    // Слева и справа от кнопки — стрелки (слот 1–9 по кругу), снизу справа — номер слота. Короткое нажатие
+    // «Зелья» (без других кнопок) — клавиша цифры слота, как цифры 1–9 на ПК; удержание с «Ударом»/«Прыжком» —
+    // по-прежнему слой ZL (зелья 6 и 7 из Snx.ini). Какое зелье в каком слоте — решает игра.
+    private var slotFlash = 0  // -1/1 — стрелка нажата (подсветка), 0 — нет
+
+    private fun slotArrowX(c: Control, dir: Int) = cx(c) + dir * radius(c) * 1.6f
+    private fun slotArrowR(c: Control) = radius(c) * 0.42f
+
+    private fun drawSlot(canvas: Canvas, c: Control, a: Float) {
+        val r = radius(c)
+        val y = cy(c)
+        for (dir in intArrayOf(-1, 1))
+            ShrekIcons.drawArrow(canvas, slotArrowX(c, dir), y, slotArrowR(c), dir < 0, slotFlash == dir, alpha(a))
+        ShrekIcons.drawBadge(canvas, cx(c) + r * 0.8f, y + r * 0.8f, r * 0.36f, settings.potionSlot.toString(), alpha(min(1f, a * 1.3f)))
+    }
+
+    // стрелка слота под пальцем: -1 / 1, 0 — нет
+    private fun slotArrowAt(x: Float, y: Float): Int {
+        val c = controls.firstOrNull { it.id == POTION_ID && it.visible } ?: return 0
+        for (dir in intArrayOf(-1, 1))
+            if (hypot(x - slotArrowX(c, dir), y - cy(c)) < slotArrowR(c) * 1.35f) return dir
+        return 0
+    }
+
+    private fun drinkSlot() {
+        val vk = 0x30 + settings.potionSlot
+        try {
+            SnxNative.key(vk, true)
+            // клавиша держится пару кадров: игра опрашивает ввод раз в кадр
+            postDelayed({ try { SnxNative.key(vk, false) } catch (e: UnsatisfiedLinkError) {} }, 90)
+        } catch (e: UnsatisfiedLinkError) {
+        }
     }
 
     private fun drawStick(canvas: Canvas, c: Control, a: Float) {
@@ -230,13 +268,23 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
         fingers[id] = f
         if (onGearAt(x, y)) { f.bind = Bind.GEAR; return }
         if (!active()) return
+        val dir = slotArrowAt(x, y)
+        if (dir != 0) {
+            f.bind = Bind.SLOT
+            settings.potionSlot = (settings.potionSlot - 1 + dir + 9) % 9 + 1
+            slotFlash = dir
+            buzz()
+            invalidate()
+            return
+        }
         val c = hit(x, y, ALL_KINDS)
         if (c != null) {
             f.bind = Bind.CONTROL
             f.ctl = c
+            if (c.kind == Kind.BUTTON && c.id != POTION_ID) markCombo()
             when (c.kind) {
                 Kind.STICK -> startStick(c, id, cx(c), cy(c), x, y)
-                Kind.DPAD -> updateDpad(c, x, y)
+                Kind.DPAD -> { markCombo(); updateDpad(c, x, y) }
                 Kind.BUTTON -> {
                     if (c.toggle) { if (!latched.remove(c.id)) latched.add(c.id) }
                     buzz()
@@ -270,6 +318,7 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
                         val n = hit(x, y, BUTTONS)
                         if (n != null && n !== c && !n.toggle) {
                             f.ctl = n
+                            if (n.id != POTION_ID) markCombo()
                             buzz()
                             invalidate()
                         }
@@ -285,12 +334,20 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
     private fun up(id: Int, x: Float, y: Float) {
         val f = fingers.remove(id) ?: return
         if (f.bind == Bind.GEAR && onGearAt(x, y)) onGear?.invoke()
+        if (f.bind == Bind.SLOT) slotFlash = 0
         val c = f.ctl
+        // короткое нажатие «Зелья» без других кнопок — выпить зелье слота
+        if (f.bind == Bind.CONTROL && c != null && c.id == POTION_ID && !c.toggle && !f.combo) drinkSlot()
         if (c != null) {
             if (c.kind == Kind.STICK) sticks[c.id]?.let { if (it.pointer == id) { it.pointer = -1; it.vx = 0f; it.vy = 0f } }
             if (c.kind == Kind.DPAD && fingers.values.none { it.ctl === c }) dpadMask = 0
         }
         invalidate()
+    }
+
+    // палец на «Зельях» участвует в сочетании (слой ZL): слот при отпускании не пьётся
+    private fun markCombo() {
+        for (o in fingers.values) if (o.bind == Bind.CONTROL && o.ctl?.id == POTION_ID) o.combo = true
     }
 
     private fun startStick(c: Control, id: Int, ox: Float, oy: Float, x: Float, y: Float) {
@@ -358,6 +415,7 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
         fingers.clear()
         sticks.values.forEach { it.pointer = -1; it.vx = 0f; it.vy = 0f }
         dpadMask = 0
+        slotFlash = 0
         if (!editMode) {
             latched.clear()
             send()
@@ -470,6 +528,7 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
 
     companion object {
         private val ALL_KINDS = setOf(Kind.BUTTON, Kind.STICK, Kind.DPAD)
+        private const val POTION_ID = "zl"
         private val BUTTONS = setOf(Kind.BUTTON)
         private const val SNAP_DEG = 25.0  // стик: ближе к оси — строго по оси
     }

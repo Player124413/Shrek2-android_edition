@@ -223,4 +223,40 @@ object ShrekIcons {
         pStroke.alpha = 255
         drawHead(canvas, kx, ky, r * 0.38f, (a * 0.95f * 255).toInt(), active)
     }
+
+    // стрелка выбора слота зелья: маленькая болотная кнопка с кремовым треугольником (влево или вправо)
+    private val ARROW_RIGHT = SvgPath.parse("M42 30 L66 50 L42 70 C38 73 35 71 35 66 L35 34 C35 29 38 27 42 30 Z")
+
+    fun drawArrow(canvas: Canvas, x: Float, y: Float, r: Float, left: Boolean, pressed: Boolean, alpha: Int) {
+        if (r <= 0f) return
+        val save = begin(canvas, x, y, r, alpha)
+        pFill.color = Color.WHITE
+        pFill.shader = if (pressed) pressedShader else baseShader
+        canvas.drawCircle(50f, 50f, 40f, pFill)
+        pFill.shader = null
+        pStroke.color = OGRE
+        pStroke.strokeWidth = 5f
+        canvas.drawCircle(50f, 50f, 40f, pStroke)
+        if (left) canvas.scale(-1f, 1f, 50f, 50f)
+        canvas.translate(3f, 0f)  // треугольник визуально по центру
+        pFill.color = if (pressed) PRESSED_INK else CREAM
+        canvas.drawPath(ARROW_RIGHT, pFill)
+        canvas.restoreToCount(save)
+    }
+
+    // номер слота: кремовый кружок с тёмной цифрой и зелёной каймой
+    fun drawBadge(canvas: Canvas, x: Float, y: Float, r: Float, text: String, alpha: Int) {
+        if (r <= 0f) return
+        val save = begin(canvas, x, y, r, alpha)
+        pFill.shader = null
+        pFill.color = CREAM
+        canvas.drawCircle(50f, 50f, 40f, pFill)
+        pStroke.color = OGRE_DARK
+        pStroke.strokeWidth = 7f
+        canvas.drawCircle(50f, 50f, 40f, pStroke)
+        pText.color = PRESSED_INK
+        pText.textSize = 56f
+        canvas.drawText(text, 50f, 50f - (pText.descent() + pText.ascent()) / 2, pText)
+        canvas.restoreToCount(save)
+    }
 }

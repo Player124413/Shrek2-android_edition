@@ -63,6 +63,9 @@ class Settings(private val ctx: Context) {
     var lookSensitivity: Float
         get() = p.getFloat("lookSens", 1.0f)
         set(v) { p.edit().putFloat("lookSens", v).commit() }
+    var potionSlot: Int  // слот зелья (1–9) у кнопки «Зелья»: стрелки рядом с ней, короткое нажатие — выпить
+        get() = p.getInt("potionSlot", 1).coerceIn(1, 9)
+        set(v) { p.edit().putInt("potionSlot", v.coerceIn(1, 9)).apply() }
     var haptics: Boolean
         get() = p.getBoolean("haptics", true)
         set(v) { p.edit().putBoolean("haptics", v).commit() }
