@@ -35,15 +35,14 @@ object TouchLayout {
     // (ролики пропускает «Меню»)
     private const val VERSION = 4
 
-    // По умолчанию — как на геймпаде Switch (docs/CONSOLE.md, «Раскладка»): A — удар, B — прыжок, X — действие,
-    // Plus — меню, ZL — второй слой (с ним X/A/B/Y — зелья 5–8). L/R (колесо мыши: смена
-    // навыка, скорость камеры) и Y «Камера» (камера за спину; есть скрытая «Центр») на экране не нужны и убраны; из
-    // старых раскладок «l», «r», «y» просто не читаются
+    // По умолчанию — как на геймпаде Switch (docs/CONSOLE.md, «Раскладка»): A — удар, B — прыжок, Plus — меню,
+    // ZL — второй слой (с ним A/B — зелья). L/R (колесо мыши: смена навыка, скорость камеры), Y «Камера» (камера за
+    // спину; есть скрытая «Центр») и X «Действие» (Use — в игре не нужен) на экране не нужны и убраны; из старых
+    // раскладок «l», «r», «y», «x» просто не читаются
     fun defaults(): List<Control> = listOf(
         Control("lstick", Kind.STICK, "", 0.14f, 0.70f, 0.38f),  // статичный: не ездит под пальцем
         Control("a", Kind.BUTTON, L.t("Удар", "Attack"), 0.915f, 0.66f, 0.17f, button = SnxNative.A),
         Control("b", Kind.BUTTON, L.t("Прыжок", "Jump"), 0.825f, 0.83f, 0.17f, button = SnxNative.B),
-        Control("x", Kind.BUTTON, L.t("Действие", "Action"), 0.735f, 0.66f, 0.15f, button = SnxNative.X),
         Control("zl", Kind.BUTTON, L.t("Зелья", "Potions"), 0.64f, 0.86f, 0.12f, button = SnxNative.ZL),
         Control("plus", Kind.BUTTON, L.t("Меню", "Menu"), 0.58f, 0.07f, 0.10f, button = SnxNative.PLUS),
         // скрытые по умолчанию: включаются в редакторе
