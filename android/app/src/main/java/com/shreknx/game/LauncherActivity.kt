@@ -74,8 +74,8 @@ class LauncherActivity : Activity() {
         val head = Ui.hbox(this).apply { setPadding(0, 0, 0, Ui.dp(this@LauncherActivity, 12f)) }
         val titles = Ui.vbox(this)
         titles.addView(Ui.title(this, getString(R.string.app_name), 28f))
-        titles.addView(Ui.label(this, "shrekNX ${BuildConfig.VERSION_NAME} · ${if (Settings.variant() == "rus") L.t("русская версия", "Russian version") else L.t("английская версия", "English version")}",
-            dim = true, size = 13f))
+        variantLabel = Ui.label(this, "", dim = true, size = 13f)
+        titles.addView(variantLabel)
         status = Ui.label(this, "", size = 14f).apply { setPadding(0, Ui.dp(this@LauncherActivity, 6f), 0, 0) }
         titles.addView(status)
         head.addView(titles, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
@@ -121,11 +121,36 @@ class LauncherActivity : Activity() {
             refreshStatus()
         }, wrapGap())
         c.addView(row2)
+        if (GameVariant.isUniversal()) {
+            // универсальный APK: в нём код обеих версий игры, по умолчанию версия — по файлам в папке
+            c.addView(Ui.choiceRow(this, L.t("Версия игры", "Game version"),
+                listOf(L.t("Авто", "Auto"), L.t("Английская", "English"), L.t("Русская", "Russian")), s.gameVariant.coerceIn(0, 2)) {
+                s.gameVariant = it
+                refreshStatus()
+            })
+            c.addView(Ui.label(this, L.t("Авто — по файлам игры (Core.dll). Настройки и сохранения у версий раздельные.",
+                "Auto — from the game files (Core.dll). Settings and saves are separate for each version."), dim = true, size = 12f))
+        }
         pathLabel = path
         return c
     }
 
     private var pathLabel: TextView? = null
+    private var variantLabel: TextView? = null
+
+    // «shrekNX 0.1.0-N · русская версия»; у универсального APK — какая версия игры найдена и как определена
+    private fun variantText(): String {
+        if (!GameVariant.isUniversal())
+            return "shrekNX ${BuildConfig.VERSION_NAME} · " +
+                (if (BuildConfig.VARIANT == "rus") L.t("русская версия", "Russian version") else L.t("английская версия", "English version"))
+        val v = GameVariant.effective(this, s)
+        val how = when (s.gameVariant) {
+            1, 2 -> L.t("выбрано вручную", "chosen manually")
+            else -> GameVariant.detect(this, s.gameDir).let { r -> if (r.variant != null) L.t("по файлам игры", "detected from game files") else L.t("не определена — по умолчанию", "not detected — default") }
+        }
+        return "shrekNX ${BuildConfig.VERSION_NAME} · " + L.t("универсальная", "universal") + " · " +
+            L.t("игра: ", "game: ") + GameVariant.label(v) + " ($how)"
+    }
 
     private fun wrapGap() = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
         .apply { rightMargin = Ui.dp(this@LauncherActivity, 8f) }
@@ -136,6 +161,7 @@ class LauncherActivity : Activity() {
         status.text = err?.let { "⚠ $it" } ?: L.t("✓ Игра найдена", "✓ Game found")
         status.setTextColor(if (err == null) Ui.ACCENT else 0xFFFFB74D.toInt())
         pathLabel?.text = s.gameDir
+        variantLabel?.text = variantText()
     }
 
     private fun pickImport() {
@@ -325,7 +351,7 @@ class LauncherActivity : Activity() {
             }
         }
         val log = Settings.logFile(this)
-        val report = "shrekNX ${BuildConfig.VERSION_NAME} (${Settings.variant()}), ${Build.MANUFACTURER} ${Build.MODEL}, " +
+        val report = "shrekNX ${BuildConfig.VERSION_NAME} (${Settings.variant(this)}${if (GameVariant.isUniversal()) ", uni: " + GameVariant.detect(this, s.gameDir).how else ""}), ${Build.MANUFACTURER} ${Build.MODEL}, " +
             "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\n\n" +
             "===== snx.log (последний запуск) =====\n" + part(log) +
             "\n\n===== snx.log.old (запуск перед ним) =====\n" + part(File(log.path + ".old"))

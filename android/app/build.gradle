@@ -67,6 +67,14 @@ android {
             buildConfigField 'String', 'VARIANT', '"rus"'
             externalNativeBuild { cmake { arguments '-DSNX_VARIANT=rus' } }
         }
+        // универсальный: обе версии игры в одном APK (tools/build.sh android-uni). libmain.so — код английской
+        // (build/gen), libmain_rus.so — русской (из APK rus, build/uni-jni); лаунчер выбирает по файлам игры
+        // (GameVariant.kt, CRC Core.dll — build/uni-assets/variants.txt). Пакет — как у английской: ставится поверх.
+        // Название — res/values(-ru)/strings.xml этого flavor («Shrek 2» / «Шрек 2» по языку телефона).
+        uni {
+            dimension 'lang'
+            buildConfigField 'String', 'VARIANT', '"uni"'
+        }
     }
 
     externalNativeBuild {
@@ -80,6 +88,10 @@ android {
     sourceSets {
         main {
             java.srcDirs += sdlJava  // org.libsdl.app.* — из исходников SDL той же версии, что и libSDL2.so
+        }
+        uni {
+            jniLibs.srcDirs += new File(repoRoot, 'build/uni-jni')
+            assets.srcDirs += new File(repoRoot, 'build/uni-assets')
         }
     }
 

@@ -34,7 +34,10 @@ class GameActivity : SDLActivity(), InputManager.InputDeviceListener, DisplayMan
         }
     }
 
-    override fun getLibraries(): Array<String> = arrayOf("SDL2", "main")
+    // универсальный APK: код русской версии игры — в libmain_rus.so (GameVariant), английской — в libmain.so
+    override fun getLibraries(): Array<String> =
+        if (GameVariant.isUniversal() && GameVariant.effective(this) == GameVariant.RUS) arrayOf("SDL2", "main_rus")
+        else arrayOf("SDL2", "main")
 
     override fun getArguments(): Array<String> = intent.getStringArrayExtra(EXTRA_ARGS) ?: Settings(this).gameArgs()
 

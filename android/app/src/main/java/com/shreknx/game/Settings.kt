@@ -23,6 +23,9 @@ class Settings(private val ctx: Context) {
     var gameDir: String
         get() = p.getString("gameDir", null) ?: defaultGameDir(ctx).absolutePath
         set(v) { p.edit().putString("gameDir", v).commit() }
+    var gameVariant: Int  // универсальный APK: 0 — версия игры по файлам (GameVariant), 1 — английская, 2 — русская
+        get() = p.getInt("gameVariant", 0)
+        set(v) { p.edit().putInt("gameVariant", v).commit() }
 
     // графика
     var renderScale: Float
@@ -103,9 +106,12 @@ class Settings(private val ctx: Context) {
     }
 
     companion object {
-        fun variant(): String = BuildConfig.VARIANT
+        // версия игры, с которой запускается libmain (у универсального APK — по папке игры или выбору)
+        fun variant(ctx: Context): String = GameVariant.effective(ctx)
         fun defaultGameDir(ctx: Context): File = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "game")
-        fun userDir(ctx: Context): File = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "user")
+        // настройки и сохранения; у универсального APK русская версия — в user-rus (ini и сохранения у версий разные)
+        fun userDir(ctx: Context): File = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir,
+            if (GameVariant.isUniversal() && GameVariant.effective(ctx) == GameVariant.RUS) "user-rus" else "user")
         fun logFile(ctx: Context): File = File(userDir(ctx), "snx.log")
     }
 }
