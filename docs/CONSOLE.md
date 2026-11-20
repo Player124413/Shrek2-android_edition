@@ -10,7 +10,7 @@
   `UseJoystick=True` читает DIJOYSTATE2 — оси lX..lRz как JoyX/JoyY/JoyZ/JoyR/JoyU/JoyV, кнопки 0–11 как
   Joy1..Joy12, POV 0 как Joy13..Joy16. Левый стик — `JoyX/JoyY` (`aStrafe`/`aBaseY`, аналоговый бег), правый —
   `JoyU/JoyV` (`aMouseX`/`aMouseY`, камера; ползунок скорости мыши в меню действует и на него).
-  Привязки пишет `host/boot/config.c` в `User.ini` (только пустые ключи). Оси — без `SpeedBase`:
+  Привязки пишет `host/boot/config.c` в `User.ini` (только пустые ключи; ini в UTF-16 с BOM — тоже в UTF-16). Оси — без `SpeedBase`:
   `UInput::DirectAxis` дописывает к команде `Speed=<значение>` и исполняет её как `IST_Hold` с Δt кадра,
   `UInput::ReadInput` умножает оси на 20/Δt — вклад не зависит от частоты кадров. Множитель (бег 1200, как у W;
   камера 72) хост закладывает в само значение оси (WinDrv делит `(v - 32768)` на 65535).

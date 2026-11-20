@@ -30,10 +30,6 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
         set(v) { if (field != v) { field = v; releaseAll(); invalidate() } }
     var hiddenByGamepad = false
         set(v) { if (field != v) { field = v; releaseAll(); invalidate() } }
-    // идёт ролик: поверх — кнопка «Пропустить», касание свободного места тоже пропускает (короткое нажатие Minus)
-    var movie = false
-        set(v) { if (field != v) { field = v; invalidate() } }
-    private var skipUntil = 0L
     var onGear: (() -> Unit)? = null
     var onSelect: ((Control?) -> Unit)? = null  // редактор: выбранный элемент
     var selected: Control? = null
@@ -104,38 +100,6 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
             }
         }
         if (!editMode) drawGear(canvas)
-        if (!editMode && movie && active()) drawSkip(canvas)
-    }
-
-    private fun skipRect(): RectF {
-        val bw = 150f * density; val bh = 44f * density; val m = 16f * density
-        return RectF(w() - bw - m, m, w() - m, m + bh)
-    }
-
-    private fun drawSkip(canvas: Canvas) {
-        val r = skipRect()
-        fill.color = 0x000000
-        fill.alpha = 150
-        canvas.drawRoundRect(r, r.height() / 2, r.height() / 2, fill)
-        ring.color = 0xFFFFFF
-        ring.alpha = 200
-        canvas.drawRoundRect(r, r.height() / 2, r.height() / 2, ring)
-        text.color = 0xFFFFFF
-        text.alpha = 230
-        text.textSize = r.height() * 0.42f
-        canvas.drawText(L.t("Пропустить ▶▶", "Skip ▶▶"), r.centerX(), r.centerY() - (text.descent() + text.ascent()) / 2, text)
-    }
-
-    // короткое нажатие Minus (StopMoviePlayback / BypassCutscene) и Enter (пропуск ролика на ПК)
-    private fun skip() {
-        skipUntil = android.os.SystemClock.uptimeMillis() + 150
-        buzz()
-        send()
-        try { SnxNative.key(0x0D, true) } catch (e: UnsatisfiedLinkError) { }
-        postDelayed({
-            send()
-            try { SnxNative.key(0x0D, false) } catch (e: UnsatisfiedLinkError) { }
-        }, 170)
     }
 
     private fun drawGrid(canvas: Canvas) {
@@ -297,8 +261,6 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
         if (onGearAt(x, y)) { f.bind = Bind.GEAR; return }
         if (!active()) return
         val c = hit(x, y, ALL_KINDS)
-        // ролик: кнопка «Пропустить» или касание мимо элементов управления — пропуск
-        if (movie && (skipRect().contains(x, y) || c == null)) { f.bind = Bind.NONE; skip(); return }
         if (c != null) {
             f.bind = Bind.CONTROL
             f.ctl = c
@@ -436,7 +398,6 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
     private fun send() {
         if (editMode) return
         var buttons = dpadMask
-        if (android.os.SystemClock.uptimeMillis() < skipUntil) buttons = buttons or (1 shl SnxNative.MINUS)
         val vks = HashSet<Int>()
         fun press(c: Control) {
             if (c.button >= 0) buttons = buttons or (1 shl c.button) else if (c.vk != 0) vks.add(c.vk)

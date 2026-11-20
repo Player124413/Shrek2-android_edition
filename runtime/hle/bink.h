@@ -13,10 +13,6 @@ void bink_audio_reset(bink_audio *a);
 // записано. 0 — декодирования нет (вызывающий дополняет тишиной).
 u32 bink_audio_decode(bink_audio *a, const u8 *packet, u32 bytes, s16 *out, u32 max);
 
-// Идёт ролик: видео Bink декодировалось меньше 0,3 с назад (сенсорный экран: кнопка «Пропустить», касание —
-// пропуск; host/boot/input.c)
-int bink_movie_playing(void);
-
 typedef struct bink_video bink_video;
 // signature — первые 4 байта файла ("BIKi"), video_flags — dword заголовка по смещению 36 (альфа и т. п.)
 bink_video *bink_video_new(u32 signature, u32 video_flags, u32 w, u32 h);

@@ -26,7 +26,6 @@ class GameActivity : SDLActivity(), InputManager.InputDeviceListener {
             val t = touch ?: return
             val st = try { SnxNative.state() } catch (e: UnsatisfiedLinkError) { 0 }
             t.hiddenByMenu = st and SnxNative.STATE_MENU != 0
-            t.movie = st and SnxNative.STATE_MOVIE != 0
             t.postDelayed(this, 100)
         }
     }

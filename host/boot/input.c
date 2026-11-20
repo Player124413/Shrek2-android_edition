@@ -13,7 +13,6 @@
 
 #include "host/boot/input.h"
 #include "host/boot/touch.h"
-#include "runtime/hle/bink.h"
 #include "runtime/hle/d3d8.h"
 #include "runtime/hle/dinput8.h"
 #include "runtime/hle/user32.h"
@@ -683,7 +682,7 @@ void touch_key(int vk, int down)
     pthread_mutex_unlock(&g_touch_lock);
 }
 
-int touch_state(void) { return (g_touch_menu ? 1 : 0) | (g_touch_ready ? 2 : 0) | (bink_movie_playing() ? 4 : 0); }
+int touch_state(void) { return (g_touch_menu ? 1 : 0) | (g_touch_ready ? 2 : 0); }
 
 // оси экранных стиков: поверх физического геймпада — тот, что отклонён сильнее
 static float g_touch_ax[4];

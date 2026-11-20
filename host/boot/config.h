@@ -2,7 +2,7 @@
 #pragma once
 #include <stddef.h>
 
-// [section] key=value в 8-битном ini (CRLF как в файле); нет ключа — добавить в секцию, нет секции — в конец.
+// [section] key=value в ini — 8-битном или UTF-16LE с BOM, как его пишет игра (CRLF как в файле); нет ключа — добавить в секцию, нет секции — в конец.
 // 1 — файл изменён, 0 — значение уже такое, -1 — ошибка ввода-вывода.
 int boot_ini_set(const char *path, const char *section, const char *key, const char *value);
 

@@ -23,7 +23,6 @@ object SnxNative {
 
     const val STATE_MENU = 1
     const val STATE_READY = 2
-    const val STATE_MOVIE = 4
 
     @JvmStatic external fun pad(buttons: Int, lx: Float, ly: Float, rx: Float, ry: Float)
     @JvmStatic external fun look(dx: Float, dy: Float)

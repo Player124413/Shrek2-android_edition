@@ -50,10 +50,140 @@ static size_t line_at(const char *s, size_t len, size_t at, size_t *next)
     return (e > at && s[e - 1] == '\r') ? e - 1 - at : e - at;
 }
 
+// ---------------------------------------------------------------- ini в UTF-16
+// Игра пишет ini (appSaveStringToFile) в UTF-16LE с BOM, если в тексте есть символ вне ANSI (русская версия:
+// кириллица в User.ini/DefUser.ini), а читает такой файл как UTF-16, только если длина чётная, — иначе как
+// 8-битный, и после BOM весь текст обрывается на первом нуле: ни одной привязки, игра не слушается ни стика, ни
+// кнопок (работает только Escape — «Меню»). Прежние сборки порта читали ini как 8-битный: в UTF-16 ключей не
+// находили и дописывали в конец 8-битный кусок «\n[Engine.Input]\nJoy1=Fire...» — длина становилась нечётной.
+// Здесь UTF-16 разбирается в UTF-8 (правка — как у 8-битного) и пишется обратно в UTF-16 с BOM, а 8-битный хвост
+// прежних сборок отрезается (его ключи порт пишет заново).
+
+static int is_wide(const char *s, size_t len)
+{
+    return len >= 2 && (unsigned char)s[0] == 0xFF && (unsigned char)s[1] == 0xFE;
+}
+
+// Начало 8-битного хвоста в UTF-16 (байтовое смещение, чётное) или len. Хвост начинался с «\n[» или «\r\n[» сразу
+// за последним символом UTF-16: такие пары байтов (U+5B0A, U+0A0D) в тексте ini не встречаются.
+static size_t wide_tail(const char *s, size_t len)
+{
+    for (size_t i = 2; i + 1 < len; i += 2) {
+        unsigned u = (unsigned char)s[i] | (unsigned char)s[i + 1] << 8;
+        if (u == 0x5B0A || u == 0x0A0D)
+            return i;
+    }
+    return len & ~(size_t)1;
+}
+
+// UTF-16LE (без BOM, n байт) -> UTF-8; половинки суррогатных пар — по отдельности (обратно — те же байты)
+static char *wide_to_utf8(const char *w, size_t n, size_t *out_len)
+{
+    char *o = malloc(n / 2 * 3 + 1), *p = o;
+    if (!o)
+        return NULL;
+    for (size_t i = 0; i + 1 < n; i += 2) {
+        unsigned u = (unsigned char)w[i] | (unsigned char)w[i + 1] << 8;
+        if (u < 0x80) {
+            *p++ = (char)u;
+        } else if (u < 0x800) {
+            *p++ = (char)(0xC0 | u >> 6);
+            *p++ = (char)(0x80 | (u & 0x3F));
+        } else {
+            *p++ = (char)(0xE0 | u >> 12);
+            *p++ = (char)(0x80 | (u >> 6 & 0x3F));
+            *p++ = (char)(0x80 | (u & 0x3F));
+        }
+    }
+    *p = 0;
+    *out_len = (size_t)(p - o);
+    return o;
+}
+
+// UTF-8 -> UTF-16LE с BOM
+static char *utf8_to_wide(const char *s, size_t n, size_t *out_len)
+{
+    char *o = malloc(2 + n * 2), *p = o;
+    if (!o)
+        return NULL;
+    *p++ = (char)0xFF;
+    *p++ = (char)0xFE;
+    for (size_t i = 0; i < n;) {
+        unsigned u = (unsigned char)s[i++];
+        if (u >= 0xC0) {
+            int k = u >= 0xE0 ? 2 : 1;
+            u &= 0x3F >> k;
+            while (k-- && i < n && ((unsigned char)s[i] & 0xC0) == 0x80)
+                u = u << 6 | ((unsigned char)s[i++] & 0x3F);
+        }
+        *p++ = (char)(u & 0xFF);
+        *p++ = (char)(u >> 8 & 0xFF);
+    }
+    *out_len = (size_t)(p - o);
+    return o;
+}
+
+// Текст ini для правки: 8-битный как есть, UTF-16 — в UTF-8 (*wide = 1). *damaged — был 8-битный хвост или
+// нечётная длина (файл прежних сборок, игра такой не прочтёт).
+static char *ini_read(const char *path, size_t *len, int *wide, int *damaged)
+{
+    size_t n = 0;
+    char *raw = read_all(path, &n);
+    *wide = *damaged = 0;
+    if (!raw || !is_wide(raw, n)) {
+        *len = n;
+        return raw;
+    }
+    size_t end = wide_tail(raw, n);
+    *wide = 1;
+    *damaged = end != n;
+    char *s = wide_to_utf8(raw + 2, end - 2, len);
+    free(raw);
+    return s;
+}
+
+// Записать a+b+c: в UTF-16 с BOM, если файл был в UTF-16, иначе как есть
+static int ini_write(const char *path, int wide, const char *a, size_t na, const char *b, size_t nb, const char *c,
+                     size_t nc)
+{
+    if (!wide)
+        return write_all(path, a, na, b, nb, c, nc);
+    char *t = malloc(na + nb + nc + 1);
+    if (!t)
+        return -1;
+    memcpy(t, a, na);
+    memcpy(t + na, b, nb);
+    memcpy(t + na + nb, c, nc);
+    size_t wl = 0;
+    char *w = utf8_to_wide(t, na + nb + nc, &wl);
+    free(t);
+    int r = w ? write_all(path, w, wl, "", 0, "", 0) : -1;
+    free(w);
+    return r;
+}
+
+// Файл UTF-16 с 8-битным хвостом прежних сборок — переписать без хвоста (1 — переписан)
+static int ini_repair(const char *path)
+{
+    size_t len = 0;
+    int wide, damaged;
+    char *s = ini_read(path, &len, &wide, &damaged);
+    int r = 0;
+    if (s && damaged) {
+        r = ini_write(path, 1, s, len, "", 0, "", 0) > 0;
+        const char *name = strrchr(path, '/');
+        fprintf(stderr, "[config] %s: UTF-16 with an 8-bit tail from an older build — %s\n", name ? name + 1 : path,
+                r ? "tail removed" : "cannot rewrite");
+    }
+    free(s);
+    return r;
+}
+
 int boot_ini_set(const char *path, const char *section, const char *key, const char *value)
 {
     size_t len = 0;
-    char *s = read_all(path, &len);
+    int wide, damaged;
+    char *s = ini_read(path, &len, &wide, &damaged);
     if (!s)
         return -1;
     const char *nl = strstr(s, "\r\n") || !len ? "\r\n" : "\n";
@@ -78,12 +208,12 @@ int boot_ini_set(const char *path, const char *section, const char *key, const c
             sec_end = next;  // пустые строки в конце секции оставляем после вставки
         if (n > klen && l[klen] == '=' && !strncasecmp(l, key, klen)) {
             size_t vlen = n - klen - 1;
-            if (vlen == strlen(value) && !memcmp(l + klen + 1, value, vlen)) {
+            if (vlen == strlen(value) && !memcmp(l + klen + 1, value, vlen) && !damaged) {
                 free(s);
                 return 0;
             }
             int m = snprintf(buf, sizeof buf, "%.*s=%s", (int)klen, l, value);
-            int r = write_all(path, s, at, buf, (size_t)m, s + at + n, len - at - n);
+            int r = ini_write(path, wide, s, at, buf, (size_t)m, s + at + n, len - at - n);
             free(s);
             return r;
         }
@@ -93,11 +223,11 @@ int boot_ini_set(const char *path, const char *section, const char *key, const c
         m = snprintf(buf, sizeof buf, "%s=%s%s", key, value, nl);
         if (sec_end == len && len && s[len - 1] != '\n')
             m = snprintf(buf, sizeof buf, "%s%s=%s%s", nl, key, value, nl);
-        r = write_all(path, s, sec_end, buf, (size_t)m, s + sec_end, len - sec_end);
+        r = ini_write(path, wide, s, sec_end, buf, (size_t)m, s + sec_end, len - sec_end);
     } else {
         m = snprintf(buf, sizeof buf, "%s[%s]%s%s=%s%s", len && s[len - 1] != '\n' ? nl : "", section, nl, key,
                      value, nl);
-        r = write_all(path, s, len, buf, (size_t)m, "", 0);
+        r = ini_write(path, wide, s, len, buf, (size_t)m, "", 0);
     }
     free(s);
     return r;
@@ -106,7 +236,8 @@ int boot_ini_set(const char *path, const char *section, const char *key, const c
 int boot_ini_get(const char *path, const char *section, const char *key, char *out, size_t cap)
 {
     size_t len = 0, slen = strlen(section), klen = strlen(key);
-    char *s = read_all(path, &len);
+    int wide, damaged;
+    char *s = ini_read(path, &len, &wide, &damaged);
     if (!s)
         return 0;
     int in_sec = 0, found = 0;
@@ -197,7 +328,8 @@ static void ini_each(const char *path, const char *section, int (*cb)(const char
                      void *ctx)
 {
     size_t len = 0, slen = strlen(section);
-    char *s = read_all(path, &len), k[128], v[512];
+    int wide, damaged;
+    char *s = ini_read(path, &len, &wide, &damaged), k[128], v[512];
     int in_sec = 0;
     for (size_t at = 0, next; s && at < len; at = next) {
         size_t n = line_at(s, len, at, &next);
@@ -524,6 +656,7 @@ void boot_config_apply(int res_w, int res_h)
         fclose(f);
     else  // первый запуск: игра сама скопировала бы Default.ini (мастер первого запуска — по ключу FirstRun)
         copy_if_missing(ini, "System/Default.ini");
+    ini_repair(ini);
     // ReduceMouseLag: D3DDrv каждый кадр блокирует задний буфер ради ожидания GPU — в порте это чтение из GL
     // и простой GPU/CPU (на маке ≈27 % времени потока гостя)
     set(ini, "D3DDrv.D3DRenderDevice", "ReduceMouseLag", "False");
@@ -543,11 +676,16 @@ void boot_config_apply(int res_w, int res_h)
     char user[1100], cur[256];
     vfs_for_write("System/User.ini", user, sizeof user, 1);
     copy_if_missing(user, "System/DefUser.ini");
+    ini_repair(user);
     {  // диагностика «второго запуска»: файлы, записанные игрой в прошлый раз (обрезанный ini — без привязок)
         size_t ul = 0, gl = 0;
-        char *u = read_all(user, &ul), *g = read_all(ini, &gl);
-        fprintf(stderr, "[config] User.ini %zu bytes (Aliases %d, Joy1 %d), game.ini %zu bytes\n", ul,
-                u ? has_ci(u, "Aliases[") : -1, u ? has_ci(u, "Joy1=") : -1, gl);
+        int uw, gw, dmg;
+        char *u = ini_read(user, &ul, &uw, &dmg), *g = ini_read(ini, &gl, &gw, &dmg);
+        // нуль посреди 8-битного текста — тоже обрыв для игры и для поиска ключей
+        size_t un = u ? strlen(u) : 0;
+        fprintf(stderr, "[config] User.ini %zu bytes%s (Aliases %d, Joy1 %d%s), game.ini %zu bytes%s\n", ul,
+                uw ? " UTF-16" : "", u ? has_ci(u, "Aliases[") : -1, u ? has_ci(u, "Joy1=") : -1,
+                u && un < ul ? ", NUL inside" : "", gl, gw ? " UTF-16" : "");
         free(u);
         free(g);
     }
