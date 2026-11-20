@@ -698,3 +698,26 @@ void boot_config_apply(int res_w, int res_h)
     prompts_apply();
     vfs_changed();  // game.ini, User.ini и .int могли появиться в оверлее
 }
+
+float boot_render_size(int *w, int *h, float scale, const char *aspect)
+{
+    float lim = 0, a = 0, b = 0;
+    if (aspect && *aspect && strcasecmp(aspect, "full") != 0) {
+        if (sscanf(aspect, "%f:%f", &a, &b) == 2 && a > 0 && b > 0)
+            lim = a / b;
+        else if (sscanf(aspect, "%f", &a) == 1 && a > 0)
+            lim = a;
+        if (lim < 1.0f || lim > 4.0f)  // мусор или портрет — без предела
+            lim = 0;
+    }
+    if (lim > 0 && *h > 0 && (float)*w > (float)*h * lim * 1.01f)
+        *w = (int)((float)*h * lim + 0.5f);
+    scale = scale < 0.25f ? 0.25f : scale > 1.0f ? 1.0f : scale;
+    *w = (int)((float)*w * scale) & ~1;
+    *h = (int)((float)*h * scale) & ~1;
+    if (*h < 360) {
+        *w = *w * 360 / (*h ? *h : 1) & ~1;
+        *h = 360;
+    }
+    return lim;
+}

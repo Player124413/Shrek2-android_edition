@@ -34,6 +34,9 @@ class Settings(private val ctx: Context) {
     var tex16: Boolean  // DXT -> 16 бит при распаковке на ЦП: вдвое меньше видеопамяти
         get() = p.getBoolean("tex16", Device.tier(ctx).tex16)
         set(v) { p.edit().putBoolean("tex16", v).commit() }
+    var aspect: Int  // формат кадра: 0 — во весь экран (Hor+), 1 — не шире 16:9, 2 — 4:3 (интерфейс без растяжения)
+        get() = p.getInt("aspect", 0)
+        set(v) { p.edit().putInt("aspect", v).commit() }
     var showFps: Boolean
         get() = p.getBoolean("showFps", false)
         set(v) { p.edit().putBoolean("showFps", v).commit() }
@@ -82,6 +85,7 @@ class Settings(private val ctx: Context) {
         fun env(k: String, v: String) { a += "--env"; a += "$k=$v" }
         env("SNX_RENDER_SCALE", "%.3f".format(java.util.Locale.ROOT, renderScale))
         if (fpsCap > 0) env("SNX_FPS_CAP", fpsCap.toString())
+        when (aspect) { 1 -> env("SNX_ASPECT", "16:9"); 2 -> env("SNX_ASPECT", "4:3") }
         if (tex16) env("SNX_TEX16", "1")
         env("SNX_SHOW_FPS", if (showFps) "1" else "0")
         env("SNX_FILE_CACHE_MB", fileCacheMb.toString())

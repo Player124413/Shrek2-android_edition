@@ -213,6 +213,26 @@ int main(int argc, char **argv)
           "game.ini UTF-16 not updated");
     free(u);
 
+    // 6. размер кадра на телефоне (boot_render_size, SNX_ASPECT): 21:9 во весь экран, с пределом 16:9 и 4:3 —
+    // уже экрана; экран уже предела не трогается; масштаб и минимум 360 строк после предела
+    int w = 2520, h = 1080;
+    CHECK(boot_render_size(&w, &h, 1.0f, NULL) == 0 && w == 2520 && h == 1080, "full: %dx%d", w, h);
+    w = 2520, h = 1080;
+    CHECK(boot_render_size(&w, &h, 1.0f, "full") == 0 && w == 2520, "full: %dx%d", w, h);
+    w = 2520, h = 1080;
+    float lim = boot_render_size(&w, &h, 1.0f, "16:9");
+    CHECK(lim > 1.77f && lim < 1.78f && w == 1920 && h == 1080, "16:9: %dx%d", w, h);
+    w = 2400, h = 1080;
+    CHECK(boot_render_size(&w, &h, 0.5f, "4:3") > 0 && w == 720 && h == 540, "4:3 50%%: %dx%d", w, h);
+    w = 1920, h = 1080;
+    boot_render_size(&w, &h, 1.0f, "21:9");
+    CHECK(w == 1920 && h == 1080, "16:9 screen, 21:9 limit: %dx%d", w, h);
+    w = 2400, h = 1080;
+    boot_render_size(&w, &h, 0.25f, "4:3");
+    CHECK(h == 360 && w == 480, "min 360 after limit: %dx%d", w, h);
+    w = 2400, h = 1080;
+    CHECK(boot_render_size(&w, &h, 1.0f, "abc") == 0 && w == 2400, "garbage aspect: %dx%d", w, h);
+
     puts(g_fail ? "ini_test: FAIL" : "ini_test: OK");
     return g_fail;
 }

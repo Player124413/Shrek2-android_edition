@@ -16,8 +16,6 @@ import android.os.Looper
 import android.os.Process
 import android.os.SystemClock
 import android.text.InputType
-import android.text.method.LinkMovementMethod
-import android.text.util.Linkify
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.EditText
@@ -51,33 +49,8 @@ class LauncherActivity : Activity() {
         }
     }
 
-    private fun showCredits() {
-        val text = L.t(
-            "Android-порт сделан ${L.AUTHOR}.\n\n" +
-                "Мой Telegram-канал: ${L.TG_CHANNEL}\n\n" +
-                "Огромное спасибо репозиторию ${L.UPSTREAM} — без него Android-порта бы не существовало.",
-            "Android port by ${L.AUTHOR}.\n\n" +
-                "My Telegram channel: ${L.TG_CHANNEL}\n\n" +
-                "Huge thanks to the ${L.UPSTREAM} repository — without it the Android port would not exist.")
-        val tv = TextView(this).apply {
-            this.text = text
-            textSize = 16f
-            setTextColor(Ui.TEXT)
-            setLinkTextColor(Ui.ACCENT)
-            autoLinkMask = Linkify.WEB_URLS
-            movementMethod = LinkMovementMethod.getInstance()
-            val p = Ui.dp(this@LauncherActivity, 22f)
-            setPadding(p, p, p, 0)
-        }
-        AlertDialog.Builder(this).setTitle("Shrek 2 · shrekNX Android").setView(tv)
-            .setPositiveButton("OK", null)
-            .setNeutralButton(L.t("Открыть канал", "Open channel")) { _, _ ->
-                try {
-                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(L.TG_CHANNEL)))
-                } catch (e: Exception) {
-                }
-            }.show()
-    }
+    // окно «О порте»: CreditsDialog (автор, Telegram-канал, благодарность репозиторию shrekNX)
+    private fun showCredits() = CreditsDialog.show(this)
 
     override fun onResume() {
         super.onResume()
@@ -226,6 +199,12 @@ class LauncherActivity : Activity() {
             val fps = listOf(30, 45, 60, 0)
             holder.addView(Ui.choiceRow(this, L.t("Ограничение FPS", "FPS limit"), listOf("30", "45", "60", L.t("Нет", "Off")),
                 fps.indexOf(s.fpsCap).let { if (it < 0) 3 else it }) { s.fpsCap = fps[it] })
+            holder.addView(Ui.choiceRow(this, L.t("Формат кадра", "Aspect ratio"),
+                listOf(L.t("Весь экран", "Full screen"), "16:9", "4:3"), s.aspect.coerceIn(0, 2)) { s.aspect = it })
+            holder.addView(Ui.label(this, L.t(
+                "Весь экран — на широких телефонах (20:9, 21:9) мир шире по бокам, но меню и интерфейс игры растянуты. 16:9 и 4:3 — поля по бокам, интерфейс ближе к оригиналу (4:3 — как на ПК).",
+                "Full screen — on wide phones (20:9, 21:9) you see more of the world, but the game menus and HUD are stretched. 16:9 and 4:3 add side bars, the HUD looks closer to the original (4:3 — as on PC)."),
+                dim = true, size = 12f))
             holder.addView(Ui.switchRow(this, L.t("16-битные текстуры", "16-bit textures"), L.t("Меньше памяти и быстрее на слабых GPU, чуть хуже цвета", "Less memory and faster on weak GPUs, slightly worse colors"),
                 s.tex16) { s.tex16 = it })
             holder.addView(Ui.switchRow(this, L.t("Стабильная производительность", "Sustained performance"),

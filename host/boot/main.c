@@ -586,14 +586,14 @@ int main(int argc, char **argv)
         plat_screen_size(&g_res_w, &g_res_h);
         const char *sc = getenv("SNX_RENDER_SCALE");
         float k = sc ? (float)atof(sc) : 1.0f;
+        // SNX_ASPECT — предел пропорций кадра (лаунчер: «Формат кадра»). Без него кадр во весь экран, и на 20:9–21:9
+        // 3D шире (Hor+: overrides_engine.c), но 2D-интерфейс игры растянут по ширине; с пределом кадр уже
+        // экрана, по бокам чёрные поля (вписывание — d3d8_present, касания в меню с теми же полями пересчитывает
+        // d3d8_window_to_target)
+        float lim = boot_render_size(&g_res_w, &g_res_h, k, getenv("SNX_ASPECT"));
         k = k < 0.25f ? 0.25f : k > 1.0f ? 1.0f : k;
-        g_res_w = (int)((float)g_res_w * k) & ~1;
-        g_res_h = (int)((float)g_res_h * k) & ~1;
-        if (g_res_h < 360) {
-            g_res_w = g_res_w * 360 / (g_res_h ? g_res_h : 1) & ~1;
-            g_res_h = 360;
-        }
-        fprintf(stderr, "[boot] render %dx%d (scale %.2f)\n", g_res_w, g_res_h, (double)k);
+        fprintf(stderr, "[boot] render %dx%d (scale %.2f, aspect %.3f%s)\n", g_res_w, g_res_h, (double)k,
+                (double)g_res_w / (double)g_res_h, lim > 0 ? ", limited" : "");
     }
 #endif
     if (g_res_w > 0)

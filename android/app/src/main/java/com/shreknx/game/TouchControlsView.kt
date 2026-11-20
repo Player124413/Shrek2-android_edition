@@ -38,10 +38,6 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
     private val density = resources.displayMetrics.density
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 2.5f * density }
-    private val text = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        textAlign = Paint.Align.CENTER
-        isFakeBoldText = true
-    }
     private val dashed = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 2f * density
@@ -116,29 +112,11 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
 
     private fun alpha(a: Float) = (a.coerceIn(0f, 1f) * 255).toInt()
 
+    // кнопки и стики — значки в стиле Шрека (ShrekIcons: SVG-пути, уши огра); у кнопок без значка — надпись
     private fun drawButton(canvas: Canvas, c: Control, a: Float) {
         val pressed = isPressed(c)
-        val x = cx(c); val y = cy(c); val r = radius(c)
-        fill.color = if (pressed) 0x8DC63F else 0x101010
-        fill.alpha = alpha(if (pressed) a * 0.9f else a * 0.55f)
-        canvas.drawCircle(x, y, r, fill)
-        ring.color = 0xFFFFFF
-        ring.alpha = alpha(a)
-        canvas.drawCircle(x, y, r - ring.strokeWidth / 2, ring)
-        if (c.toggle && c.id in latched) canvas.drawCircle(x, y, r * 0.8f, ring)
-        drawLabel(canvas, c.label, x, y, r, a)
-    }
-
-    private fun drawLabel(canvas: Canvas, s: String, x: Float, y: Float, r: Float, a: Float) {
-        if (s.isEmpty()) return
-        text.color = 0xFFFFFF
-        text.alpha = alpha(min(1f, a * 1.3f))
-        text.textSize = if (s.length <= 2) r * 0.8f else r * 0.42f
-        // длинная надпись — ужать до ширины кнопки
-        val maxW = r * 1.7f
-        val tw = text.measureText(s)
-        if (tw > maxW) text.textSize *= maxW / tw
-        canvas.drawText(s, x, y - (text.descent() + text.ascent()) / 2, text)
+        ShrekIcons.drawButton(canvas, cx(c), cy(c), radius(c), ShrekIcons.iconFor(c.id), c.label, pressed,
+            c.toggle && c.id in latched, alpha(if (pressed) min(1f, a * 1.2f) else a))
     }
 
     private fun drawStick(canvas: Canvas, c: Control, a: Float) {
@@ -148,17 +126,9 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
         val bx = if (activeNow) st.cx else cx(c)
         val by = if (activeNow) st.cy else cy(c)
         val r = radius(c)
-        fill.color = 0x101010
-        fill.alpha = alpha(a * 0.4f)
-        canvas.drawCircle(bx, by, r, fill)
-        ring.color = 0xFFFFFF
-        ring.alpha = alpha(a * 0.8f)
-        canvas.drawCircle(bx, by, r - ring.strokeWidth / 2, ring)
         val kx = bx + (st?.vx ?: 0f) * r * 0.6f
         val ky = by + (st?.vy ?: 0f) * r * 0.6f
-        fill.color = if (activeNow) 0x8DC63F else 0xDDDDDD
-        fill.alpha = alpha(a * 0.85f)
-        canvas.drawCircle(kx, ky, r * 0.38f, fill)
+        ShrekIcons.drawStick(canvas, bx, by, r, kx, ky, activeNow, a)
     }
 
     private fun drawDpad(canvas: Canvas, c: Control, a: Float) {
@@ -169,10 +139,10 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
             canvas.rotate(90f * i, x, y)
             rect.set(x - t, y - r, x + t, y - t * 0.6f)
             val on = dpadMask and (1 shl bit) != 0
-            fill.color = if (on) 0x8DC63F else 0x101010
+            fill.color = if (on) 0x8DC63F else 0x16210A
             fill.alpha = alpha(if (on) a * 0.9f else a * 0.55f)
             canvas.drawRoundRect(rect, t * 0.4f, t * 0.4f, fill)
-            ring.color = 0xFFFFFF
+            ring.color = 0x8DC63F
             ring.alpha = alpha(a)
             canvas.drawRoundRect(rect, t * 0.4f, t * 0.4f, ring)
             path.reset()
@@ -180,7 +150,7 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
             path.lineTo(x - t * 0.45f, y - r * 0.62f)
             path.lineTo(x + t * 0.45f, y - r * 0.62f)
             path.close()
-            fill.color = 0xFFFFFF
+            fill.color = if (on) 0x1B2A0B else 0xF2EBC9
             fill.alpha = alpha(a)
             canvas.drawPath(path, fill)
             canvas.restore()
