@@ -46,6 +46,17 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
         pathEffect = DashPathEffect(floatArrayOf(8f * density, 6f * density), 0f)
     }
     private val grid = Paint().apply { strokeWidth = 1f; color = 0x22FFFFFF }
+    private val bmpPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+    private val nameText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textAlign = Paint.Align.CENTER
+        isFakeBoldText = true
+        textSize = 14f * density
+    }
+
+    init {
+        // значки зелий из файлов игры (SH_Hud.utx) — в фоне; без них на кнопке прежняя колба
+        PotionIcons.load(settings.gameDir) { post { invalidate() } }
+    }
     private val path = Path()
     private val rect = RectF()
 
@@ -119,9 +130,23 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
     // кнопки и стики — значки в стиле Шрека (ShrekIcons: SVG-пути, уши огра); у кнопок без значка — надпись
     private fun drawButton(canvas: Canvas, c: Control, a: Float) {
         val pressed = isPressed(c)
-        ShrekIcons.drawButton(canvas, cx(c), cy(c), radius(c), ShrekIcons.iconFor(c.id), c.label, pressed,
-            c.toggle && c.id in latched, alpha(if (pressed) min(1f, a * 1.2f) else a))
+        val potion = if (c.id == POTION_ID) PotionIcons.get(settings.potionSlot) else null
+        val al = alpha(if (pressed) min(1f, a * 1.2f) else a)
+        ShrekIcons.drawButton(canvas, cx(c), cy(c), radius(c), if (potion != null) null else ShrekIcons.iconFor(c.id),
+            if (potion != null) "" else c.label, pressed, c.toggle && c.id in latched, al)
+        if (potion != null) drawPotion(canvas, c, potion, pressed, al)
         if (c.id == POTION_ID) drawSlot(canvas, c, a)
+    }
+
+    // зелье слота (значок игры) внутри круга кнопки
+    private fun drawPotion(canvas: Canvas, c: Control, b: android.graphics.Bitmap, pressed: Boolean, al: Int) {
+        val box = radius(c) * (if (pressed) 1.2f else 1.34f)  // сторона квадрата под значок (круг кнопки — 0.8 от r*2)
+        val k = box / max(b.width, b.height)
+        val bw = b.width * k
+        val bh = b.height * k
+        rect.set(cx(c) - bw / 2, cy(c) - bh / 2, cx(c) + bw / 2, cy(c) + bh / 2)
+        bmpPaint.alpha = al
+        canvas.drawBitmap(b, null, rect, bmpPaint)
     }
 
     // ---------------------------------------------------------------- слот зелья у кнопки «Зелья»
@@ -139,7 +164,28 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
         for (dir in intArrayOf(-1, 1))
             ShrekIcons.drawArrow(canvas, slotArrowX(c, dir), y, slotArrowR(c), dir < 0, slotFlash == dir, alpha(a))
         ShrekIcons.drawBadge(canvas, cx(c) + r * 0.8f, y + r * 0.8f, r * 0.36f, settings.potionSlot.toString(), alpha(min(1f, a * 1.3f)))
+        // после смены слота — название зелья над кнопкой (1,5 с)
+        val left = slotNameUntil - android.os.SystemClock.uptimeMillis()
+        if (left > 0 && !editMode) {
+            val name = PotionIcons.name(settings.potionSlot)
+            if (name.isNotEmpty()) {
+                val fade = min(1f, left / 300f)
+                val ty = y - r * 1.25f
+                nameText.style = Paint.Style.STROKE
+                nameText.strokeWidth = 3.5f * density
+                nameText.color = ShrekIcons.SWAMP
+                nameText.alpha = (fade * 230).toInt()
+                canvas.drawText(name, cx(c), ty, nameText)
+                nameText.style = Paint.Style.FILL
+                nameText.color = ShrekIcons.CREAM
+                nameText.alpha = (fade * 255).toInt()
+                canvas.drawText(name, cx(c), ty, nameText)
+                postInvalidateDelayed(if (left > 300) left - 300 else 30)
+            }
+        }
     }
+
+    private var slotNameUntil = 0L
 
     // стрелка слота под пальцем: -1 / 1, 0 — нет
     private fun slotArrowAt(x: Float, y: Float): Int {
@@ -274,6 +320,7 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
         if (dir != 0) {
             f.bind = Bind.SLOT
             settings.potionSlot = (settings.potionSlot - 1 + dir + 9) % 9 + 1
+            slotNameUntil = android.os.SystemClock.uptimeMillis() + 1500
             slotFlash = dir
             buzz()
             invalidate()
