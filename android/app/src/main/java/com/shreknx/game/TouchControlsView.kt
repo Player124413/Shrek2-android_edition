@@ -32,6 +32,8 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
         set(v) { if (field != v) { field = v; releaseAll(); invalidate() } }
     var onGear: (() -> Unit)? = null
     var onSelect: ((Control?) -> Unit)? = null  // редактор: выбранный элемент
+    var onDrag: ((Boolean) -> Unit)? = null      // редактор: элемент тянут пальцем (true) / отпустили (false)
+    var onEmptyTap: (() -> Unit)? = null         // редактор: касание пустого места (без сдвига пальца)
     var selected: Control? = null
         private set
 
@@ -491,18 +493,23 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
                 val x = e.getX(idx); val y = e.getY(idx)
                 val c = editHit(x, y)
                 select(c)
+                emptyDown = c == null
+                downX = x; downY = y
                 if (c != null) {
                     dragId = e.getPointerId(idx)
                     dragDx = cx(c) - x
                     dragDy = cy(c) - y
+                    setDragging(true)
                 }
             }
             MotionEvent.ACTION_POINTER_DOWN -> if (e.pointerCount == 2 && selected != null) {
+                setDragging(true)
                 pinchStart = hypot(e.getX(0) - e.getX(1), e.getY(0) - e.getY(1))
                 sizeStart = selected!!.size
                 dragId = -1  // двумя пальцами — только размер
             }
             MotionEvent.ACTION_MOVE -> {
+                if (emptyDown && hypot(e.getX(0) - downX, e.getY(0) - downY) > touchSlop) emptyDown = false
                 val c = selected ?: return true
                 if (e.pointerCount >= 2 && pinchStart > 0f) {
                     val d = hypot(e.getX(0) - e.getX(1), e.getY(0) - e.getY(1))
@@ -519,9 +526,26 @@ class TouchControlsView(ctx: Context, private val settings: Settings, val editMo
                 invalidate()
             }
             MotionEvent.ACTION_POINTER_UP -> if (e.pointerCount <= 2) pinchStart = 0f
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { dragId = -1; pinchStart = 0f }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                dragId = -1; pinchStart = 0f
+                setDragging(false)
+                if (e.actionMasked == MotionEvent.ACTION_UP && emptyDown) onEmptyTap?.invoke()
+                emptyDown = false
+            }
         }
         return true
+    }
+
+    private var emptyDown = false   // палец опущен на пустое место и ещё не сдвинулся
+    private var downX = 0f
+    private var downY = 0f
+    private var dragging = false
+    private val touchSlop = android.view.ViewConfiguration.get(ctx).scaledTouchSlop.toFloat()
+
+    private fun setDragging(v: Boolean) {
+        if (v == dragging) return
+        dragging = v
+        onDrag?.invoke(v)
     }
 
     private fun snap(v: Float) = Math.round(v * 200f) / 200f

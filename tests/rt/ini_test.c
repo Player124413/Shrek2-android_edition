@@ -213,7 +213,19 @@ int main(int argc, char **argv)
           "game.ini UTF-16 not updated");
     free(u);
 
-    // 6. размер кадра на телефоне (boot_render_size, SNX_ASPECT): 21:9 во весь экран, с пределом 16:9 и 4:3 —
+    // 6. читы (SNX_CHEATS=1, лаунчер Android): команды на NumPad0-9; без переменной — не пишутся
+    put(user_ini, "[Engine.Input]\r\nW=MoveForward\r\nNumPad2=Duck\r\n", 45);
+    boot_config_apply(1280, 720);
+    CHECK(!boot_ini_get(user_ini, "Engine.Input", "NumPad1", v, sizeof v) || !v[0], "cheats without SNX_CHEATS");
+    setenv("SNX_CHEATS", "1", 1);
+    boot_config_apply(1280, 720);
+    unsetenv("SNX_CHEATS");
+    CHECK(boot_ini_get(user_ini, "Engine.Input", "NumPad1", v, sizeof v) && !strcmp(v, "ShowDevMenu"), "NumPad1 = '%s'", v);
+    CHECK(boot_ini_get(user_ini, "Engine.Input", "NumPad2", v, sizeof v) && !strcmp(v, "Ghost"), "NumPad2 = '%s'", v);
+    CHECK(boot_ini_get(user_ini, "Engine.Input", "NumPad6", v, sizeof v) && !strcmp(v, "AddCoins 100"), "NumPad6 = '%s'", v);
+    CHECK(boot_ini_get(user_ini, "Engine.Input", "W", v, sizeof v) && !strcmp(v, "MoveForward"), "W = '%s'", v);
+
+    // 7. размер кадра на телефоне (boot_render_size, SNX_ASPECT): 21:9 во весь экран, с пределом 16:9 и 4:3 —
     // уже экрана; экран уже предела не трогается; масштаб и минимум 360 строк после предела
     int w = 2520, h = 1080;
     CHECK(boot_render_size(&w, &h, 1.0f, NULL) == 0 && w == 2520 && h == 1080, "full: %dx%d", w, h);

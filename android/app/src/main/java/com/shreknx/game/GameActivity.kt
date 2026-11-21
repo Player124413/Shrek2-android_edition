@@ -10,6 +10,7 @@ import android.os.PowerManager
 import android.os.Process
 import android.view.Display
 import android.view.InputDevice
+import android.view.KeyEvent
 import android.view.Surface
 import android.view.View
 import android.view.ViewGroup
@@ -52,7 +53,7 @@ class GameActivity : SDLActivity(), InputManager.InputDeviceListener, DisplayMan
             if (pm.isSustainedPerformanceModeSupported) window.setSustainedPerformanceMode(true)
         }
         val t = TouchControlsView(this, settings, editMode = false)
-        t.onGear = { openEditor() }
+        t.onGear = { gearMenu() }
         SDLActivity.mLayout.addView(t, RelativeLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         touch = t
         inputManager = (getSystemService(Context.INPUT_SERVICE) as InputManager).also {
@@ -162,6 +163,45 @@ class GameActivity : SDLActivity(), InputManager.InputDeviceListener, DisplayMan
         window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_FULLSCREEN or
             View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
             View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN)
+    }
+
+    // шестерёнка: редактор раскладки; при включённых читах — выбор «Раскладка» / «Читы»
+    private fun gearMenu() {
+        if (!settings.cheats) return openEditor()
+        touch?.releaseAll()
+        AlertDialog.Builder(this)
+            .setItems(arrayOf(L.t("✎  Редактор раскладки", "✎  Layout editor"), L.t("★  Читы…", "★  Cheats…"))) { _, i ->
+                if (i == 0) openEditor() else showCheats()
+            }
+            .setOnDismissListener { immersive() }
+            .show()
+    }
+
+    private var cheatsOpen = false
+
+    private fun showCheats() {
+        if (cheatsOpen) return
+        cheatsOpen = true
+        touch?.releaseAll()
+        Cheats.show(this) { cheatsOpen = false; immersive() }
+    }
+
+    // геймпад: оба стика нажаты (L3+R3) — меню читов (если включены в лаунчере)
+    private var thumbL = false
+    private var thumbR = false
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val down = event.action == KeyEvent.ACTION_DOWN
+        when (event.keyCode) {
+            KeyEvent.KEYCODE_BUTTON_THUMBL -> thumbL = down
+            KeyEvent.KEYCODE_BUTTON_THUMBR -> thumbR = down
+        }
+        if (down && thumbL && thumbR && settings.cheats && event.repeatCount == 0) {
+            thumbL = false
+            thumbR = false
+            showCheats()
+        }
+        return super.dispatchKeyEvent(event)
     }
 
     // редактор поверх игры (игра идёт дальше, экранный геймпад отпущен)

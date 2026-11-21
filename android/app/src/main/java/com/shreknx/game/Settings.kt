@@ -72,6 +72,24 @@ class Settings(private val ctx: Context) {
     var haptics: Boolean
         get() = p.getBoolean("haptics", true)
         set(v) { p.edit().putBoolean("haptics", v).commit() }
+    var padCamera: Int  // камера правым стиком геймпада: 0 — смещениями мыши (как пальцем), 1 — осью джойстика
+        get() = p.getInt("padCamera", 0)
+        set(v) { p.edit().putInt("padCamera", v).commit() }
+    var cheats: Boolean  // читы: привязки команд в User.ini (host/boot/config.c) и меню «Читы» в игре (Cheats)
+        get() = p.getBoolean("cheats", false)
+        set(v) { p.edit().putBoolean("cheats", v).commit() }
+
+    // обновления (Updater): проверять при запуске лаунчера; когда проверяли; «Позже» — не спрашивать до
+    var checkUpdates: Boolean
+        get() = p.getBoolean("checkUpdates", true)
+        set(v) { p.edit().putBoolean("checkUpdates", v).commit() }
+    var updateCheckedAt: Long
+        get() = p.getLong("updateCheckedAt", 0L)
+        set(v) { p.edit().putLong("updateCheckedAt", v).commit() }
+    var updateSnoozeUntil: Long
+        get() = p.getLong("updateSnoozeUntil", 0L)
+        set(v) { p.edit().putLong("updateSnoozeUntil", v).commit() }
+
     var creditsShownVersion: Int  // versionCode, для которого уже показано окно «О порте»
         get() = p.getInt("creditsShown", 0)
         set(v) { p.edit().putInt("creditsShown", v).commit() }
@@ -84,7 +102,8 @@ class Settings(private val ctx: Context) {
     }
 
     // аргументы libmain.so (host/boot/main.c)
-    fun gameArgs(): Array<String> {
+    // map — сразу на этот уровень («Выбор уровня»: имя файла из Maps, например 1_Shreks_Swamp.unr)
+    fun gameArgs(map: String? = null): Array<String> {
         val user = userDir(ctx)
         user.mkdirs()
         val a = arrayListOf("--game", gameDir, "--user", user.absolutePath)
@@ -95,6 +114,9 @@ class Settings(private val ctx: Context) {
         if (tex16) env("SNX_TEX16", "1")
         env("SNX_SHOW_FPS", if (showFps) "1" else "0")
         env("SNX_FILE_CACHE_MB", fileCacheMb.toString())
+        env("SNX_LOOK_SENS", "%.2f".format(java.util.Locale.ROOT, lookSensitivity))  // и камера правым стиком
+        env("SNX_PAD_CAMERA", if (padCamera == 1) "joystick" else "mouse")
+        if (cheats) env("SNX_CHEATS", "1")
         env("SNX_SHADER_CACHE", File(ctx.cacheDir, "shaders").absolutePath)
         val tahoma = File(gameDir, "System/tahoma.ttf")
         if (tahoma.exists()) env("SNX_GDI_FONT", tahoma.absolutePath)
@@ -102,6 +124,7 @@ class Settings(private val ctx: Context) {
             val s = line.trim()
             if (s.isNotEmpty() && !s.startsWith("#") && s.contains('=')) { a += "--env"; a += s }
         }
+        if (!map.isNullOrEmpty()) { a += "--"; a += map }  // после «--» — командная строка игры (host/boot/main.c)
         return a.toTypedArray()
     }
 

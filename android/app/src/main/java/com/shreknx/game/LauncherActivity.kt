@@ -19,6 +19,7 @@ import android.text.InputType
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.EditText
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
@@ -47,6 +48,7 @@ class LauncherActivity : Activity() {
             s.creditsShownVersion = BuildConfig.VERSION_CODE
             showCredits()
         }
+        Updater.checkAndAsk(this, s, auto = true)  // новый выпуск на GitHub — «Скачать» / «Позже»
     }
 
     // окно «О порте»: CreditsDialog (автор, Telegram-канал, благодарность репозиторию shrekNX)
@@ -60,6 +62,7 @@ class LauncherActivity : Activity() {
             build()
         }
         refreshStatus()
+        Updater.resumePending(this)  // вернулись из настроек «Установка неизвестных приложений»
     }
 
     private var stale = false
@@ -94,6 +97,7 @@ class LauncherActivity : Activity() {
         content.addView(cols)
 
         left.addView(gameCard())
+        left.addView(extrasCard())
         left.addView(controlsCard())
         right.addView(graphicsCard())
         right.addView(advancedCard())
@@ -175,6 +179,7 @@ class LauncherActivity : Activity() {
         val uri = data?.data ?: return
         if (resultCode != RESULT_OK) return
         if (requestCode == REQ_IMPORT) runImport(uri)
+        if (requestCode == REQ_SAVES) runSaveImport(uri)
     }
 
     private fun runImport(tree: Uri) {
@@ -204,6 +209,43 @@ class LauncherActivity : Activity() {
                     toastDialog(error?.let { L.t("Ошибка импорта: $it", "Import failed: $it") } ?: (GameFolder.check(dst.absolutePath)
                         ?.let { L.t("Скопировано, но: $it", "Copied, but: $it") } ?: L.t("Готово: игра скопирована.", "Done: the game has been copied.")))
                 }
+            }
+        }.start()
+    }
+
+    // ---------------------------------------------------------------- уровни, сохранения, читы
+    private fun extrasCard(): LinearLayout {
+        val c = Ui.card(this)
+        c.addView(Ui.title(this, L.t("Уровни, сохранения, читы", "Levels, saves, cheats")))
+        val row = Ui.hbox(this)
+        row.addView(Ui.button(this, L.t("Выбор уровня…", "Level select…")) {
+            Levels.show(this, s.gameDir) { map -> launch(map) }
+        }, wrapGap())
+        row.addView(Ui.button(this, L.t("Импорт сохранений…", "Import saves…")) {
+            startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQ_SAVES)
+        }, wrapGap())
+        c.addView(HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false; addView(row) })
+        c.addView(Ui.label(this, L.t("Сохранения — папка Save с ПК (или папка, в которой она лежит). Прежние сохранения порта " +
+            "не пропадут: они переименуются в Save.bak-<дата>.", "Saves: the Save folder from a PC (or the folder containing it). " +
+            "The current saves are kept as Save.bak-<date>."), dim = true, size = 12f)
+            .apply { setPadding(0, Ui.dp(this@LauncherActivity, 6f), 0, 0) })
+        c.addView(Ui.switchRow(this, L.t("Читы", "Cheats"), L.t("В игре — шестерёнка → «Читы» или оба стика геймпада (L3+R3): " +
+            "сквозь стены, полёт, бессмертие, монеты, меню разработчика (любая карта, бонусы)",
+            "In game: gear → “Cheats” or both gamepad sticks (L3+R3): noclip, fly, god mode, coins, developer menu (any map, bonuses)"),
+            s.cheats) { s.cheats = it })
+        return c
+    }
+
+    private fun runSaveImport(tree: Uri) {
+        val dlg = AlertDialog.Builder(this).setMessage(L.t("Копирую сохранения…", "Copying saves…")).setCancelable(false).show()
+        Thread {
+            val res = try { Result.success(Saves.import(this, s, tree)) } catch (e: Exception) { Result.failure(e) }
+            runOnUiThread {
+                dlg.dismiss()
+                val r = res.getOrNull()
+                toastDialog(if (r == null) L.t("Ошибка: ${res.exceptionOrNull()?.message}", "Error: ${res.exceptionOrNull()?.message}")
+                    else L.t("Готово: ${r.files} файлов → ${r.target.path}", "Done: ${r.files} files → ${r.target.path}") +
+                        (r.backup?.let { L.t("\nПрежние сохранения: ${it.name}", "\nPrevious saves: ${it.name}") } ?: ""))
             }
         }.start()
     }
@@ -263,6 +305,10 @@ class LauncherActivity : Activity() {
         c.addView(Ui.switchRow(this, L.t("Вибрация кнопок", "Button vibration"), null, s.haptics) { s.haptics = it })
         c.addView(Ui.seekRow(this, L.t("Чувствительность камеры", "Camera sensitivity"), 38, ((s.lookSensitivity - 0.1f) * 10f).toInt(),
             { "%.1f".format(0.1f + it / 10f) }) { s.lookSensitivity = 0.1f + it / 10f })
+        c.addView(Ui.choiceRow(this, L.t("Камера правым стиком геймпада", "Gamepad right stick camera"),
+            listOf(L.t("Как палец", "Like touch"), L.t("Ось джойстика", "Joystick axis")), s.padCamera.coerceIn(0, 1)) { s.padCamera = it })
+        c.addView(Ui.label(this, L.t("«Как палец» — камера не пропадает (было на Retroid Pocket, GameSir); скорость — ползунок выше.",
+            "“Like touch” keeps the camera from dropping out (seen on Retroid Pocket, GameSir); speed is the slider above."), dim = true, size = 12f))
         c.addView(Ui.seekRow(this, L.t("Прозрачность кнопок", "Button opacity"), 18, ((s.opacity - 0.1f) * 20f).toInt(),
             { "${((0.1f + it / 20f) * 100).toInt()} %" }) { s.opacity = 0.1f + it / 20f })
         return c
@@ -279,6 +325,11 @@ class LauncherActivity : Activity() {
         row.addView(Ui.button(this, L.t("Журнал", "Log")) { showLog() }, wrapGap())
         row.addView(Ui.button(this, L.t("Переменные SNX_*", "SNX_* variables")) { editEnv() }, wrapGap())
         c.addView(row)
+        c.addView(Ui.switchRow(this, L.t("Проверять обновления", "Check for updates"),
+            L.t("При запуске, раз в 6 часов: новая версия на GitHub — предложит скачать", "On start, every 6 hours: offers a new version from GitHub"),
+            s.checkUpdates) { s.checkUpdates = it })
+        c.addView(Ui.button(this, L.t("Проверить обновления", "Check for updates")) { Updater.checkAndAsk(this, s, auto = false) }
+            .apply { layoutParams = wrapGap().apply { bottomMargin = Ui.dp(this@LauncherActivity, 4f) } })
         c.addView(Ui.button(this, L.t("Очистить кэш шейдеров", "Clear shader cache")) {
             File(cacheDir, "shaders").deleteRecursively()
             File(Settings.userDir(this), "System/SnxPrograms.bin").delete()  // список программ для фоновой сборки
@@ -393,7 +444,7 @@ class LauncherActivity : Activity() {
         launch()
     }
 
-    private fun launch() {
+    private fun launch(map: String? = null) {
         stale = true
         // Лаунчер виден — значит, игры поверх него нет (она в той же задаче). Живой процесс :game тогда — остаток
         // прошлого запуска (завис на выходе): новая игра попала бы в него и не отвечала бы на касания. Завершить
@@ -401,7 +452,7 @@ class LauncherActivity : Activity() {
         val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         fun gamePid(): Int? = am.runningAppProcesses
             ?.firstOrNull { it.processName == "$packageName:game" && it.pid != Process.myPid() }?.pid
-        val start = { startActivity(Intent(this, GameActivity::class.java).putExtra(GameActivity.EXTRA_ARGS, s.gameArgs())) }
+        val start = { startActivity(Intent(this, GameActivity::class.java).putExtra(GameActivity.EXTRA_ARGS, s.gameArgs(map))) }
         val pid = gamePid() ?: return start()
         Process.killProcess(pid)
         val h = Handler(Looper.getMainLooper())
@@ -421,5 +472,6 @@ class LauncherActivity : Activity() {
 
     companion object {
         private const val REQ_IMPORT = 1
+        private const val REQ_SAVES = 2
     }
 }

@@ -144,8 +144,18 @@ static void wheel(int clicks)
 // крестовина — фокус на соседний элемент (у ползунка и выпадающего списка влево/вправо — стрелки: значение),
 // A — щелчок по элементу в фокусе, B — по кнопке «назад» страницы (BACK, CANCEL, NO), если она есть, иначе
 // Escape; L/R — вкладки настроек; Plus — Escape, Minus — пробел; стики — курсор. Касание — щелчок в точке.
-static float g_axis[SDL_CONTROLLER_AXIS_MAX];
+static float g_axis[SDL_CONTROLLER_AXIS_MAX];  // оси без устройства: SNX_KEYS (~RX=...)
 static int g_trig[2];
+// Оси — по каждому открытому геймпаду отдельно (SDL_JoystickID), в игру — сильнее отклонённая. Прежде одна общая
+// таблица: второе устройство (встроенный геймпад и «виртуальный», геймпад-переходник и т. п.) событием с нулём
+// затирало правый стик настоящего — камера «пропадала» (жалоба: Retroid Pocket, GameSir X5 Lite).
+#define MAX_PADS 8
+static struct {
+    SDL_JoystickID id;  // -1 — свободно
+    SDL_GameController *gc;
+    float axis[SDL_CONTROLLER_AXIS_MAX];
+    unsigned events;    // событий осей (диагностика)
+} g_pads[MAX_PADS] = {[0 ... MAX_PADS - 1] = {.id = -1}};
 enum { PB_ZL = SDL_CONTROLLER_BUTTON_MAX, PB_ZR, PB_N };  // курки — тоже кнопки
 enum {  // цели, кроме клавиш
     T_LMB = 0x1000, T_RMB, T_MMB, T_WHEEL_UP, T_WHEEL_DOWN, T_FPS, T_JOY, T_NAV, T_SELECT, T_BACK, T_TAB_PREV, T_TAB_NEXT
@@ -179,11 +189,11 @@ static const struct {
     {"Backslash", 0xDC}, {"RightBracket", 0xDD}, {"SingleQuote", 0xDE}, {"ToggleFPS", T_FPS},
 };
 
-#define SNX_INI_VERSION 2
+#define SNX_INI_VERSION 3
 static const char g_snx_default[] =
     "; Настройки порта shrekNX. Правятся здесь, действуют со следующего запуска.\n"
     "[Port]\n"
-    "Version=2          ; формат файла (файл старого формата переименовывается в Snx.ini.old)\n"
+    "Version=3          ; формат файла (файл старого формата переименовывается в Snx.ini.old)\n"
     "\n"
     "[Overlay]\n"
     "ShowFPS=False      ; счётчик кадров в углу (переключается и на ходу: ZL+Minus)\n"
@@ -200,6 +210,9 @@ static const char g_snx_default[] =
     "[Pad]\n"
     "Layer=ZL           ; кнопка второго слоя (None - без слоя)\n"
     "Plus=Escape        ; меню - клавишей: открытое с джойстика меню игра рисует без книги\n"
+    "B=Ctrl             ; прыжок - клавишей Ctrl, как на ПК: двойной прыжок и лианы (кнопка джойстика Joy2\n"
+    ";                    срабатывала через раз). B= (пусто) - снова Joy2 из User.ini\n"
+    "CameraMode=Mouse   ; камера правым стиком: Mouse - как мышь/палец, Joystick - ось JoyU/JoyV\n"
     "MoveSpeed=1200     ; бег при полном наклоне левого стика (как клавиша W)\n"
     "CameraSpeed=72     ; поворот камеры правым стиком (умножается ещё на скорость мыши из меню игры)\n"
     "InvertCameraY=False\n"
@@ -222,6 +235,13 @@ static u32 g_held[PB_N];    // что нажала кнопка: отпуска�
 static int g_layer_btn = -1, g_layer, g_menu;
 static float g_move_speed = 1200.0f, g_cam_speed = 72.0f, g_dead = 0.15f;
 static int g_invert_y;
+// Камера правым стиком: 1 — смещениями мыши DirectInput (как камера пальцем), 0 — осью джойстика JoyU/JoyV.
+// Мышь — основной ввод игры на ПК: у оси джойстика камера на Android «пропадала» (после прыжков по кувшинкам и
+// просто через минуту-две, до захода в меню), у пальца — нет. Скорость: ось V даёт aMouseX = 20·V, мышь —
+// 1,2 на отсчёт в секунду (MouseX: Axis aMouseX Speed=6, ×0,01; UInput::ReadInput ×20/Δt), то есть
+// CameraSpeed 72 ≈ 1200 отсчётов/с при полном наклоне; ещё × «Чувствительность камеры» лаунчера (SNX_LOOK_SENS).
+static int g_cam_mouse = 1;
+static float g_look_sens = 1.0f;
 
 static int pad_button_of(const char *n)
 {
@@ -302,6 +322,10 @@ static int load_settings(const char *text, const char *src)
             g_invert_y = is_true(v);
             continue;
         }
+        if (!strcasecmp(k, "CameraMode")) {
+            g_cam_mouse = strcasecmp(v, "Joystick") != 0;
+            continue;
+        }
         char *plus = strchr(k, '+');
         int b = pad_button_of(plus ? plus + 1 : k);
         u32 t = *v ? key_of(v) : 0;
@@ -346,12 +370,23 @@ static void input_load(const char *user_dir)
 void input_init(const char *user_dir)
 {
     input_load(user_dir);
+    const char *cm = getenv("SNX_PAD_CAMERA");  // поверх Snx.ini: лаунчер («Камера правым стиком»)
+    if (cm && *cm)
+        g_cam_mouse = strcasecmp(cm, "joystick") != 0;
+    const char *ls = getenv("SNX_LOOK_SENS");
+    if (ls && atof(ls) > 0.0)
+        g_look_sens = (float)atof(ls);
+    fprintf(stderr, "[input] right stick camera: %s, speed %.0f, sensitivity %.2f\n", g_cam_mouse ? "mouse" : "joystick",
+            (double)g_cam_speed, (double)g_look_sens);
     const char *e = getenv("SNX_SHOW_FPS");  // поверх Snx.ini: лаунчер Android («Счётчик FPS»)
     if (e)
         d3d8_set_fps_overlay(*e == '1');
 }
 
 static u32 g_joy_buttons;  // кнопки джойстика (биты Joy1..Joy12) и крестовины (биты 16..19: вверх, вниз, влево, вправо)
+// Нажатия с последней передачи в dinput8_joy: короткое нажатие (нажал и отпустил между двумя тактами ввода) не
+// теряется — игра увидит кнопку нажатой хотя бы в одном опросе (dinput8 держит нажатие до чтения игрой).
+static u32 g_joy_latch;
 
 // Щелчок в точке заднего буфера (B — по кнопке «назад», касание экрана): курсор GUI ставит поток гостя
 // (game_menu_point), нажатие — когда GUI уже увидел курсор там (элемент под курсором выбирается заранее),
@@ -482,6 +517,8 @@ static void send_target(int b, u32 t, int down)
     case T_JOY: {
         u32 bit = g_pb_joy[b] ? 1u << (g_pb_joy[b] - 1) : 1u << (16 + b - SDL_CONTROLLER_BUTTON_DPAD_UP);
         g_joy_buttons = down ? g_joy_buttons | bit : g_joy_buttons & ~bit;
+        if (down)
+            g_joy_latch |= bit & 0xFFF;
         break;
     }
     default: key(t, down);
@@ -558,7 +595,34 @@ static void release_all(void)
             g_held[b] = 0;
         }
     g_joy_buttons = 0;
+    g_joy_latch = 0;
     g_joy_frozen = joy;
+}
+
+static int pad_slot(SDL_JoystickID id, int alloc)
+{
+    int free_ = -1;
+    for (int i = 0; i < MAX_PADS; i++) {
+        if (g_pads[i].id == id)
+            return i;
+        if (g_pads[i].id < 0 && free_ < 0)
+            free_ = i;
+    }
+    if (alloc && free_ >= 0) {
+        memset(&g_pads[free_], 0, sizeof g_pads[free_]);
+        g_pads[free_].id = id;
+    }
+    return alloc ? free_ : -1;
+}
+
+// ось a: самая отклонённая среди геймпадов (и SNX_KEYS)
+static float pad_axis(int a)
+{
+    float best = g_axis[a];
+    for (int i = 0; i < MAX_PADS; i++)
+        if (g_pads[i].id >= 0 && fabsf(g_pads[i].axis[a]) > fabsf(best))
+            best = g_pads[i].axis[a];
+    return best;
 }
 
 // стик с круглой мёртвой зоной: (x, y) -> длина 0..1 с тем же направлением; curve — квадратичный отклик
@@ -721,6 +785,12 @@ static void diag_tick(void)
                     "lx=%.2f ly=%.2f | dinput: mouse %u joy %u unacquired %u acquire %u\n",
             now / 1000, g_diag_ticks, user32_focus(), g_menu, ready, x, y, g_diag_pad, g_diag_taps, g_touch_applied,
             (double)g_touch_ax[0], (double)g_touch_ax[1], st[0], st[1], st[2], st[3]);
+    for (int i = 0; i < MAX_PADS; i++)  // геймпады: правый стик сейчас и число событий осей (камера «пропадает»)
+        if (g_pads[i].id >= 0 && g_pads[i].events)
+            fprintf(stderr, "[pad] #%d axis events %u rx=%.2f ry=%.2f lx=%.2f ly=%.2f\n", (int)g_pads[i].id,
+                    g_pads[i].events, (double)g_pads[i].axis[SDL_CONTROLLER_AXIS_RIGHTX],
+                    (double)g_pads[i].axis[SDL_CONTROLLER_AXIS_RIGHTY], (double)g_pads[i].axis[0],
+                    (double)g_pads[i].axis[1]);
 }
 
 
@@ -773,7 +843,7 @@ static void touch_tick(void)
 
 static float axis_of(int a)
 {
-    float p = g_axis[a], t = a < 4 ? g_touch_ax[a] : 0.0f;
+    float p = pad_axis(a), t = a < 4 ? g_touch_ax[a] : 0.0f;
     return fabsf(t) > fabsf(p) ? t : p;
 }
 
@@ -801,7 +871,7 @@ void input_tick(void)
     }
     // курки -> кнопки ZL/ZR
     for (int i = 0; i < 2; i++) {
-        int on = g_axis[SDL_CONTROLLER_AXIS_TRIGGERLEFT + i] > (g_trig[i] ? 0.3f : 0.5f);
+        int on = pad_axis(SDL_CONTROLLER_AXIS_TRIGGERLEFT + i) > (g_trig[i] ? 0.3f : 0.5f);
         if (on != g_trig[i])
             pad_button(PB_ZL + i, g_trig[i] = on);
     }
@@ -814,7 +884,22 @@ void input_tick(void)
                                        9000, 4500, 13500, 9000, -1, 0, 18000, -1};
         float ax[6] = {lx * g_move_speed, ly * g_move_speed, 0, 0, rx * g_cam_speed,
                        (g_invert_y ? -ry : ry) * g_cam_speed};
-        dinput8_joy(ax, g_joy_buttons & 0xFFF, pov_of[g_joy_buttons >> 16 & 15]);
+        if (g_cam_mouse) {  // камера — смещениями мыши, как пальцем (см. g_cam_mouse)
+            static float cfx, cfy;
+            float k = g_cam_speed * (1200.0f / 72.0f) * g_look_sens * dt;
+            ax[4] = ax[5] = 0.0f;
+            cfx += rx * k;
+            cfy += (g_invert_y ? -ry : ry) * k;
+            if (rx == 0.0f && ry == 0.0f)
+                cfx = cfy = 0.0f;
+            int dx = (int)cfx, dy = (int)cfy;
+            cfx -= (float)dx;
+            cfy -= (float)dy;
+            if (dx || dy)
+                dinput8_mouse_move(dx, dy, 0);
+        }
+        dinput8_joy(ax, (g_joy_buttons | g_joy_latch) & 0xFFF, pov_of[g_joy_buttons >> 16 & 15]);
+        g_joy_latch = 0;
         return;
     }
     static const float zero[6];
@@ -919,17 +1004,48 @@ void input_event(const void *p)
     case SDL_MOUSEWHEEL:
         wheel(e->wheel.y);
         break;
-    case SDL_CONTROLLERDEVICEADDED:
-        SDL_GameControllerOpen(e->cdevice.which);
+    case SDL_CONTROLLERDEVICEADDED: {
+        SDL_GameController *gc = SDL_GameControllerOpen(e->cdevice.which);
+        SDL_JoystickID id = gc ? SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(gc)) : -1;
+        int slot = id >= 0 ? pad_slot(id, 1) : -1;
+        if (slot >= 0 && !g_pads[slot].gc)
+            g_pads[slot].gc = gc;
+        else if (gc && slot >= 0)
+            SDL_GameControllerClose(gc);  // уже открыт (SDL считает ссылки): лишнюю ссылку — обратно
+        char *map = gc ? SDL_GameControllerMapping(gc) : NULL;
+        fprintf(stderr, "[input] pad added: #%d \"%s\" slot %d mapping %s\n", (int)id,
+                gc ? SDL_GameControllerName(gc) : "?", slot, map ? map : "-");
+        SDL_free(map);
         break;
+    }
+    case SDL_CONTROLLERDEVICEREMOVED: {  // отключили: оси — в ноль, нажатое — отпустить
+        int slot = pad_slot(e->cdevice.which, 0);
+        fprintf(stderr, "[input] pad removed: #%d slot %d\n", (int)e->cdevice.which, slot);
+        if (slot < 0)
+            break;
+        if (g_pads[slot].gc)
+            SDL_GameControllerClose(g_pads[slot].gc);
+        memset(&g_pads[slot], 0, sizeof g_pads[slot]);
+        g_pads[slot].id = -1;
+        for (int b = 0; b < PB_N; b++)
+            if (g_held[b])
+                pad_button(b, 0);
+        g_trig[0] = g_trig[1] = 0;
+        g_touch_applied = 0;  // кнопки, которые держит палец, нажмутся заново в touch_tick
+        break;
+    }
     case SDL_CONTROLLERBUTTONDOWN:
     case SDL_CONTROLLERBUTTONUP:
         pad_button(by_label(e->cbutton.button), e->type == SDL_CONTROLLERBUTTONDOWN);
         break;
-    case SDL_CONTROLLERAXISMOTION:
-        if (e->caxis.axis < SDL_CONTROLLER_AXIS_MAX)
-            g_axis[e->caxis.axis] = (float)e->caxis.value / 32767.0f;
+    case SDL_CONTROLLERAXISMOTION: {
+        int slot = pad_slot(e->caxis.which, 1);
+        if (slot >= 0 && e->caxis.axis < SDL_CONTROLLER_AXIS_MAX) {
+            g_pads[slot].axis[e->caxis.axis] = (float)e->caxis.value / 32767.0f;
+            g_pads[slot].events++;
+        }
         break;
+    }
     default:
         break;
     }

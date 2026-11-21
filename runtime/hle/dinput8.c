@@ -70,6 +70,8 @@ void dinput8_mouse_button(int i, int down)
 // Состояние геймпада: оси в единицах игры (см. dinput8.h), кнопки, POV
 static s32 g_joy_axis[6];
 static u32 g_joy_buttons;
+static u32 g_joy_sticky;  // нажатые после последнего GetDeviceState: игра увидит их хотя бы раз, даже если
+                          // кнопку уже отпустили (хост обновляет состояние чаще, чем игра его читает)
 static u32 g_joy_pov = 0xFFFFFFFFu;
 
 void dinput8_joy(const float axis[6], u32 buttons, int pov)
@@ -79,9 +81,26 @@ void dinput8_joy(const float axis[6], u32 buttons, int pov)
         double v = 32768.0 + (double)axis[i] * 65535.0;
         g_joy_axis[i] = v > 2e9 ? 2000000000 : v < -2e9 ? -2000000000 : (s32)lrint(v);
     }
+    g_joy_sticky |= buttons & ~g_joy_buttons;
     g_joy_buttons = buttons;
     g_joy_pov = pov < 0 ? 0xFFFFFFFFu : (u32)pov;
     pthread_mutex_unlock(&g_in_lock);
+}
+
+// кнопки для опроса игрой: нажатые сейчас и нажатые после прошлого опроса (вызывать под g_in_lock)
+static u32 take_buttons(void)
+{
+    u32 b = g_joy_buttons | g_joy_sticky;
+    g_joy_sticky = 0;
+    return b;
+}
+
+u32 dinput8_joy_poll_buttons(void)
+{
+    pthread_mutex_lock(&g_in_lock);
+    u32 b = take_buttons();
+    pthread_mutex_unlock(&g_in_lock);
+    return b;
 }
 
 // ================================================================ IDirectInputDevice8W
@@ -180,8 +199,9 @@ static void dev_GetDeviceState(CPU *c)
         wr32(g_mem, p + 0x20, g_joy_pov);
         for (u32 i = 1; i < 4; i++)
             wr32(g_mem, p + 0x20 + 4 * i, 0xFFFFFFFFu);
+        u32 b = take_buttons();
         for (u32 i = 0; i < 32; i++)
-            g_mem[p + 0x30 + i] = g_joy_buttons >> i & 1 ? 0x80 : 0;
+            g_mem[p + 0x30 + i] = b >> i & 1 ? 0x80 : 0;
         pthread_mutex_unlock(&g_in_lock);
     }
     RET(3, d && d->acquired ? DI_OK : DIERR_NOTACQUIRED);

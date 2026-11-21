@@ -40,6 +40,10 @@ on:
         description: 'Только для both: ссылка на архив русской версии игры'
         type: string
         default: ''
+      release:
+        description: 'Выпустить APK без игры в GitHub Releases (лаунчер проверяет там обновления). APK с кодом игры не выпускается'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -63,6 +67,9 @@ jobs:
   apk:
     runs-on: ubuntu-24.04
     timeout-minutes: 300
+    # contents: write — только для шага «Выпуск» (gh release); остальные шаги токен не используют
+    permissions:
+      contents: write
     env:
       NDK_VERSION: 27.2.12479018
     steps:
@@ -265,6 +272,7 @@ jobs:
           mkdir -p build/out
           cp "$APK" "build/out/$NAME"
           echo "path=build/out/$NAME" >> "$GITHUB_OUTPUT"
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
           echo "days=$DAYS" >> "$GITHUB_OUTPUT"
           echo "APK: **$NAME**" >> "$GITHUB_STEP_SUMMARY"
 
@@ -276,3 +284,25 @@ jobs:
           archive: false
           retention-days: ${{ steps.pack.outputs.days }}
           if-no-files-found: error
+
+      # Выпуск для проверки обновлений лаунчером (Updater.kt ищет в выпусках APK с именем
+      # <Shrek2|shrekNX-nogame>-<eng|rus|uni>-<версия>.apk и сравнивает число после последнего «-»). Только APK без
+      # игры: в APK с игрой — переведённый код игры, его не распространяем (AGENTS.md, правило 6).
+      - name: Выпуск (GitHub Releases)
+        if: github.event_name == 'workflow_dispatch' && inputs.release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GAME: ${{ steps.mode.outputs.game }}
+          APK: ${{ steps.pack.outputs.path }}
+          VER: ${{ steps.pack.outputs.ver }}
+        run: |
+          if [ "$GAME" = 1 ]; then
+            echo "::error::Выпуск — только для APK без игры (в APK с игрой — переведённый код игры)"
+            exit 1
+          fi
+          TAG="v$VER"
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "shrekNX $VER" \
+              --notes "Сборка $VER ($(git log -1 --format=%h)): $(git log -1 --format=%s)"
+          gh release upload "$TAG" "$APK" -R "$GITHUB_REPOSITORY" --clobber
+          echo "Выпуск: **$TAG**" >> "$GITHUB_STEP_SUMMARY"

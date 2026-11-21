@@ -308,6 +308,25 @@ static const char *const g_joy_bindings[][2] = {
     {"JoyV", "Axis aMouseY Invert=-1"},
 };
 
+// Читы (лаунчер Android: «Читы», SNX_CHEATS=1): команды игры на клавиши цифрового блока — их нажимает меню «Читы»
+// поверх игры (android/.../Cheats.kt, тот же список). Команды — exec-функции контроллера игрока
+// (KWHeroController: ShowDevMenu, FraserIsGod, ToggleHud; ShrekController: AddCoins; ShHeroController:
+// AddPotions, Addposters; KWPlayerInput: ToggleDebugMode) и CheatManager движка (Ghost, Fly, Walk) — имена по
+// декомпиляции скриптов (github.com/Master-64/Shrek2-LevelEditor) и патчу kam0n4ik/Shrek-2-PC-Unified-Patch
+// (F9=ToggleDebugMode, F10=ShowDevMenu). Что именно работает без режима разработчика — [проверить] в игре.
+static const char *const g_cheat_bindings[][2] = {
+    {"NumPad0", "ToggleDebugMode"},  // режим разработчика вкл/выкл
+    {"NumPad1", "ShowDevMenu"},      // Dev Menu: любая карта, закладки, состояние сюжета
+    {"NumPad2", "Ghost"},            // сквозь стены (noclip)
+    {"NumPad3", "Fly"},              // полёт
+    {"NumPad4", "Walk"},             // обычная ходьба (выключить Ghost/Fly)
+    {"NumPad5", "FraserIsGod"},      // бессмертие
+    {"NumPad6", "AddCoins 100"},     // +100 монет
+    {"NumPad7", "AddPotions 5"},     // зелья
+    {"NumPad8", "Addposters"},       // плакаты «Разыскивается» (открывают бонусы)
+    {"NumPad9", "ToggleHud"},        // интерфейс вкл/выкл
+};
+
 // Действия вкладки GAME (Tab_OptionsGame.AliasNames1). Переназначение клавиш там в порту выключено
 // (runtime/game/menu.c), но прежние сборки его пропускали: ячейка ждала нажатия, и кнопка геймпада забирала
 // действие, а у прежних клавиш (W, Ctrl, Joy2...) оно стиралось. Тогда игра пишет «назначьте клавиши во всех
@@ -694,6 +713,14 @@ void boot_config_apply(int res_w, int res_h)
         const char *k = g_joy_bindings[i][0];
         if (!boot_ini_get(user, "Engine.Input", k, cur, sizeof cur) || !cur[strspn(cur, " \t")])
             set(user, "Engine.Input", k, g_joy_bindings[i][1]);
+    }
+    const char *cheats = getenv("SNX_CHEATS");
+    if (cheats && *cheats == '1') {  // клавиши цифрового блока — под читы (на телефоне их нажимает только меню «Читы»)
+        for (size_t i = 0; i < sizeof g_cheat_bindings / sizeof g_cheat_bindings[0]; i++)
+            if (!boot_ini_get(user, "Engine.Input", g_cheat_bindings[i][0], cur, sizeof cur) ||
+                strcmp(cur, g_cheat_bindings[i][1]) != 0)
+                set(user, "Engine.Input", g_cheat_bindings[i][0], g_cheat_bindings[i][1]);
+        fprintf(stderr, "[config] cheats: NumPad0-9 bound\n");
     }
     prompts_apply();
     vfs_changed();  // game.ini, User.ini и .int могли появиться в оверлее
