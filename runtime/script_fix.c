@@ -132,18 +132,35 @@ static int name_is(u32 obj, const char *name)
     }
 }
 
-// Script функции: TArray на STRUCT_SCRIPT (*exact = 1), иначе первый правдоподобный TArray (байткод кончается на
-// 0x53, EX_EndOfScript) в полях UStruct
+// Script функции: TArray (данные, число, ёмкость) на STRUCT_SCRIPT (*exact = 1) — данные в окне гостя, число
+// правдоподобно; иначе (другая раскладка) первый TArray в полях UStruct, чей байткод кончается на 0x53
+// (EX_EndOfScript) или на 04 0B (return; — так кончается Script функций в SHGame.u: без 0x53). На STRUCT_SCRIPT конец
+// не проверяется: на устройстве (0.1.0-35) там был байткод в 201 байт (…04 0B), но первая версия требовала 0x53
+// последним байтом, ёмкость >= числа и память по VirtualQuery и ждала «загрузки» вечно. Узнаёт ли байткод правка —
+// решает сопоставление по образцу (script_fix_post_load_game), чужой байткод остаётся как есть.
 static int script_of(u32 fn, u32 *data, u32 *num, int *exact)
 {
-    for (u32 k = 0; k <= 16; k++) {
-        u32 off = k ? 0x40 + 4 * k : STRUCT_SCRIPT;
-        u32 d = rd32(g_mem, fn + off), cnt = rd32(g_mem, fn + off + 4), cap = rd32(g_mem, fn + off + 8);
-        if (cnt < 16 || cnt > 0xFFFF || cap < cnt || !committed(d, cnt) || g_mem[d + cnt - 1] != 0x53)
+    u32 d = rd32(g_mem, fn + STRUCT_SCRIPT), cnt = rd32(g_mem, fn + STRUCT_SCRIPT + 4);
+    // окно гостя целиком доступно на чтение и запись (runtime/vmem.h), а память распределителя игры VirtualQuery
+    // может и не описывать — хватает границ окна
+    if (cnt >= 16 && cnt <= 0xFFFF && d >= 0x10000 && d < RT_WINDOW && cnt <= RT_WINDOW - d) {
+        *data = d;
+        *num = cnt;
+        *exact = 1;
+        return 1;
+    }
+    for (u32 k = 1; k <= 16; k++) {
+        u32 off = 0x40 + 4 * k;
+        if (off == STRUCT_SCRIPT)
+            continue;
+        d = rd32(g_mem, fn + off), cnt = rd32(g_mem, fn + off + 4);
+        u32 cap = rd32(g_mem, fn + off + 8);
+        if (cnt < 16 || cnt > 0xFFFF || cap < cnt || !committed(d, cnt) ||
+            (g_mem[d + cnt - 1] != 0x53 && (g_mem[d + cnt - 2] != 0x04 || g_mem[d + cnt - 1] != 0x0B)))
             continue;
         *data = d;
         *num = cnt;
-        *exact = !k;
+        *exact = 0;
         return 1;
     }
     return 0;
@@ -156,8 +173,14 @@ static void fix_post_load_game(u32 fn, const char *via)
     g_seen = 1;
     if (!script_of(fn, &data, &num, &exact)) {
         if (g_pending != fn) {
-            fprintf(stderr, "[script] Shrek.PostLoadGame %08x (%s): no bytecode yet (Script %08x, %u bytes)\n", fn, via,
-                    rd32(g_mem, fn + STRUCT_SCRIPT), rd32(g_mem, fn + STRUCT_SCRIPT + 4));
+            u32 d = rd32(g_mem, fn + STRUCT_SCRIPT), cnt = rd32(g_mem, fn + STRUCT_SCRIPT + 4);
+            vm_info mi;
+            int q = vm_query(d, &mi);
+            fprintf(stderr, "[script] Shrek.PostLoadGame %08x (%s): no bytecode yet (Script %08x, %u bytes, max %u; "
+                            "memory %s %08x+%x)\n", fn, via, d, cnt, rd32(g_mem, fn + STRUCT_SCRIPT + 8),
+                    !q ? "outside" : mi.state == VM_MEM_COMMIT ? "committed" : mi.state == VM_MEM_RESERVE ? "reserved"
+                                                                                                        : "free",
+                    mi.base, mi.size);
             g_pending = fn;
         }
         return;  // байткод ещё не загружен — следующий Link

@@ -48,7 +48,7 @@ static void build(int mod, u32 *chk, u32 *ret_mod, u32 *saved)
     *saved = len;
     b(0x0F), b(0x01), w32(SAVED), b(0x19), b(0x01), w32(1), w16(5), b(0x01), w32(2);  // SavedTag = ...Tag
     b(0x0F), b(0x19), b(0x01), w32(1), w16(5), b(0x01), w32(2), b(0x21), w32(88);     // ...Tag = 'MainPlayer'
-    b(0x04), b(0x0B), b(0x53);
+    b(0x04), b(0x0B);  // как в SHGame.u: без EX_EndOfScript
 }
 
 int main(void)
