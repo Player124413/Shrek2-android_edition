@@ -25,16 +25,23 @@
 //     0F 01 <L> 1F 00                    FuturePlayerLabel = ""
 //  B: 0F ...                             SavedTag = Level.PlayerHeroActor.Tag
 // Правка той же длины: 7A (==) -> 7B (!=), переход -> B, 04 0B (return) -> 0B 0B (nothing, nothing):
-// пустая метка — переход к B, непустая — как раньше (смена героя, затем B).
-// В моде Shrek 2.2 перед этим ещё «if (IsInBonusLevel()) { FuturePlayerLabel = ""; return; }» — его return тоже
-// становится nothing.
-// SNX_SCRIPT_FIX=0 — не исправлять. Результат — строка [script] в snx.log.
+// пустая метка — переход к B, непустая — как раньше (смена героя, затем B). Как в Shrek 2 Enhanced Edition, больше
+// ничего не меняется: ветка перед этим «if (!IsInBonusLevel()) { FuturePlayerLabel = ""; return; }» (81 — «!»)
+// выходит только на обычных уровнях, и они остаются как в игре.
+//
+// Когда править: после UStruct::Link функции (байткод загружен) или класса Shrek (его функции), и при каждой новой
+// загрузке: при смене карты сборка мусора может выгрузить SHGame.u, и он грузится заново (прямой запуск уровня —
+// сначала карта Entry, затем сам уровень), а с ним и неисправленный байткод. Поэтому исправленная функция
+// запоминается (объект и адрес байткода), а новая — правится снова. Дополнительно (если Link не застал байткод) —
+// обход всех объектов (UObject::GObjObjects) при UEngine::Flush (загрузка карты) и раз в 2 с кадров, пока функция
+// не найдена (script_fix_scan). SNX_SCRIPT_FIX=0 — не исправлять. Результат — строки [script] в snx.log.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
 #include "runtime/process.h"
+#include "runtime/rt.h"
 #include "runtime/script_fix.h"
 #include "runtime/vmem.h"
 
@@ -74,14 +81,6 @@ int script_fix_post_load_game(u8 *s, u32 n)
         u32 b = match_label_check(s, n, p, 0x7A, 0x04, &label);
         if (!b)
             continue;
-        // мод Shrek 2.2: «07 <p> 81 1B <FName> 16 16 0F 01 <L> 1F 00 04 0B» прямо перед p
-        if (p >= 24 && s[p - 2] == 0x04 && s[p - 1] == 0x0B && s[p - 4] == 0x1F && !s[p - 3] && s[p - 10] == 0x0F &&
-            s[p - 9] == 0x01 && le32(s + p - 8) == label)
-            for (u32 j = p - 24; j + 10 <= p - 10; j++)
-                if (s[j] == 0x07 && (s[j + 1] | (u32)s[j + 2] << 8) == p && s[j + 3] == 0x81 && s[j + 4] == 0x1B) {
-                    s[p - 2] = 0x0B;
-                    break;
-                }
         s[p + 1] = (u8)b;
         s[p + 2] = (u8)(b >> 8);
         s[p + 3] = 0x7B;
@@ -101,9 +100,11 @@ int script_fix_post_load_game(u8 *s, u32 n)
 #define STRUCT_CHILDREN 0x40u
 #define STRUCT_SCRIPT 0x4Cu
 
-static u32 g_names;  // FName::Names (TArray<FNameEntry*>)
-static int g_state;  // 0 — ищем, 1 — исправлено или не нужно, -1 — выключено
-static u32 g_fn;     // Shrek.PostLoadGame, встреченная до загрузки её байткода: проверяется на каждом Link
+static u32 g_names;         // FName::Names (TArray<FNameEntry*>)
+static int g_off;           // SNX_SCRIPT_FIX=0
+static u32 g_pending;       // Shrek.PostLoadGame без загруженного байткода: проверяется на каждом Link
+static u32 g_done_fn, g_done_data;  // последняя исправленная (или проверенная) функция и её байткод
+static int g_seen;          // функция хоть раз найдена (для обхода кадров)
 
 static int committed(u32 a, u32 size)
 {
@@ -119,7 +120,7 @@ static int name_is(u32 obj, const char *name)
     if (idx >= rd32(g_mem, g_names + 4))
         return 0;
     u32 e = rd32(g_mem, rd32(g_mem, g_names) + 4 * idx);
-    if (!e)
+    if (!e || !committed(e, 0xC))
         return 0;
     for (u32 i = 0;; i++) {
         u16 ch = rd16(g_mem, e + 0xC + 2 * i);
@@ -148,64 +149,133 @@ static int script_of(u32 fn, u32 *data, u32 *num, int *exact)
     return 0;
 }
 
-static void fix_post_load_game(u32 fn)
+static void fix_post_load_game(u32 fn, const char *via)
 {
     u32 data, num;
     int exact;
-    if (!script_of(fn, &data, &num, &exact))
+    g_seen = 1;
+    if (!script_of(fn, &data, &num, &exact)) {
+        if (g_pending != fn) {
+            fprintf(stderr, "[script] Shrek.PostLoadGame %08x (%s): no bytecode yet (Script %08x, %u bytes)\n", fn, via,
+                    rd32(g_mem, fn + STRUCT_SCRIPT), rd32(g_mem, fn + STRUCT_SCRIPT + 4));
+            g_pending = fn;
+        }
         return;  // байткод ещё не загружен — следующий Link
+    }
+    if (fn == g_done_fn && data == g_done_data) {
+        if (g_pending == fn)
+            g_pending = 0;
+        return;
+    }
     int r = script_fix_post_load_game(g_mem + data, num);
     if (r == 1)
-        fprintf(stderr, "[script] Shrek.PostLoadGame: hero keeps the MainPlayer tag without a travelled hero "
-                        "(bonus levels started directly)\n");
+        fprintf(stderr, "[script] Shrek.PostLoadGame %08x (%s, %u bytes%s): fixed, the hero keeps the MainPlayer tag "
+                        "without a travelled hero (bonus levels started directly)\n",
+                fn, via, num, exact ? "" : ", Script found off its usual place");
     else if (r == 2)
-        fprintf(stderr, "[script] Shrek.PostLoadGame: already fixed\n");
+        fprintf(stderr, "[script] Shrek.PostLoadGame %08x (%s): already fixed\n", fn, via);
     else if (exact) {
-        fprintf(stderr, "[script] Shrek.PostLoadGame: bytecode not recognised (%u bytes), left as is:", num);
-        for (u32 i = 0; i < num && i < 256; i++)
+        fprintf(stderr, "[script] Shrek.PostLoadGame %08x (%s): bytecode not recognised (%u bytes), left as is:", fn,
+                via, num);
+        for (u32 i = 0; i < num && i < 512; i++)
             fprintf(stderr, " %02x", g_mem[data + i]);
         fputc('\n', stderr);
     } else
         return;  // не тот TArray — ждать следующего Link
-    g_state = 1;
+    g_done_fn = fn;
+    g_done_data = data;
+    if (g_pending == fn)
+        g_pending = 0;
 }
 
-void script_fix_linked(u32 st)
+static int init(void)
 {
-    if (g_state)
-        return;
+    if (g_off)
+        return 0;
     if (!g_names) {
         const char *env = getenv("SNX_SCRIPT_FIX");
         if (env && !strcmp(env, "0")) {
-            g_state = -1;
-            return;
+            g_off = 1;
+            fprintf(stderr, "[script] SNX_SCRIPT_FIX=0: script fixes are off\n");
+            return 0;
         }
         rt_module *core = rt_module_by_name("Core");
         g_names = core ? rt_module_export(core, "?Names@FName@@0V?$TArray@PAUFNameEntry@@@@A", 0) : 0;
         if (!g_names)
-            return;
+            return 0;
     }
+    return 1;
+}
+
+static int is_post_load_game(u32 f)
+{
+    return name_is(f, "PostLoadGame") && name_is(rd32(g_mem, f + OBJ_CLASS), "Function") &&
+           name_is(rd32(g_mem, f + OBJ_OUTER), "Shrek");
+}
+
+void script_fix_linked(u32 st)
+{
+    static int logged;
+    if (!init())
+        return;
+    if (!logged++)
+        fprintf(stderr, "[script] UStruct::Link hook active\n");
+    if (g_pending && committed(g_pending, 0x58) && is_post_load_game(g_pending))
+        fix_post_load_game(g_pending, "pending");
     if (!st || !committed(st, 0x58))
         return;
-    if (g_fn && committed(g_fn, 0x58)) {
-        fix_post_load_game(g_fn);
-        if (g_state)
-            return;
-    }
     u32 cls = rd32(g_mem, st + OBJ_CLASS);
-    if (name_is(st, "PostLoadGame") && name_is(cls, "Function") && name_is(rd32(g_mem, st + OBJ_OUTER), "Shrek")) {
-        g_fn = st;
-        fix_post_load_game(st);
+    if (is_post_load_game(st)) {
+        fix_post_load_game(st, "Link");
         return;
     }
     if (name_is(st, "Shrek") && name_is(cls, "Class"))  // функции класса могли загрузиться раньше него
-        for (u32 f = rd32(g_mem, st + STRUCT_CHILDREN), j = 0; f && j < 4096 && !g_state; j++) {
+        for (u32 f = rd32(g_mem, st + STRUCT_CHILDREN), j = 0; f && j < 4096; j++) {
             if (!committed(f, 0x58))
                 break;
-            if (name_is(f, "PostLoadGame") && name_is(rd32(g_mem, f + OBJ_CLASS), "Function")) {
-                g_fn = f;
-                fix_post_load_game(f);
-            }
+            if (is_post_load_game(f))
+                fix_post_load_game(f, "class Link");
             f = rd32(g_mem, f + FIELD_NEXT);
         }
+}
+
+void script_fix_scan(int frame)
+{
+    static u32 objs, idx_plg = ~0u, last_ms;
+    static int logged;
+    if (!init())
+        return;
+    if (frame) {  // кадры: пока функция не найдена ни разу, раз в 2 с
+        u32 now = (u32)(rt_ticks_ns() / 1000000u);
+        if (g_seen || now - last_ms < 2000u)
+            return;
+        last_ms = now;
+    }
+    if (!objs) {
+        rt_module *core = rt_module_by_name("Core");
+        objs = core ? rt_module_export(core, "?GObjObjects@UObject@@0V?$TArray@PAVUObject@@@@A", 0) : 0;
+        if (!objs)
+            return;
+    }
+    u32 arr = rd32(g_mem, objs), n = rd32(g_mem, objs + 4), found = 0;
+    if (!n || n > (1u << 24) || !committed(arr, 4 * n))
+        return;
+    for (u32 i = 0; i < n; i++) {
+        u32 o = rd32(g_mem, arr + 4 * i);
+        if (o < 0x10000)
+            continue;
+        u32 ni = rd32(g_mem, o + OBJ_NAME);
+        if (idx_plg != ~0u ? ni != idx_plg : !name_is(o, "PostLoadGame"))
+            continue;
+        idx_plg = ni;
+        if (is_post_load_game(o)) {
+            found++;
+            fix_post_load_game(o, frame ? "frame scan" : "load scan");
+        }
+    }
+    if (!logged && (found || !frame)) {
+        logged = 1;
+        fprintf(stderr, "[script] object scan (%s): %u objects, Shrek.PostLoadGame %s\n", frame ? "frame" : "load", n,
+                found ? "found" : "not loaded yet");
+    }
 }

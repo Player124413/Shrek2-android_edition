@@ -4,6 +4,7 @@
 
 #include "runtime/abi.h"
 #include "runtime/rt.h"
+#include "runtime/script_fix.h"
 
 // ---------------------------------------------------------------- Hor+ на широком экране
 // FCameraSceneNode::UpdateMatrices строит проекцию FPerspectiveMatrix(FOV/2, FOV/2, 1, W/H): горизонтальный
@@ -69,5 +70,6 @@ void ovr_engine_flush(CPU *c)
         c->esp += 8;  // thiscall с одним аргументом: ret 4
         return;
     }
+    script_fix_scan(0);  // загрузка карты: SHGame.u мог загрузиться заново (runtime/script_fix.c)
     RT_ENTER_GEN(c, ovr_orig_ovr_engine_flush);  // оригинал — код гостя
 }

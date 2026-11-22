@@ -23,8 +23,9 @@ static void w32(u32 v) { w16(v & 0xFFFF), w16(v >> 16); }
 static const u32 LABEL = 0x12345678;  // FuturePlayerLabel (StrProperty)
 static const u32 SAVED = 0x0BADF00D;  // SavedTag
 
-// тело функции; mod — с веткой «if (IsInBonusLevel()) { FuturePlayerLabel = ""; return; }» мода Shrek 2.2.
-// -> смещения: *chk — if (FuturePlayerLabel == ""), *ret_mod — return ветки мода, *saved — SavedTag = ...
+// тело функции; mod — с веткой «if (!IsInBonusLevel()) { FuturePlayerLabel = ""; return; }» (как в SHGame.u:
+// выход на обычных уровнях, её правка не трогает). -> смещения: *chk — if (FuturePlayerLabel == ""), *ret_mod —
+// return этой ветки, *saved — SavedTag = ...
 static void build(int mod, u32 *chk, u32 *ret_mod, u32 *saved)
 {
     len = 0;
@@ -62,11 +63,11 @@ int main(void)
         CHECK(buf[chk + 3] == 0x7B);                          // == -> !=
         CHECK(buf[chk + 12] == 0x0B && buf[chk + 13] == 0x0B);  // return -> nothing
         if (mod)
-            CHECK(buf[rm] == 0x0B && buf[rm + 1] == 0x0B);
+            CHECK(buf[rm] == 0x04 && buf[rm + 1] == 0x0B);  // обычные уровни — как в игре
         u32 diff = 0;
         for (u32 i = 0; i < len; i++)
             diff += buf[i] != orig[i];
-        CHECK(diff == (mod ? 4u : 3u));  // младший байт перехода, условие, return (+ return мода)
+        CHECK(diff == 3u);  // младший байт перехода, условие, return
         CHECK(script_fix_post_load_game(buf, len) == 2);  // повторно — уже исправлено
     }
     // чужой байткод: переход не за return, другое условие — не трогать

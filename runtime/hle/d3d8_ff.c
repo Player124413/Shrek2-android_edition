@@ -22,6 +22,7 @@
 #include "runtime/hle/bink.h"
 #include "runtime/hle/d3d8.h"
 #include "runtime/game/menu.h"
+#include "runtime/script_fix.h"
 #include "runtime/hle/overlay.h"
 #include "runtime/hle/d3d8_int.h"
 #include "runtime/hle/vfs.h"
@@ -1477,6 +1478,7 @@ static void movie_overlay(d3ddev *d)
 void d3d8_present(d3ddev *d)
 {
     game_menu_frame(d->bb_w, d->bb_h);  // состояние меню игры — для ввода хоста
+    script_fix_scan(1);                 // запасной поиск неисправленного байткода (runtime/script_fix.c)
     movie_overlay(d);
     int w, h;
     plat_drawable_size(&w, &h);
