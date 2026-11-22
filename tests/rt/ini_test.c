@@ -213,14 +213,21 @@ int main(int argc, char **argv)
           "game.ini UTF-16 not updated");
     free(u);
 
-    // 6. читы (SNX_CHEATS=1, лаунчер Android): команды на NumPad0-9; без переменной — не пишутся
-    put(user_ini, "[Engine.Input]\r\nW=MoveForward\r\nNumPad2=Duck\r\n", 45);
+    // 6. читы (SNX_CHEATS=1, лаунчер Android): команды на NumPad2-9; без переменной — не пишутся; режим и меню
+    // разработчика прежней сборки (NumPad0/NumPad1) стираются
+    {
+        static const char seed[] = "[Engine.Input]\r\nW=MoveForward\r\nNumPad2=Duck\r\nNumPad0=ToggleDebugMode\r\n"
+                                   "NumPad1=ShowDevMenu\r\n";
+        put(user_ini, seed, sizeof seed - 1);
+    }
     boot_config_apply(1280, 720);
-    CHECK(!boot_ini_get(user_ini, "Engine.Input", "NumPad1", v, sizeof v) || !v[0], "cheats without SNX_CHEATS");
+    CHECK(!boot_ini_get(user_ini, "Engine.Input", "NumPad1", v, sizeof v) || !v[0], "NumPad1 not cleared: '%s'", v);
+    CHECK(!boot_ini_get(user_ini, "Engine.Input", "NumPad0", v, sizeof v) || !v[0], "NumPad0 not cleared: '%s'", v);
+    CHECK(boot_ini_get(user_ini, "Engine.Input", "NumPad2", v, sizeof v) && !strcmp(v, "Duck"), "cheats without SNX_CHEATS");
     setenv("SNX_CHEATS", "1", 1);
     boot_config_apply(1280, 720);
     unsetenv("SNX_CHEATS");
-    CHECK(boot_ini_get(user_ini, "Engine.Input", "NumPad1", v, sizeof v) && !strcmp(v, "ShowDevMenu"), "NumPad1 = '%s'", v);
+    CHECK(!boot_ini_get(user_ini, "Engine.Input", "NumPad1", v, sizeof v) || !v[0], "NumPad1 = '%s'", v);
     CHECK(boot_ini_get(user_ini, "Engine.Input", "NumPad2", v, sizeof v) && !strcmp(v, "Ghost"), "NumPad2 = '%s'", v);
     CHECK(boot_ini_get(user_ini, "Engine.Input", "NumPad6", v, sizeof v) && !strcmp(v, "AddCoins 100"), "NumPad6 = '%s'", v);
     CHECK(boot_ini_get(user_ini, "Engine.Input", "W", v, sizeof v) && !strcmp(v, "MoveForward"), "W = '%s'", v);

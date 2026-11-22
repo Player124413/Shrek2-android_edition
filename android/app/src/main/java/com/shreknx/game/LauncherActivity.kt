@@ -261,8 +261,8 @@ class LauncherActivity : Activity() {
             "The current saves are kept as Save.bak-<date>."), dim = true, size = 12f)
             .apply { setPadding(0, Ui.dp(this@LauncherActivity, 6f), 0, 0) })
         c.addView(Ui.switchRow(this, L.t("Читы", "Cheats"), L.t("В игре — шестерёнка → «Читы» или оба стика геймпада (L3+R3): " +
-            "сквозь стены, полёт, бессмертие, монеты, меню разработчика (любая карта, бонусы)",
-            "In game: gear → “Cheats” or both gamepad sticks (L3+R3): noclip, fly, god mode, coins, developer menu (any map, bonuses)"),
+            "сквозь стены, полёт, бессмертие, монеты, зелья, плакаты (бонусы)",
+            "In game: gear → “Cheats” or both gamepad sticks (L3+R3): noclip, fly, god mode, coins, potions, posters (bonuses)"),
             s.cheats) { s.cheats = it })
         return c
     }

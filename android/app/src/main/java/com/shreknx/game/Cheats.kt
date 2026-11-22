@@ -7,13 +7,11 @@ import android.os.Looper
 
 // Читы поверх игры: команды игры привязаны к клавишам цифрового блока (host/boot/config.c, g_cheat_bindings —
 // тот же список, SNX_CHEATS=1 от лаунчера), меню нажимает клавишу. Открывается шестерёнкой (при включённых
-// читах) или с геймпада — нажатием обоих стиков (L3+R3). Что работает без режима разработчика — [проверить].
+// читах) или с геймпада — нажатием обоих стиков (L3+R3). Режим и меню разработчика убраны (по просьбе автора).
 object Cheats {
     class Cheat(val vk: Int, val ru: String, val en: String)
 
     val LIST = listOf(
-        Cheat(0x61, "Меню разработчика: любая карта, закладки, сюжет", "Developer menu: any map, bookmarks, story state"),
-        Cheat(0x60, "Режим разработчика вкл/выкл (нужен для меню выше)", "Developer mode on/off (needed for the menu above)"),
         Cheat(0x62, "Сквозь стены (noclip)", "Through walls (noclip)"),
         Cheat(0x63, "Полёт", "Fly"),
         Cheat(0x64, "Обычная ходьба (выключить полёт и noclip)", "Walk normally (turn off fly and noclip)"),
