@@ -260,6 +260,7 @@ tools/build.sh mac difftest_msvcr70 && UC_IGNORE_REG_BREAK=1 tools/.venv/bin/pyt
 | `SNX_SHOT=300,600`, `SNX_SHOT_DIR`, `SNX_DUMP_DRAWS=<кадр>` | PNG заднего буфера; состояние каждой отрисовки (`tools/probe/sheet.py`) |
 | `SNX_EH_TEST=<с>`, `SNX_ERR_TEST=<с>` | исключение C++ в `StaticLoadObject`; фатальная ошибка движка |
 | `SNX_CFG_TEST=<с>[,<n>[,<мс>]]`, `SNX_CFG_CHECK=1` | n подборов монеты бонусного уровня (`bonuscoins`+1 и `SaveConfig` контроллера героя) с паузой (250 мс; 0 — подряд в одном кадре, тогда каждый ждёт запись `User.ini` предыдущего), время — `[core] SaveConfig`; сверка пропусков перечитывания и `GetString` с оригиналом |
+| `SNX_SCRIPT_FIX=0` | без правки байткода `Shrek.PostLoadGame` в памяти (`runtime/script_fix.c`: метка `MainPlayer` герою на бонусных уровнях, запущенных напрямую); итог — строка `[script]` |
 | `SNX_FIELD_CHECK=1` | сверить кеш обхода свойств с полным обходом |
 | `SNX_PERF=1`, `SNX_NOVSYNC=1`, `SNX_PROF=<файл>`, `SNX_CALLSTATS=<файл>` | инструкции и такты на кадр; без vsync; профиль; счётчики входов |
 | `SNX_RENDER_THREAD=0`, `SNX_GLTHREAD=1`, `SNX_FILE_CACHE_MB` | без потока рендера; glthread Mesa; бюджет образов пакетов |

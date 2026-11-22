@@ -7,6 +7,7 @@
 #include "runtime/ini_cache.h"
 #include "runtime/process.h"
 #include "runtime/rt.h"
+#include "runtime/script_fix.h"
 
 // ---------------------------------------------------------------- обход свойств класса
 // TFieldIterator<UProperty> (Core.dll, не экспорт): от текущего поля по цепочке Children/Next, затем в
@@ -139,11 +140,14 @@ void ovr_core_collect_garbage(CPU *c)
     __atomic_add_fetch(&g_fn_epoch, 1, __ATOMIC_RELAXED);
 }
 
+// После Link байткод функции уже в памяти: исправления скриптов игры (runtime/script_fix.c)
 void ovr_core_struct_link(CPU *c)
 {
+    u32 self = c->ecx;
     __atomic_add_fetch(&g_fn_epoch, 1, __ATOMIC_RELAXED);
     RT_ENTER_GEN(c, ovr_orig_ovr_core_struct_link);  // оригинал — код гостя
     __atomic_add_fetch(&g_fn_epoch, 1, __ATOMIC_RELAXED);
+    script_fix_linked(self);
 }
 
 // ---------------------------------------------------------------- SaveConfig: перечитывание конфига в умолчания

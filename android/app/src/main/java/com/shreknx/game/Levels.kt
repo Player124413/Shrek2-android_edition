@@ -9,15 +9,16 @@ import android.widget.ScrollView
 import android.widget.TextView
 import java.io.File
 
-// Выбор уровня: карты из папки игры (Maps/*.unr) — сюжетные (имя с номера: 1_Shreks_Swamp), «книги» (Book_*:
-// меню-книга, сказка) и остальные.
-// Бонусных карт (Beanstalk_bonus, _dawn, _knight — мини-игра с монетами на ферме Джека) здесь нет: напрямую они не
-// работают (камера у ворот, нет героя, таймер стоит). В игре в них попадают только с плаката «Разыскивается»
-// (SHGame.SHInGameWantedPoster.AttempToEnterBonus, каждый третий плакат): игра делает автосохранение, задаёт
-// Shrek.WhichBonusGame (время по числу плакатов) и LevelBonusEnteredFrom, переносит текущего героя
-// (Level.ServerTravel(карта, true)), а по концу времени или падению LeaveBonusLevelTrigger загружает то
-// автосохранение. Запуск карты из лаунчера ничего этого не делает. Игра запускается сразу на карте
-// (командная строка после «--», host/boot/main.c) — минуя сюжет: инвентарь и прогресс — как с начала уровня.
+// Выбор уровня: карты из папки игры (Maps/*.unr) — сюжетные (имя с номера: 1_Shreks_Swamp), бонусные
+// (Beanstalk_bonus, _dawn, _knight — мини-игра с монетами на ферме Джека), «книги» (Book_*: меню-книга, сказка) и
+// остальные. Игра запускается сразу на карте (командная строка после «--», host/boot/main.c) — минуя сюжет:
+// инвентарь и прогресс — как с начала уровня.
+// Бонусные карты напрямую раньше теряли героя (камера у ворот, Шрек невидим, таймер стоит): скрипт игры
+// Shrek.PostLoadGame снимал с героя метку MainPlayer и возвращал её, только если герой пришёл с другого уровня
+// (в игре — с плаката «Разыскивается»). Порт исправляет байткод в памяти при загрузке (runtime/script_fix.c).
+// Время мини-игры без плакатов — самое долгое (CoinBonusGame.GameTimeLimits[3]); по концу времени или падению
+// LeaveBonusLevelTrigger загружает слот GameSlot (последний выбранный в меню игры) — монеты добавятся к нему; без
+// него уровень не закрывается — выход через меню паузы.
 object Levels {
     class Group(val title: String, val maps: List<String>)
 
@@ -36,6 +37,7 @@ object Levels {
         val other = (rest - bonus.toSet() - books.toSet()).sortedBy { it.lowercase() }
         return listOf(
             Group(L.t("Сюжет", "Story"), story),
+            Group(L.t("Бонусные уровни", "Bonus levels"), bonus),
             Group(L.t("Книги", "Books"), books),
             Group(L.t("Другие карты", "Other maps"), other),
         ).filter { it.maps.isNotEmpty() }
@@ -59,12 +61,13 @@ object Levels {
             "The level starts directly, skipping the story: inventory and progress start from scratch. " +
             "Don't save over a slot you need."), dim = true, size = 12f))
         if (all.any { isBonus(it) })
-            box.addView(Ui.label(a, L.t("Бонусных уровней (ферма Джека) здесь нет — как в оригинале, в них попадают из " +
-                "сюжета: каждый третий подобранный плакат «Разыскивается» — автосохранение и мини-игра с монетами за " +
-                "текущего героя; время вышло или упал — возврат в игру. Напрямую эти карты не работают.",
-                "Bonus levels (Jack's farm) are not listed: as in the original, you enter them from the story — every " +
-                "third wanted poster you pick up autosaves and starts the coin mini-game with the current hero; when " +
-                "time runs out or you fall, you return to the game. These maps don't work when started directly."),
+            box.addView(Ui.label(a, L.t("Бонусные уровни (ферма Джека): вступление рассказчика, затем мини-игра с " +
+                "монетами на время. Когда время выйдет или герой упадёт, игра загрузит слот, последним выбранный " +
+                "в меню игры (собранные монеты добавятся к нему, как после плаката); если сохранений нет — выход " +
+                "через меню паузы.",
+                "Bonus levels (Jack's farm): the narrator's intro, then the timed coin mini-game. When time runs out " +
+                "or the hero falls, the game loads the save slot last chosen in the game menu (the coins you " +
+                "collected are added to it, as after a wanted poster); with no saves, leave through the pause menu."),
                 dim = true, size = 12f).apply { setPadding(0, Ui.dp(a, 6f), 0, 0) })
         var dlg: AlertDialog? = null
         for (g in groups(all)) {
