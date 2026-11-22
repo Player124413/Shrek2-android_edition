@@ -21,3 +21,7 @@ void bink_video_flush(bink_video *v);  // перед декодирование�
 int bink_video_decode(bink_video *v, const u8 *packet, u32 size, int key);  // 0 — кадр готов
 // последний декодированный кадр -> поверхность (тип BINKSURFACE* в младших 4 битах flags), с (x, y), не больше rows строк
 void bink_video_copy(bink_video *v, u8 *dst, u32 pitch, u32 rows, u32 x, u32 y, u32 flags);
+
+// Ролик Movies/*.bik, который игра сейчас крутит: его текущий кадр RGBA w x h (строки сверху вниз) — 1. Для
+// d3d8_present, когда кадр ролика не попал в задний буфер (ролик больше кадра игры).
+int bink_movie_overlay(const u8 **rgba, u32 *w, u32 *h);

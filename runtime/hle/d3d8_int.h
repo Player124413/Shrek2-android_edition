@@ -160,6 +160,7 @@ int d3d8_vdecl_for(d3ddev *d, vdecl *out);          // объявление те
 void d3d8_draw(d3ddev *d, u32 prim, u32 count, int indexed, u32 first, u32 min_index, u32 num_vertices,
                const void *up_vertices, u32 up_stride, const void *up_indices, u32 up_index_fmt);
 void d3d8_bind_target(d3ddev *d);  // FBO текущих rt/ds, viewport/scissor
+extern u64 g_movie_drawn_ns;  // когда кадр ролика Bink последний раз залит в цель игрой (d3d8_res.c write_movie)
 void d3d8_present(d3ddev *d);
 void d3d8_caps_probe(d3ddev *d);
 void d3d8_prog_preload(void);  // программы прошлых запусков — в фоновую сборку (d3d8_ff.c)

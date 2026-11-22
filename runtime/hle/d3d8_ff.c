@@ -19,6 +19,7 @@
 #ifdef __ANDROID__
 #include "platform/android/perf.h"
 #endif
+#include "runtime/hle/bink.h"
 #include "runtime/hle/d3d8.h"
 #include "runtime/game/menu.h"
 #include "runtime/hle/overlay.h"
@@ -1424,9 +1425,59 @@ static void hitch_check(d3ddev *d)
     prev = cur;
 }
 
+// Ролик, кадр которого игра не вывела в задний буфер (больше кадра: 800x600 в 1200x540 и т. п. — D3DDrv тогда
+// кадр не копирует, остаются звук и чёрный экран): порт рисует текущий кадр ролика сам, вписанным в задний буфер с
+// чёрными полями, как write_movie (d3d8_res.c). Если игра сама выводит кадры ролика (write_movie за последние
+// 250 мс) — ничего.
+static void movie_overlay(d3ddev *d)
+{
+    const u8 *px;
+    u32 mw, mh;
+    if (rt_ticks_ns() - g_movie_drawn_ns < 250000000ull || !d->backbuffer || !d->backbuffer->rb ||
+        !bink_movie_overlay(&px, &mw, &mh))
+        return;
+    static GLuint tex;
+    static u32 tw, th;
+    static int logged;
+    if (!logged++)
+        fprintf(stderr, "[bink] movie %ux%u is not in the %ux%u frame: drawn by the port\n", mw, mh, d->bb_w, d->bb_h);
+    if (!tex || tw != mw || th != mh) {
+        if (!tex)
+            glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        cs_TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)mw, (GLsizei)mh, GL_RGBA, GL_UNSIGNED_BYTE, NULL, 0);
+        tw = mw;
+        th = mh;
+    } else
+        glBindTexture(GL_TEXTURE_2D, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    cs_TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)mw, (GLsizei)mh, GL_RGBA, GL_UNSIGNED_BYTE, px, (size_t)mw * 4,
+                     (size_t)mw * 4);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    GLuint fb[2];
+    glGenFramebuffers(2, fb);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fb[0]);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb[1]);
+    glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, d->backbuffer->rb);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    GLint W = (GLint)d->bb_w, H = (GLint)d->bb_h;
+    float sc = fminf((float)W / (float)mw, (float)H / (float)mh);
+    GLint w = (GLint)((float)mw * sc), h = (GLint)((float)mh * sc);
+    glBlitFramebuffer(0, 0, (GLint)mw, (GLint)mh, (W - w) / 2, (H - h) / 2, (W - w) / 2 + w, (H - h) / 2 + h,
+                      GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(2, fb);
+    d3d8_bind_target(d);
+}
+
 void d3d8_present(d3ddev *d)
 {
     game_menu_frame(d->bb_w, d->bb_h);  // состояние меню игры — для ввода хоста
+    movie_overlay(d);
     int w, h;
     plat_drawable_size(&w, &h);
     if (!d->blit_fbo)

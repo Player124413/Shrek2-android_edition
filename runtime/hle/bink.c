@@ -15,6 +15,7 @@
 #include "runtime/hle/d3d8.h"
 #include "runtime/hle/hle.h"
 #include "runtime/hle/vfs.h"
+#include "runtime/rt.h"
 
 #define BINKFROMMEMORY 0x04000000u
 #define MAX_BINK 64
@@ -33,6 +34,9 @@ typedef struct {
     u32 dec_next[4];       // кадр, который декодер ждёт следующим (иначе — сброс хвоста перекрытия)
     bink_video *vid;
     u32 vid_frame;         // последний декодированный кадр видео (~0 — нет)
+    int movie;             // ролик из файла (Movies/*.bik), не звук в пакете
+    u32 do_frame;          // кадр последнего BinkDoFrame (~0 — не было)
+    u64 tick_ns;           // последний вызов игры по этому ролику (кадр, звук, копия)
 } bink;
 
 static bink *g_bink[MAX_BINK];
@@ -184,6 +188,7 @@ void hle_binkw32__BinkOpen_8(CPU *c)
         }
         fprintf(stderr, "[bink] BinkOpen(%s) %u bytes\n", name, size);
     }
+    int from_file = !(flags & BINKFROMMEMORY);
     bink *b = d ? parse(d, size) : NULL;
     int slot = -1;
     for (int i = 0; i < MAX_BINK && slot < 0; i++)
@@ -206,6 +211,11 @@ void hle_binkw32__BinkOpen_8(CPU *c)
     wr32(g_mem, o + 40, size);
     g_bink[slot] = b;
     b->vid_frame = ~0u;
+    b->do_frame = ~0u;
+    b->movie = from_file && b->w && b->h;
+    b->tick_ns = rt_ticks_ns();
+    if (b->movie)
+        fprintf(stderr, "[bink] movie %ux%u, %u frames\n", b->w, b->h, b->frames);
     if (b->w && b->h) {
         b->vid = bink_video_new(le32(d), le32(d + 36), b->w, b->h);
         if (!b->vid)
@@ -289,6 +299,7 @@ void hle_binkw32__BinkGetTrackData_8(CPU *c)
     u32 cap = rd32(g_mem, ARG(0) + 12);
     if (bytes > cap)
         bytes = cap;
+    b->tick_ns = rt_ticks_ns();
     if (b->frame != b->dec_next[t])
         bink_audio_reset(b->dec[t]);
     b->dec_next[t] = b->frame + 1;
@@ -310,8 +321,11 @@ void hle_binkw32__BinkDoFrame_4(CPU *c)
 {
     HLE_ENTER("BinkDoFrame", 1);
     bink *b = by_obj(ARG(0));
-    if (b)
+    if (b) {
         video_decode_to(b, b->frame);
+        b->do_frame = b->frame;
+        b->tick_ns = rt_ticks_ns();
+    }
     RET(1, 0);
 }
 
@@ -320,6 +334,7 @@ void hle_binkw32__BinkNextFrame_4(CPU *c)
     HLE_ENTER("BinkNextFrame", 1);
     bink *b = by_obj(ARG(0));
     if (b) {
+        b->tick_ns = rt_ticks_ns();
         wr32(g_mem, b->obj + 16, b->frame + 1);  // LastFrameNum
         b->frame = b->frame + 1 < b->frames ? b->frame + 1 : 0;  // как SDK: после последнего — первый
         sync_obj(b);
@@ -333,7 +348,14 @@ void hle_binkw32__BinkCopyToBuffer_28(CPU *c)
 {
     HLE_ENTER("BinkCopyToBuffer", 7);
     bink *b = by_obj(ARG(0));
-    if (b) {
+    if (b && ((s32)ARG(4) < 0 || (s32)ARG(5) < 0)) {
+        // ролик больше кадра, игра поставила его левее/выше начала: не писать мимо буфера (покажет
+        // bink_movie_overlay)
+        static int warned;
+        if (!warned++)
+            fprintf(stderr, "[bink] BinkCopyToBuffer at %d,%d: outside the frame, skipped\n", (s32)ARG(4), (s32)ARG(5));
+    } else if (b) {
+        b->tick_ns = rt_ticks_ns();
         u32 pitch = ARG(2), rows = ARG(3) < b->h ? ARG(3) : b->h;
         if (b->vid && b->vid_frame != ~0u) {
             bink_video_copy(b->vid, g_mem + ARG(1), pitch, rows, ARG(4), ARG(5), ARG(6));
@@ -383,4 +405,49 @@ void hle_binkw32__BinkGetSummary_8(CPU *c)
         wr32(g_mem, s + 36, b->frame + 1);
     }
     RET(2, 0);
+}
+
+// Ролик, который игра крутит (вызовы по нему не старше 250 мс), — для показа самим портом, когда его кадр не попадает
+// в задний буфер (d3d8_present). Игра (D3DDrv) копирует кадр Bink 1:1 в середину заднего буфера и только если он
+// туда помещается: ролики игры — 800x600 и 640x480, а кадр порта на телефоне — экран x «Разрешение» (на 20:9 при
+// 50 % — 1200x540, на 720p — 780x360). Тогда звук идёт, а экран чёрный. Кадр — RGBA (R,G,B,255), строки сверху
+// вниз; буфер живёт до следующего вызова.
+int bink_movie_overlay(const u8 **rgba, u32 *w, u32 *h)
+{
+    static u8 *buf;
+    static u32 buf_size, last_obj, last_frame = ~0u;
+    u64 now = rt_ticks_ns();
+    bink *m = NULL;
+    for (int i = 0; i < MAX_BINK; i++) {
+        bink *b = g_bink[i];
+        if (b && b->movie && b->vid && now - b->tick_ns < 250000000ull && (!m || b->tick_ns > m->tick_ns))
+            m = b;
+    }
+    if (!m)
+        return 0;
+    u32 f = m->do_frame != ~0u ? m->do_frame : m->frame;
+    video_decode_to(m, f);
+    if (m->vid_frame == ~0u)
+        return 0;
+    u32 need = m->w * m->h * 4;
+    if (need > buf_size) {
+        u8 *nb = realloc(buf, need);
+        if (!nb)
+            return 0;
+        buf = nb;
+        buf_size = need;
+        last_obj = 0;
+    }
+    if (m->obj != last_obj || m->vid_frame != last_frame) {
+        memset(buf, 0, need);
+        bink_video_copy(m->vid, buf, m->w * 4, m->h, 0, 0, 4 /* BINKSURFACE32R: R,G,B,x */);
+        for (u32 i = 3; i < need; i += 4)
+            buf[i] = 255;
+        last_obj = m->obj;
+        last_frame = m->vid_frame;
+    }
+    *rgba = buf;
+    *w = m->w;
+    *h = m->h;
+    return 1;
 }

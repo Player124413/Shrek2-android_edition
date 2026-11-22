@@ -6,6 +6,7 @@
 #include <stdlib.h>
 
 #include "runtime/heap.h"
+#include "runtime/rt.h"
 #include "runtime/hle/d3d8_int.h"
 
 #ifndef GL_COMPRESSED_RGBA_S3TC_DXT1_EXT
@@ -294,6 +295,8 @@ static u32 surf_lock(d3dsurf *s, u32 locked_rect, u32 rect, u32 flags)
     return D3D_OK;
 }
 
+u64 g_movie_drawn_ns;
+
 // Кадр ролика Bink (d3d8_movie_frame: D3DDrv выводит его прямо в залоченный задний буфер): только его
 // прямоугольник — в постоянную текстуру и blit в цель, растянутый с сохранением пропорций (на ПК 640x480/800x600
 // почти занимали экран, а в 1920x1080 были бы окошком), поля вокруг — чёрные.
@@ -341,6 +344,7 @@ static int write_movie(d3dsurf *s, const d3dfmt *f)
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glDeleteFramebuffers(2, fb);
     d3d8_bind_target(d3d8_dev());  // и маски/scissor — заново перед следующей отрисовкой
+    g_movie_drawn_ns = rt_ticks_ns();
     return 1;
 }
 
