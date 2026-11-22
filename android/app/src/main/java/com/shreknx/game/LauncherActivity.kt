@@ -63,6 +63,30 @@ class LauncherActivity : Activity() {
         }
         refreshStatus()
         Updater.resumePending(this)  // вернулись из настроек «Установка неизвестных приложений»
+        if (fromGame) { fromGame = false; explainFailedStart() }
+    }
+
+    private var fromGame = false
+
+    // Игра не стартовала (host/boot/main.c: «[boot] process init failed») — вместо молчаливого возврата в лаунчер
+    // объяснить причину по строкам загрузчика из snx.log
+    private fun explainFailedStart() {
+        val log = try { Settings.logFile(this).readText().takeLast(64 * 1024) } catch (e: Exception) { return }
+        if (!log.contains("[boot] process init failed")) return
+        val loader = log.lines().filter { it.startsWith("[loader]") }.takeLast(6)
+        val missing = GameFolder.missingModules(s.gameDir, Settings.moduleDir(this))
+        val msg = when {
+            missing.isNotEmpty() -> GameFolder.missingText(missing)
+            loader.any { it.contains("differs from the one used") } -> L.t(
+                "Файлы игры не совпадают с теми, из которых собран этот APK (другая версия или копия игры, " +
+                    "либо файл повреждён). Импортируйте ту же копию игры.",
+                "The game files differ from the ones this APK was built from (another version or copy, or a damaged " +
+                    "file). Import the same game copy.")
+            else -> L.t("Игра не запустилась.", "The game failed to start.")
+        } + (if (loader.isNotEmpty()) "\n\n" + loader.joinToString("\n") else "")
+        AlertDialog.Builder(this).setTitle(L.t("Игра не запустилась", "The game failed to start")).setMessage(msg)
+            .setPositiveButton(L.t("Импорт из папки…", "Import from folder…")) { _, _ -> pickImport() }
+            .setNegativeButton("OK", null).show()
     }
 
     private var stale = false
@@ -161,8 +185,15 @@ class LauncherActivity : Activity() {
 
     private fun refreshStatus() {
         if (!::status.isInitialized) return
+        val mods = Settings.moduleDir(this)
+        val missing = GameFolder.missingModules(s.gameDir, mods)
         val err = GameFolder.check(s.gameDir)
-        status.text = err?.let { "⚠ $it" } ?: L.t("✓ Игра найдена", "✓ Game found")
+            ?: if (missing.isNotEmpty()) L.t("Пропали System/${missing.joinToString(", ")} — «Импорт из папки…»",
+                "Missing System/${missing.joinToString(", ")} — “Import from folder…”") else null
+        val backup = GameFolder.fromBackup(s.gameDir, mods)
+        status.text = err?.let { "⚠ $it" } ?: (L.t("✓ Игра найдена", "✓ Game found") +
+            if (backup.isNotEmpty()) L.t(" (${backup.joinToString(", ")} — из копии приложения)",
+                " (${backup.joinToString(", ")} from the app's copy)") else "")
         status.setTextColor(if (err == null) Ui.ACCENT else 0xFFFFB74D.toInt())
         pathLabel?.text = s.gameDir
         variantLabel?.text = variantText()
@@ -441,11 +472,21 @@ class LauncherActivity : Activity() {
                 .setNegativeButton(L.t("Отмена", "Cancel"), null).show()
             return
         }
+        val missing = GameFolder.missingModules(s.gameDir, Settings.moduleDir(this))
+        if (missing.isNotEmpty()) {
+            AlertDialog.Builder(this).setTitle(L.t("Не хватает файлов игры", "Game files are missing"))
+                .setMessage(GameFolder.missingText(missing))
+                .setPositiveButton(L.t("Импорт из папки…", "Import from folder…")) { _, _ -> pickImport() }
+                .setNeutralButton(L.t("Всё равно запустить", "Start anyway")) { _, _ -> launch() }
+                .setNegativeButton(L.t("Отмена", "Cancel"), null).show()
+            return
+        }
         launch()
     }
 
     private fun launch(map: String? = null) {
         stale = true
+        fromGame = true
         // Лаунчер виден — значит, игры поверх него нет (она в той же задаче). Живой процесс :game тогда — остаток
         // прошлого запуска (завис на выходе): новая игра попала бы в него и не отвечала бы на касания. Завершить
         // и дождаться, пока система его отпустит (до 2 с), затем — запуск с чистого листа.

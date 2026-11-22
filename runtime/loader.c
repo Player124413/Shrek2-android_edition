@@ -1,8 +1,12 @@
 // Загрузка PE-модулей игры в гостевую память по фиксированной карте адресов.
 #include "runtime/loader.h"
 
+#include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <strings.h>
 
 #include "runtime/rt.h"
 
@@ -35,22 +39,87 @@ u32 rt_hle_thunk(const char *dll, guest_fn fn)
     return a;
 }
 
+// файл целиком; NULL — с errno (EIO — ошибка чтения)
 static u8 *read_file(const char *path, size_t *size)
 {
     FILE *f = fopen(path, "rb");
     if (!f)
         return NULL;
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
+    long n = -1;
+    if (fseek(f, 0, SEEK_END) == 0)
+        n = ftell(f);
     fseek(f, 0, SEEK_SET);
-    u8 *buf = malloc((size_t)n);
+    u8 *buf = n >= 0 ? malloc(n ? (size_t)n : 1) : NULL;
     if (buf && fread(buf, 1, (size_t)n, f) != (size_t)n) {
         free(buf);
         buf = NULL;
     }
     fclose(f);
-    *size = (size_t)n;
+    if (!buf)
+        errno = n < 0 ? EIO : errno ? errno : EIO;
+    *size = n > 0 ? (size_t)n : 0;
     return buf;
+}
+
+// dir/name; нет такого — то же имя без учёта регистра (Game.exe с ПК, раздел телефона различает регистр)
+static u8 *read_module_file(const char *dir, const char *name, char *path, size_t cap, size_t *size)
+{
+    snprintf(path, cap, "%s/%s", dir, name);
+    u8 *f = read_file(path, size);
+    if (f || errno != ENOENT)
+        return f;
+    DIR *d = opendir(dir);
+    if (!d) {
+        errno = ENOENT;
+        return NULL;
+    }
+    struct dirent *e;
+    while ((e = readdir(d)))
+        if (!strcasecmp(e->d_name, name) && strcmp(e->d_name, name)) {
+            snprintf(path, cap, "%s/%s", dir, e->d_name);
+            closedir(d);
+            return read_file(path, size);
+        }
+    closedir(d);
+    errno = ENOENT;
+    return NULL;
+}
+
+static int module_matches(const rt_module_desc *d, const u8 *file, size_t size)
+{
+    return size == d->file_size && crc32_buf(file, size) == d->crc32;
+}
+
+// Копия модулей во внутренней памяти приложения (Android: SNX_MODULE_DIR = files/modules/<версия>, лаунчер).
+// На ZTE Blade 20 Smart (Android 9) игра «через некоторое время» перестала запускаться: System/game.exe в папке
+// игры (Android/data/…, доступна USB, файловым менеджерам, «очистке» и антивирусам — .exe с ПК им кажется
+// мусором или вирусом) пропал. Внутреннюю память другие приложения не видят: после удачной загрузки модуля из
+// System порт кладёт туда его копию (запись во временный файл и rename), а без файла в System грузит копию.
+static void module_backup(const rt_module_desc *d, const u8 *file, size_t size, const char *bdir)
+{
+    char dst[1100], tmp[1110];
+    snprintf(dst, sizeof dst, "%s/%s", bdir, d->name);
+    FILE *f = fopen(dst, "rb");
+    if (f) {  // уже есть того же размера — CRC проверится при загрузке копии
+        long n = fseek(f, 0, SEEK_END) == 0 ? ftell(f) : -1;
+        fclose(f);
+        if (n == (long)size)
+            return;
+    }
+    snprintf(tmp, sizeof tmp, "%s.tmp", dst);
+    f = fopen(tmp, "wb");
+    if (!f) {
+        fprintf(stderr, "[loader] cannot back up %s to %s: %s\n", d->name, bdir, strerror(errno));
+        return;
+    }
+    int ok = fwrite(file, 1, size, f) == size;
+    ok = fclose(f) == 0 && ok;
+    if (ok && rename(tmp, dst) == 0)
+        fprintf(stderr, "[loader] %s: backup copy saved to %s\n", d->name, bdir);
+    else {
+        fprintf(stderr, "[loader] cannot back up %s to %s: %s\n", d->name, bdir, strerror(errno));
+        remove(tmp);
+    }
 }
 
 static u32 le32(const u8 *p) { u32 v; memcpy(&v, p, 4); return v; }
@@ -58,19 +127,40 @@ static u16 le16(const u8 *p) { u16 v; memcpy(&v, p, 2); return v; }
 
 int rt_load_module(const rt_module_desc *d, const char *dir)
 {
-    char path[1024];
-    snprintf(path, sizeof path, "%s/%s", dir, d->name);
+    char path[1100];
     size_t size = 0;
-    u8 *file = read_file(path, &size);
-    if (!file) {
-        fprintf(stderr, "[loader] cannot read %s\n", path);
-        return -1;
-    }
-    if (size != d->file_size || crc32_buf(file, size) != d->crc32) {
-        fprintf(stderr, "[loader] %s: file differs from the one used for recompilation (size %zu/%u, crc %08x/%08x)\n",
-                d->name, size, d->file_size, crc32_buf(file, size), d->crc32);
+    const char *bdir = getenv("SNX_MODULE_DIR");
+    if (bdir && !*bdir)
+        bdir = NULL;
+    u8 *file = read_module_file(dir, d->name, path, sizeof path, &size);
+    int err = file ? 0 : errno;
+    if (file && module_matches(d, file, size)) {
+        if (bdir)
+            module_backup(d, file, size, bdir);
+    } else {
+        if (file)
+            fprintf(stderr, "[loader] %s: file differs from the one used for recompilation (size %zu/%u, crc %08x/%08x)\n",
+                    d->name, size, d->file_size, crc32_buf(file, size), d->crc32);
+        else
+            fprintf(stderr, "[loader] cannot read %s: %s\n", path, strerror(err));
         free(file);
-        return -1;
+        file = NULL;
+        if (bdir) {
+            char bpath[1100];
+            size_t bsize = 0;
+            u8 *b = read_module_file(bdir, d->name, bpath, sizeof bpath, &bsize);
+            if (b && module_matches(d, b, bsize)) {
+                fprintf(stderr, "[loader] %s: using the backup copy %s\n", d->name, bpath);
+                file = b;
+                size = bsize;
+            } else {
+                fprintf(stderr, "[loader] %s: no valid backup copy in %s%s\n", d->name, bdir,
+                        b ? " (differs)" : "");
+                free(b);
+            }
+        }
+        if (!file)
+            return -1;
     }
     u32 pe = le32(file + 0x3C);
     u16 nsec = le16(file + pe + 6);

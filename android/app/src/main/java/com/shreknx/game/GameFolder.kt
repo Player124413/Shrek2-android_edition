@@ -23,6 +23,35 @@ object GameFolder {
         return null
     }
 
+    // Модули игры (PE: их грузит runtime/loader.c, файл должен совпадать байт в байт). Пропали из System (на ZTE
+    // Blade 20 Smart game.exe «через некоторое время» исчез: очистка памяти или антивирус удаляют .exe с ПК) и
+    // нет копии во внутренней памяти (Settings.moduleDir, её делает загрузчик после удачного запуска) —
+    // список пропавших, иначе пусто.
+    val MODULES = listOf("game.exe", "Core.dll", "Engine.dll")
+
+    fun missingModules(gameDir: String, moduleDir: File): List<String> {
+        val sys = child(File(gameDir), "System") ?: return emptyList()  // нет System — скажет check()
+        return MODULES.filter { child(sys, it)?.takeIf { f -> f.length() > 0 } == null && child(moduleDir, it) == null }
+    }
+
+    // модули, которых нет в System, но есть копия (игра запустится с копией)
+    fun fromBackup(gameDir: String, moduleDir: File): List<String> {
+        val sys = child(File(gameDir), "System") ?: return emptyList()
+        return MODULES.filter { child(sys, it) == null && child(moduleDir, it) != null }
+    }
+
+    fun missingText(missing: List<String>): String = L.t(
+        "В папке игры пропали файлы: System/${missing.joinToString(", ")}.\n\n" +
+            "Чаще всего их удаляет «Очистка» / «Диспетчер телефона» или антивирус: файлы .exe и .dll с ПК они " +
+            "считают мусором или вирусом. Скопируйте их заново — «Импорт из папки…» (та же копия игры) или по USB в " +
+            "System. После следующего удачного запуска порт хранит копию этих файлов во внутренней памяти " +
+            "приложения, куда очистка и антивирусы не добираются, — и игра запустится, даже если их снова удалят.",
+        "Files are missing from the game folder: System/${missing.joinToString(", ")}.\n\n" +
+            "Usually a phone cleaner or an antivirus deletes them: .exe and .dll files from a PC look like junk or " +
+            "malware to them. Copy them again — “Import from folder…” (the same game copy) or over USB into " +
+            "System. After the next successful start the port keeps a copy of these files in the app's internal " +
+            "storage, out of reach of cleaners and antiviruses, so the game starts even if they are deleted again.")
+
     class Progress(var files: Int = 0, var bytes: Long = 0, var current: String = "")
 
     // рекурсивное копирование дерева SAF в dst; cancel() — прервать; onProgress зовётся из потока копирования

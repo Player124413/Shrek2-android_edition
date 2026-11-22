@@ -118,6 +118,8 @@ class Settings(private val ctx: Context) {
         env("SNX_PAD_CAMERA", if (padCamera == 1) "joystick" else "mouse")
         if (cheats) env("SNX_CHEATS", "1")
         env("SNX_SHADER_CACHE", File(ctx.cacheDir, "shaders").absolutePath)
+        // копия game.exe и .dll во внутренней памяти (runtime/loader.c): их не удалит очистка или антивирус
+        env("SNX_MODULE_DIR", moduleDir(ctx).apply { mkdirs() }.absolutePath)
         val tahoma = File(gameDir, "System/tahoma.ttf")
         if (tahoma.exists()) env("SNX_GDI_FONT", tahoma.absolutePath)
         for (line in extraEnv.lines()) {
@@ -136,6 +138,8 @@ class Settings(private val ctx: Context) {
         fun userDir(ctx: Context): File = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir,
             if (GameVariant.isUniversal() && GameVariant.effective(ctx) == GameVariant.RUS) "user-rus" else "user")
         fun logFile(ctx: Context): File = File(userDir(ctx), "snx.log")
+        // внутренняя память приложения (не Android/data): копии модулей игры, у версий игры — свои
+        fun moduleDir(ctx: Context): File = File(ctx.filesDir, "modules/" + variant(ctx))
     }
 }
 
