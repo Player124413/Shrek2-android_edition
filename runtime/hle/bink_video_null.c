@@ -33,3 +33,18 @@ void bink_video_copy(bink_video *v, u8 *dst, u32 pitch, u32 rows, u32 x, u32 y, 
     (void)y;
     (void)flags;
 }
+
+void bink_video_prefetch(bink_video *v, const u8 *packet, u32 size, int key)
+{
+    (void)v;
+    (void)packet;
+    (void)size;
+    (void)key;
+}
+
+void bink_video_stats(bink_video *v, double *dec_ms, double *wait_ms, u32 *frames)
+{
+    (void)v;
+    *dec_ms = *wait_ms = 0;
+    *frames = 0;
+}

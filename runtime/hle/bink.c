@@ -37,6 +37,8 @@ typedef struct {
     int movie;             // ролик из файла (Movies/*.bik), не звук в пакете
     u32 do_frame;          // кадр последнего BinkDoFrame (~0 — не было)
     u64 tick_ns;           // последний вызов игры по этому ролику (кадр, звук, копия)
+    u64 stats_ns, copy_ns; // статистика (movie_stats): начало отрезка, время перевода кадров
+    u32 copy_n;
 } bink;
 
 static bink *g_bink[MAX_BINK];
@@ -137,6 +139,29 @@ static const u8 *video_packet(bink *b, u32 f, u32 *len)
     return b->data + p;
 }
 
+// Раз в 2 с, пока ролик идёт: скорость декодирования и перевода кадра в snx.log
+static void movie_stats(bink *b)
+{
+    u64 now = rt_ticks_ns();
+    if (!b->movie || !b->vid)
+        return;
+    if (!b->stats_ns) {
+        b->stats_ns = now;
+        return;
+    }
+    if (now - b->stats_ns < 2000000000ull)
+        return;
+    double dec, wait;
+    u32 n;
+    bink_video_stats(b->vid, &dec, &wait, &n);
+    fprintf(stderr, "[bink] movie %ux%u: %u frames in %.1f s, decode %.1f ms/frame (waited %.1f), copy %.1f ms\n",
+            b->w, b->h, n, (double)(now - b->stats_ns) / 1e9, dec, wait,
+            b->copy_n ? (double)b->copy_ns / 1e6 / (double)b->copy_n : 0.0);
+    b->stats_ns = now;
+    b->copy_ns = 0;
+    b->copy_n = 0;
+}
+
 // Декодировать кадр f; если он не следующий — с ближайшего ключевого (или с последнего декодированного)
 static void video_decode_to(bink *b, u32 f)
 {
@@ -154,6 +179,13 @@ static void video_decode_to(bink *b, u32 f)
             bink_video_decode(b->vid, p, n, b->key[i]);
     }
     b->vid_frame = f;
+    if (f + 1 < b->frames) {  // следующий кадр — в фоне, пока игра выводит этот
+        u32 n;
+        const u8 *p = video_packet(b, f + 1, &n);
+        if (p && n)
+            bink_video_prefetch(b->vid, p, n, b->key[f + 1]);
+    }
+    movie_stats(b);
 }
 
 // BinkOpen(name, flags): имя файла гостя или (BINKFROMMEMORY) указатель на данные
@@ -358,7 +390,10 @@ void hle_binkw32__BinkCopyToBuffer_28(CPU *c)
         b->tick_ns = rt_ticks_ns();
         u32 pitch = ARG(2), rows = ARG(3) < b->h ? ARG(3) : b->h;
         if (b->vid && b->vid_frame != ~0u) {
+            u64 t0 = rt_ticks_ns();
             bink_video_copy(b->vid, g_mem + ARG(1), pitch, rows, ARG(4), ARG(5), ARG(6));
+            b->copy_ns += rt_ticks_ns() - t0;
+            b->copy_n++;
             d3d8_movie_frame(ARG(1), pitch, ARG(4), ARG(5), b->w, rows);
         }
         else
@@ -439,10 +474,12 @@ int bink_movie_overlay(const u8 **rgba, u32 *w, u32 *h)
         last_obj = 0;
     }
     if (m->obj != last_obj || m->vid_frame != last_frame) {
-        memset(buf, 0, need);
-        bink_video_copy(m->vid, buf, m->w * 4, m->h, 0, 0, 4 /* BINKSURFACE32R: R,G,B,x */);
-        for (u32 i = 3; i < need; i += 4)
-            buf[i] = 255;
+        if (m->obj != last_obj)
+            memset(buf, 0, need);  // кадр декодера мог быть меньше заголовка
+        u64 t0 = rt_ticks_ns();
+        bink_video_copy(m->vid, buf, m->w * 4, m->h, 0, 0, 4 /* BINKSURFACE32R: R,G,B, альфа 255 */);
+        m->copy_ns += rt_ticks_ns() - t0;
+        m->copy_n++;
         last_obj = m->obj;
         last_frame = m->vid_frame;
     }

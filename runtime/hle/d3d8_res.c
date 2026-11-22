@@ -237,6 +237,15 @@ d3dbuf *d3d8_buf_from(u32 obj)
     return vt == g_vt_vb || vt == g_vt_ib ? com_host(obj) : NULL;
 }
 
+// Ролик рисует порт (movie_overlay: кадр больше заднего буфера): игра всё равно блокирует задний буфер на каждом
+// кадре ролика (копия Bink мимо), и чтение FBO при Lock (glReadPixels — ожидание всего ГП) и заливка при Unlock
+// стоили бы десятков мс на кадр. Задний буфер в это время целиком перекрывает кадр ролика — не читаем и не заливаем.
+static int overlay_target(const d3dsurf *s)
+{
+    d3ddev *d = d3d8_dev();
+    return d && s == d->backbuffer && g_movie_overlay_ns && rt_ticks_ns() - g_movie_overlay_ns < 250000000ull;
+}
+
 // Блокировка поверхности: уровень текстуры, самостоятельная поверхность в памяти или цель рендера
 static u32 surf_lock(d3dsurf *s, u32 locked_rect, u32 rect, u32 flags)
 {
@@ -262,7 +271,7 @@ static u32 surf_lock(d3dsurf *s, u32 locked_rect, u32 rect, u32 flags)
         int keep = !(flags & LOCK_DISCARD);
         if (s->tex && keep && (s->tex->filled & (1u << s->level)))
             read_level(s->tex, s->face, (u32)s->level, g_mem + s->mem);
-        else if (s->rb && keep && !s->movie_mode) {
+        else if (s->rb && keep && !s->movie_mode && !overlay_target(s)) {
             // цель рендера: прочитать заблокированный прямоугольник из её FBO (снимок экрана; ReduceMouseLag
             // блокирует 1x1 каждый кадр — ради ожидания GPU). Во время ролика не читаем: заливается только
             // кадр ролика (write_movie), остальное в памяти блокировки не нужно
@@ -295,7 +304,7 @@ static u32 surf_lock(d3dsurf *s, u32 locked_rect, u32 rect, u32 flags)
     return D3D_OK;
 }
 
-u64 g_movie_drawn_ns;
+u64 g_movie_drawn_ns, g_movie_overlay_ns;
 
 // Кадр ролика Bink (d3d8_movie_frame: D3DDrv выводит его прямо в залоченный задний буфер): только его
 // прямоугольник — в постоянную текстуру и blit в цель, растянутый с сохранением пропорций (на ПК 640x480/800x600
@@ -357,8 +366,8 @@ static void write_target(d3dsurf *s, const d3dfmt *f)
     int was_movie = s->movie_mode, movie = s->has_movie;
     s->has_movie = 0;
     s->movie_mode = movie && write_movie(s, f);
-    if (s->movie_mode || was_movie)
-        return;  // кадр ролика залит; или цель не читалась при Lock (ролик кончился) — память устарела
+    if (s->movie_mode || was_movie || overlay_target(s))
+        return;  // кадр ролика залит; или цель не читалась при Lock (ролик кончился, ролик рисует порт)
     if (r <= l || b <= t)
         return;
     GLuint tex, fb[2];

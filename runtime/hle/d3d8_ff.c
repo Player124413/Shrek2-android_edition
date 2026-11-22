@@ -1473,6 +1473,7 @@ static void movie_overlay(d3ddev *d)
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glDeleteFramebuffers(2, fb);
     d3d8_bind_target(d);
+    g_movie_overlay_ns = rt_ticks_ns();
 }
 
 void d3d8_present(d3ddev *d)
