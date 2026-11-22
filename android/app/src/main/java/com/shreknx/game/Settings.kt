@@ -110,6 +110,7 @@ class Settings(private val ctx: Context) {
         fun env(k: String, v: String) { a += "--env"; a += "$k=$v" }
         env("SNX_RENDER_SCALE", "%.3f".format(java.util.Locale.ROOT, renderScale))
         if (fpsCap > 0) env("SNX_FPS_CAP", fpsCap.toString())
+        else env("SNX_NOVSYNC", "1")  // «Нет»: без vsync — кадров больше частоты экрана (platform/window.c)
         when (aspect) { 1 -> env("SNX_ASPECT", "16:9"); 2 -> env("SNX_ASPECT", "4:3") }
         if (tex16) env("SNX_TEX16", "1")
         env("SNX_SHOW_FPS", if (showFps) "1" else "0")

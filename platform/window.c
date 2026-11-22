@@ -318,7 +318,8 @@ void plat_set_display(float hz, int fps_cap)
     static float old_hz = -1;
     static int old_cap = -1;
     if (fabsf(old_hz - hz) > 0.5f || old_cap != fps_cap)
-        SDL_Log("display %.1f Hz, FPS cap %d: %s", (double)hz, fps_cap, paced ? "vsync pacing" : "sleep pacing");
+        SDL_Log("display %.1f Hz, FPS cap %d: %s", (double)hz, fps_cap,
+                paced ? "vsync pacing" : fps_cap > 0 ? "sleep pacing" : SDL_getenv("SNX_NOVSYNC") ? "uncapped, no vsync" : "vsync");
     old_hz = hz;
     old_cap = fps_cap;
     atomic_store(&g_vsync_paced, paced);

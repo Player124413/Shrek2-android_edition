@@ -71,9 +71,28 @@ class GameActivity : SDLActivity(), InputManager.InputDeviceListener, DisplayMan
     // Режим экрана под ограничение FPS: частота, равная ему (60 Гц при 60 FPS), иначе самая низкая кратная.
     // Без этого на экране 90/120 Гц ограничитель засыпал между обновлениями экрана и кадры шли рывками
     // (8/17/25 мс вперемешку), а при равной частоте кадры ровно отмеряет vsync (platform/window.c plat_set_display).
+    // «Нет» (cap 0) — самая высокая частота экрана: иначе система держит приложение на 60 Гц, и без ограничения
+    // всё равно было ровно 60 FPS (vsync выключен отдельно: SNX_NOVSYNC, Settings.gameArgs).
+    private fun maxMode(): Display.Mode? {
+        if (Build.VERSION.SDK_INT < 23) return null
+        @Suppress("DEPRECATION")
+        val d = windowManager.defaultDisplay ?: return null
+        val cur = d.mode
+        return d.supportedModes.filter { it.physicalWidth == cur.physicalWidth && it.physicalHeight == cur.physicalHeight }
+            .maxByOrNull { it.refreshRate }
+    }
+
     private fun pickDisplayMode() {
         val cap = settings.fpsCap
-        if (cap <= 0 || Build.VERSION.SDK_INT < 23) return
+        if (Build.VERSION.SDK_INT < 23) return
+        if (cap <= 0) {
+            val m = maxMode() ?: return
+            val lp = window.attributes
+            lp.preferredDisplayModeId = m.modeId
+            lp.preferredRefreshRate = m.refreshRate
+            window.attributes = lp
+            return
+        }
         @Suppress("DEPRECATION")
         val d = windowManager.defaultDisplay ?: return
         val cur = d.mode
@@ -93,10 +112,12 @@ class GameActivity : SDLActivity(), InputManager.InputDeviceListener, DisplayMan
     // Частота поверхности (Android 11+): системе — что игра идёт ровно cap кадров в секунду
     private fun setSurfaceFrameRate() {
         val cap = settings.fpsCap
-        if (cap <= 0 || Build.VERSION.SDK_INT < 30) return
+        if (Build.VERSION.SDK_INT < 30) return
         try {
             val s = SDLActivity.mSurface?.holder?.surface ?: return
-            if (s.isValid) s.setFrameRate(cap.toFloat(), Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+            if (!s.isValid) return
+            if (cap > 0) s.setFrameRate(cap.toFloat(), Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+            else maxMode()?.let { s.setFrameRate(it.refreshRate, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT) }
         } catch (e: Exception) {
         }
     }

@@ -298,6 +298,8 @@ class LauncherActivity : Activity() {
             val fps = listOf(30, 45, 60, 0)
             holder.addView(Ui.choiceRow(this, L.t("Ограничение FPS", "FPS limit"), listOf("30", "45", "60", L.t("Нет", "Off")),
                 fps.indexOf(s.fpsCap).let { if (it < 0) 3 else it }) { s.fpsCap = fps[it] })
+            holder.addView(Ui.label(this, L.t("«Нет» — без ограничения: экран на самой высокой частоте, без vsync (сильнее греется и садит батарею)",
+                "“Off” — uncapped: the screen at its highest refresh rate, no vsync (more heat and battery drain)"), dim = true, size = 12f))
             holder.addView(Ui.choiceRow(this, L.t("Формат кадра", "Aspect ratio"),
                 listOf(L.t("Весь экран", "Full screen"), "16:9", "4:3"), s.aspect.coerceIn(0, 2)) { s.aspect = it })
             holder.addView(Ui.label(this, L.t(
