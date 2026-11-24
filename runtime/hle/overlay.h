@@ -1,7 +1,7 @@
 // Слой интерфейса порта поверх кадра игры: текст (FreeType; на Switch — системный шрифт) и значки кнопок
 // геймпада Switch. Список прямоугольников строит поток гостя при показе кадра (d3d8_present), рисует поток
-// рендера прямо в задний буфер перед выводом на экран — координаты в пикселях заднего буфера, начало вверху
-// слева (как у Bounds элементов меню игры).
+// рендера поверх пост-прохода прямо в окно (fbo=0, квадратные пиксели 1:1) или в заданный FBO — координаты в
+// пикселях цели, начало вверху слева.
 #pragma once
 #include "runtime/abi.h"
 
@@ -15,11 +15,13 @@ typedef enum {
 } ov_button;
 
 void ov_begin(void);                                                   // новый список (поток гостя)
-float ov_text(float x, float y, float h, u32 rgba, const char *s);     // y — верх строки, h — кегль; -> ширина
+float ov_text(float x, float y, float h, u32 rgba, const char *s);     // UTF-8 (ASCII + кириллица); y — верх, h — кегль; -> ширина
 float ov_text_width(float h, const char *s);
 float ov_icon(float x, float y, float h, ov_button b);                 // значок высотой h; -> ширина
 float ov_icon_width(float h, ov_button b);
 void ov_rect(float x, float y, float w, float h, u32 rgba);            // залитый прямоугольник
+// Дополнительная отрисовка поверх слоя меню (например, Quick Menu порта); вызывается в потоке гостя из ov_flush.
+void ov_set_draw_hook(void (*fn)(int w, int h));
 // Нарисовать список в FBO fbo размером w x h (поток гостя ставит в очередь рендера; пустой — ничего).
 void ov_flush(u32 fbo, int w, int h);
 

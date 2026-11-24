@@ -66,6 +66,8 @@ bink_audio *bink_audio_new(u32 rate, u32 channels, int dct, int revision)
         return NULL;
     }
     bink_audio *a = calloc(1, sizeof *a);
+    if (!a)
+        return NULL;
     a->nbits = rate < 22050 ? 9 : rate < 44100 ? 10 : 11;
     a->n = 1u << a->nbits;
     a->overlap = a->n / 16;
@@ -73,13 +75,19 @@ bink_audio *bink_audio_new(u32 rate, u32 channels, int dct, int revision)
     a->root = (float)a->n / (sqrtf((float)a->n) * 32768.0f);
     for (int i = 0; i < 96; i++)
         a->quant_table[i] = expf((float)i * 0.15289164787221953823f) * a->root;
-    u32 half = (rate + 1) / 2;
+    u64 half = ((u64)rate + 1ull) / 2ull;
     for (a->nbands = 1; a->nbands < 25; a->nbands++)
         if (half <= crit_freq[a->nbands - 1])
             break;
     a->bands[0] = 2;
-    for (u32 i = 1; i < a->nbands; i++)
-        a->bands[i] = (crit_freq[i - 1] * a->n / half) & ~1u;
+    for (u32 i = 1; i < a->nbands; i++) {
+        u32 bi = (u32)(((u64)crit_freq[i - 1] * a->n / half) & ~1ull);
+        if (bi < a->bands[i - 1])
+            bi = a->bands[i - 1];
+        if (bi > a->n)
+            bi = a->n;
+        a->bands[i] = bi;
+    }
     a->bands[a->nbands] = a->n;
     const double pi = 3.14159265358979323846;
     for (u32 k = 0; k < a->n; k++) {
@@ -152,7 +160,7 @@ static int decode_block(bink_audio *a, bits *b)
     get(b, 2);
     for (u32 ch = 0; ch < a->channels; ch++) {
         float *c = a->coef[ch], quant[25];
-        if (b->end - b->pos < 58 + a->nbands * 8)
+        if (b->pos > b->end || b->end - b->pos < 58 + a->nbands * 8)
             return 0;
         c[0] = get_float(b) * a->root;
         c[1] = get_float(b) * a->root;
@@ -170,15 +178,16 @@ static int decode_block(bink_audio *a, bits *b)
             if (!width) {
                 memset(c + i, 0, (j - i) * sizeof *c);
                 i = j;
-                while (a->bands[k] < i)
+                while (k < a->nbands && a->bands[k] < i)
                     q = quant[k++];
                 continue;
             }
-            u32 most = b->pos + (j - i) * (width + 1);  // группа целиком внутри пакета — без проверок, значение и
-            if (most <= b->end && (most >> 3) + 8 <= (b->end >> 3)) {  // знак одним чтением
+            u32 need_bits = (j - i) * (width + 1);
+            if (b->pos <= b->end && need_bits <= b->end - b->pos &&
+                ((b->pos + need_bits) >> 3) + 8 <= (b->end >> 3)) {  // группа целиком внутри пакета — без проверок
                 u32 pos = b->pos, mask = (1u << width) - 1;
                 for (; i < j; i++) {
-                    if (a->bands[k] == i)
+                    while (k < a->nbands && a->bands[k] <= i)
                         q = quant[k++];
                     u64 w;
                     memcpy(&w, b->p + (pos >> 3), 8);
@@ -189,7 +198,7 @@ static int decode_block(bink_audio *a, bits *b)
                 b->pos = pos;
             }
             for (; i < j; i++) {
-                if (a->bands[k] == i)
+                while (k < a->nbands && a->bands[k] <= i)
                     q = quant[k++];
                 u32 v = get(b, width);
                 c[i] = v ? (get(b, 1) ? -q : q) * (float)v : 0.0f;
@@ -212,21 +221,30 @@ static int decode_block(bink_audio *a, bits *b)
 
 static s16 to_s16(float f)
 {
+    if (!(f == f))  // NaN из повреждённого потока
+        return 0;
+    if (f >= 1.0f)
+        return 32767;
+    if (f <= -1.0f)
+        return -32768;
     long v = lrintf(f * 32768.0f);
     return (s16)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
 }
 
 u32 bink_audio_decode(bink_audio *a, const u8 *packet, u32 bytes, s16 *out, u32 max)
 {
-    if (!a)
+    // Предел 0x0FFFFFFF байт (< 2^31 бит) оставляет запас до UINT32_MAX, чтобы b.pos в decode_block не переполнял u32
+    if (!a || !packet || !out || !bytes || !max || bytes > 0x0FFFFFFFu)
         return 0;
-    bits b = {packet, 0, bytes * 8};
+    bits b = {packet, 0, bytes * 8u};
     u32 got = 0, per = a->n - a->overlap;
-    while (b.end - b.pos >= 32 && decode_block(a, &b)) {
+    while (b.pos <= b.end && b.end - b.pos >= 32 && decode_block(a, &b)) {
         for (u32 i = 0; i < per && got + a->channels <= max; i++)
             for (u32 ch = 0; ch < a->channels; ch++)
                 out[got++] = to_s16(a->coef[ch][i]);
-        b.pos = (b.pos + 31) & ~31u;
+        if (b.pos > b.end)
+            break;
+        b.pos = (b.pos + 31u) & ~31u;
     }
     return got;
 }

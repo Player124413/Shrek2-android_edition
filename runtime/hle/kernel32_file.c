@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "platform/platform.h"
 #include "runtime/heap.h"
 #include "runtime/hle/hle.h"
 #include "runtime/hle/vfs.h"
@@ -173,19 +174,31 @@ static void wb_unlist(hfile *f)  // под g_wb_lock
 // десяток запросов к файловому сервису. Записанное до закрытия обычно уходит на диск вместе с открытием в фоне.
 static int f_open(hfile *f)
 {
-    if (!f->lazy)
-        return f->std || f->fd >= 0;
+    if (!f->lazy) {
+        if (f->std || f->fd >= 0)
+            return 1;
+        errno = EIO;
+        return 0;
+    }
     f->lazy = 0;
     f->fd = open(f->path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (f->fd < 0)
-        fprintf(stderr, "[file] deferred open of %s failed: %s\n", f->path, strerror(errno));
+    if (f->fd < 0) {
+        int err = errno;
+        fprintf(stderr, "[file] deferred open of %s failed: %s\n", f->path, strerror(err));
+        errno = err;
+    }
     return f->fd >= 0;
 }
+
+static s64 fimg_size(const fimage *im);
 
 // Размер файла: lseek в конец — один запрос GetSize к fsdev; fstat на Switch тянет ещё тип и метки времени (с
 // переводом через сервис времени). Позицию fd чтения и записи ставят сами (lseek перед read/write).
 static s64 fd_size(hfile *f)
 {
+    s64 isz = fimg_size(f->img);
+    if (isz >= 0)
+        return isz;
     struct stat st;
     if (f->std || f->fd < 0)
         return f->fd >= 0 && fstat(f->fd, &st) == 0 ? (s64)st.st_size : -1;
@@ -194,12 +207,19 @@ static s64 fd_size(hfile *f)
 
 static int write_range(int fd, const u8 *p, s64 off, u32 n)
 {
+    if (fd < 0) {
+        errno = EBADF;
+        return 0;
+    }
     if (lseek(fd, (off_t)off, SEEK_SET) < 0)
         return 0;
     for (u32 done = 0; done < n;) {
         ssize_t r = write(fd, p + done, n - done);
-        if (r <= 0)
+        if (r <= 0) {
+            if (r == 0)
+                errno = EIO;
             return 0;
+        }
         done += (u32)r;
     }
     return 1;
@@ -223,6 +243,7 @@ static int g_ws_thread;  // 1 — поток есть, -1 — не создал�
 static void *ws_worker(void *arg)
 {
     (void)arg;
+    rt_platform_thread_background();
     pthread_mutex_lock(&g_ws_lock);
     for (;;) {
         while (!g_ws_file)
@@ -288,10 +309,16 @@ static void ws_dirty(hfile *f, u32 lo, u32 hi)
     d[1] = hi > d[1] ? hi : d[1];
 }
 
-static int wb_flush(hfile *f)
+// Вызывается под g_wb_lock (или из wc_worker для файла с closing == 1, который уже никому не доступен)
+static int wb_flush_locked(hfile *f)
 {
-    if (f->lazy && !f_open(f))
+    if (f->lazy && !f_open(f)) {
+        int err = errno;
+        f->wlen = f->wsent = 0;
+        f->ndirty = 0;
+        errno = err;
         return 0;
+    }
     if (!f->wsent && !f->wlen)
         return 1;
     pthread_mutex_lock(&g_ws_lock);
@@ -301,25 +328,44 @@ static int wb_flush(hfile *f)
     f->werr = 0;
     pthread_mutex_unlock(&g_ws_lock);
     u32 n = f->wlen, from = f->wsent, redo = 0;
+    int err = ok ? 0 : EIO;
     u64 t0 = rt_ticks_ns();
     for (int i = 0; i < f->ndirty; i++) {
         u32 *d = f->dirty[i];
-        ok &= write_range(f->fd, f->wbuf + d[0], f->wpos + d[0], d[1] - d[0]);
+        if (!write_range(f->fd, f->wbuf + d[0], f->wpos + d[0], d[1] - d[0])) {
+            ok = 0;
+            if (!err)
+                err = errno;
+        }
         redo += d[1] - d[0];
     }
     f->wlen = f->wsent = 0;
     f->ndirty = 0;
-    if (n > from)
-        ok &= write_range(f->fd, f->wbuf + from, f->wpos + from, n - from);
+    if (n > from) {
+        if (!write_range(f->fd, f->wbuf + from, f->wpos + from, n - from)) {
+            ok = 0;
+            if (!err)
+                err = errno;
+        }
+    }
     u64 dt = rt_ticks_ns() - t0;
     if (dt > 50000000)  // запись сохранения на Switch: ≈0,7 с на 2,2 МБ — где именно
         fprintf(stderr, "[file] slow write: %u KB at %lld to %s, %.0f ms\n", (n - from + redo) >> 10,
                 (long long)(f->wpos + from), f->path, (double)dt / 1e6);
     if (!ok) {
         fprintf(stderr, "[file] deferred write of %u bytes to %s failed\n", n, f->path);
+        errno = err ? err : EIO;
         return 0;
     }
     return 1;
+}
+
+static int wb_flush(hfile *f)
+{
+    pthread_mutex_lock(&g_wb_lock);
+    int ok = wb_flush_locked(f);
+    pthread_mutex_unlock(&g_wb_lock);
+    return ok;
 }
 
 // Фоновое закрытие: файл, который не писался фоном по ходу (ini, лог — не сохранение), гость закрывает сразу, а
@@ -335,6 +381,7 @@ static void rb_drop(hfile *f);
 static void *wc_worker(void *arg)
 {
     (void)arg;
+    rt_platform_thread_background();
     pthread_mutex_lock(&g_wb_lock);
     for (;;) {
         while (!g_wc_head)
@@ -345,7 +392,7 @@ static void *wc_worker(void *arg)
         pthread_mutex_unlock(&g_wb_lock);
         u32 n = f->wlen;
         u64 t0 = rt_ticks_ns();
-        wb_flush(f);
+        wb_flush_locked(f);
         if (f->fd >= 0)
             close(f->fd);
         double ms = (double)(rt_ticks_ns() - t0) / 1e6;
@@ -398,7 +445,7 @@ static void flush_files(const char *host)
                 if (f->closing)
                     pending = 1;
                 else if (!host || f->wlen || f->lazy)
-                    wb_flush(f);
+                    wb_flush_locked(f);
             }
         if (!pending)
             break;
@@ -423,7 +470,8 @@ static _Atomic u64 g_fg_read_ns;  // время последнего чтени�
 // n байт с позиции off (до конца файла); -1 — ошибка
 static ssize_t read_at(hfile *f, s64 off, u8 *dst, size_t n)
 {
-    wb_flush(f);
+    if (!wb_flush(f))
+        return -1;
     static int log = -1;
     if (log < 0)
         log = getenv("SNX_LOG_READS") != NULL;
@@ -525,37 +573,117 @@ static void rb_drop(hfile *f)
 }
 
 // ---------------------------------------------------------------- образы пакетов в памяти
-// Открытый на чтение файл из каталога игры (пакеты: текстуры, меши, звуки, карта) фоновый поток дочитывает в
-// память целиком, с начала; чтение гостя из уже прочитанного — копия из памяти. Движок подгружает данные пакетов
-// по требованию (TLazyArray: мипы текстур при первом показе, звуки), и на Switch это были фризы посреди игры
-// (строка [hitch]: 0,2–3,5 МБ с SD за 8–90 мс), а после сохранения он перечитывал ≈16 МБ уровня (≈0,6 с).
-// Поток уступает диск: после чтения гостя ждёт затишья (загрузка уровня не дольше). Образы закрытых файлов
-// остаются до вытеснения (повторная загрузка уровня, общие пакеты); бюджет — SNX_FILE_CACHE_MB (по умолчанию 512,
-// 0 — без образов). Болото открывает 65 пакетов, ≈280 МБ без файлов крупнее FIMG_MAX.
+// Открытый на чтение файл из каталога игры (пакеты: текстуры, меши, звуки, карта) и read-only файлы
+// локализации (.int/.rus, в т.ч. пропатченные в оверлее BumpDialog.int / HpDialog.int) фоновый поток
+// дочитывает в память целиком, с начала; чтение гостя из уже прочитанного — копия из памяти. Движок
+// подгружает данные пакетов по требованию (TLazyArray: мипы текстур, реплики из AllDialog.uax 111 МБ),
+// и на Switch это были фризы посреди игры (строка [hitch]: 0,2–3,5 МБ с SD за 8–260 мс). Поток уступает
+// диск: после чтения гостя ждёт затишья. При записи/удалении/переносе в оверлей образ немедленно
+// инвалидируется (fimg_invalidate), а поток подкачки закрывает fd до модификации файла (требование fs Switch).
+// Бюджет — SNX_FILE_CACHE_MB (по умолчанию 640 МБ: ~1 ГБ окно + ~650 МБ прочее + 640 МБ кеш ≈ 2,3 ГБ < 3,1 ГБ
+// в полном режиме Switch; 0 — без образов).
 struct fimage {
     fimage *next;
     char path[1024];
     s64 size;
     u8 *data;
     _Atomic s64 loaded;  // байт с начала уже в памяти
+    _Atomic int stale;   // инвалидирован записью/удалением: не использовать, освободить при refs==0 && busy==0
     int refs;            // открытых hfile (под g_img_lock)
     int busy;            // поток подкачки читает (под g_img_lock)
     int failed;          // дочитать не вышло: в памяти только начало
     u64 used;            // часы последнего открытия/закрытия (вытеснение)
 };
-#define FIMG_MIN (256u << 10)  // мелкие файлы — блочный кеш
-#define FIMG_MAX (64u << 20)   // крупнее — нужны кусками (AllDialog.uax, 110 МБ реплик, — несколько штук на уровень)
-#define FIMG_CHUNK (256u << 10)  // чтение гостя ждёт фоновое не дольше одного куска (≈5 мс)
+#define FIMG_MIN (256u << 10)        // мелкие пакеты — блочный кеш (для .int/.rus порог 1 Б)
+#define FIMG_MAX (128u << 20)        // включает AllDialog.uax (111 МБ реплик)
+#define FIMG_OVERLAY_MAX (16u << 20) // верхняя граница для read-only файлов локализации из оверлея
+#define FIMG_CHUNK (256u << 10)      // чтение гостя ждёт фоновое не дольше одного куска (≈5 мс)
 static fimage *g_imgs;
 static u64 g_img_total, g_img_budget, g_img_clock;
 static pthread_mutex_t g_img_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_img_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_img_done = PTHREAD_COND_INITIALIZER;
 static int g_img_thread;
+
+static s64 fimg_size(const fimage *im)
+{
+    return (im && !atomic_load_explicit(&im->stale, memory_order_acquire)) ? im->size : -1;
+}
+
+static int is_loc_ext(const char *rel)
+{
+    size_t n = strlen(rel);
+    return n >= 4 && (!strcasecmp(rel + n - 4, ".int") || !strcasecmp(rel + n - 4, ".rus"));
+}
+
+static int has_open_writer(const char *host)
+{
+    int found = 0;
+    pthread_mutex_lock(&g_wb_lock);
+    for (hfile *f = g_wb_files; f; f = f->wnext)
+        if (!strcasecmp(f->path, host)) {
+            found = 1;
+            break;
+        }
+    pthread_mutex_unlock(&g_wb_lock);
+    return found;
+}
+
+// Удалить и освободить конкретный образ из g_imgs (под g_img_lock; refs == 0 && busy == 0)
+static void fimg_unlink_free(fimage *target)
+{
+    for (fimage **p = &g_imgs; *p; p = &(*p)->next) {
+        if (*p == target) {
+            *p = target->next;
+            g_img_total -= (u64)target->size;
+            free(target->data);
+            free(target);
+            return;
+        }
+    }
+}
+
+// Инвалидировать образы пути host перед записью/усечением/удалением/переносом: помечает stale и
+// дожидается завершения фонового чтения (чтобы fd на Switch fs был закрыт до модификации файла).
+static void fimg_invalidate(const char *host)
+{
+    if (!host || !host[0])
+        return;
+    pthread_mutex_lock(&g_img_lock);
+    for (;;) {
+        int busy = 0;
+        for (fimage **p = &g_imgs; *p;) {
+            fimage *im = *p;
+            if (!strcasecmp(im->path, host)) {
+                atomic_store_explicit(&im->stale, 1, memory_order_release);
+                im->failed = 1;
+                if (im->busy) {
+                    busy = 1;
+                    p = &(*p)->next;
+                } else if (!im->refs) {
+                    *p = im->next;
+                    g_img_total -= (u64)im->size;
+                    free(im->data);
+                    free(im);
+                } else {
+                    p = &(*p)->next;
+                }
+            } else {
+                p = &(*p)->next;
+            }
+        }
+        if (!busy)
+            break;
+        pthread_cond_wait(&g_img_done, &g_img_lock);
+    }
+    pthread_mutex_unlock(&g_img_lock);
+}
 
 static fimage *fimg_next_work(void)
 {
     for (fimage *i = g_imgs; i; i = i->next)
-        if (atomic_load(&i->loaded) < i->size && !i->failed)
+        if (atomic_load(&i->loaded) < i->size && !i->failed &&
+            !atomic_load_explicit(&i->stale, memory_order_acquire))
             return i;
     return NULL;
 }
@@ -563,6 +691,7 @@ static fimage *fimg_next_work(void)
 static void *fimg_worker(void *arg)
 {
     (void)arg;
+    rt_platform_thread_background();
     pthread_mutex_lock(&g_img_lock);
     for (;;) {
         fimage *im = fimg_next_work();
@@ -587,10 +716,13 @@ static void *fimg_worker(void *arg)
             close(fd);
             fd = -1;
         }
-        while (fd >= 0 && at < im->size) {
-            // гость читал с диска недавно (загрузка) — подождать затишья
-            while (rt_ticks_ns() - atomic_load(&g_fg_read_ns) < 300000000ull)
-                usleep(50000);
+        while (fd >= 0 && at < im->size && !atomic_load_explicit(&im->stale, memory_order_acquire)) {
+            // гость читал с диска недавно (загрузка) — подождать затишья, но не тормозить инвалидацию
+            while (!atomic_load_explicit(&im->stale, memory_order_acquire) &&
+                   rt_ticks_ns() - atomic_load(&g_fg_read_ns) < 300000000ull)
+                usleep(10000);
+            if (atomic_load_explicit(&im->stale, memory_order_acquire))
+                break;
             u32 n = im->size - at < FIMG_CHUNK ? (u32)(im->size - at) : FIMG_CHUNK;
             ssize_t r = read(fd, im->data + at, n);
             if (r <= 0)
@@ -602,25 +734,29 @@ static void *fimg_worker(void *arg)
             close(fd);
         pthread_mutex_lock(&g_img_lock);
         im->busy = 0;
-        im->failed = at < im->size;  // в памяти остаётся прочитанное начало
+        int stale = atomic_load_explicit(&im->stale, memory_order_relaxed);
+        im->failed = at < im->size || stale;  // в памяти остаётся прочитанное начало
+        if (stale && !im->refs)
+            fimg_unlink_free(im);
+        pthread_cond_broadcast(&g_img_done);
     }
     return NULL;
 }
 
 // образ для только что открытого на чтение файла (под g_img_lock); NULL — без образа
-static fimage *fimg_open(const char *host, s64 size)
+static fimage *fimg_open(const char *host, s64 size, s64 min_size, s64 max_size)
 {
     if (!g_img_budget) {
         const char *e = getenv("SNX_FILE_CACHE_MB");
-        g_img_budget = (u64)(e ? atoi(e) : 512) << 20;
+        g_img_budget = (u64)(e ? atoi(e) : 640) << 20;
         if (!g_img_budget)
             g_img_budget = 1;  // выключено
     }
-    if (size < (s64)FIMG_MIN || size > (s64)FIMG_MAX || (u64)size > g_img_budget)
+    if (size < min_size || size > max_size || (u64)size > g_img_budget)
         return NULL;
     fimage *im = NULL;
     for (fimage *i = g_imgs; i && !im; i = i->next)
-        if (i->size == size && !strcmp(i->path, host))
+        if (!atomic_load_explicit(&i->stale, memory_order_acquire) && i->size == size && !strcasecmp(i->path, host))
             im = i;
     if (!im) {
         while (g_img_total + (u64)size > g_img_budget) {  // вытеснить давно закрытый
@@ -662,7 +798,7 @@ static fimage *fimg_open(const char *host, s64 size)
 static u32 buffered_read(hfile *f, u8 *dst, u32 n)
 {
     fimage *im = f->img;
-    if (im && f->pos >= 0) {  // из образа, если эта часть уже в памяти
+    if (im && !atomic_load_explicit(&im->stale, memory_order_acquire) && f->pos >= 0) {  // из образа, если эта часть уже в памяти
         s64 end = f->pos + n > im->size ? im->size : f->pos + n;
         if (end <= atomic_load_explicit(&im->loaded, memory_order_acquire)) {
             u32 k = end > f->pos ? (u32)(end - f->pos) : 0;
@@ -671,6 +807,9 @@ static u32 buffered_read(hfile *f, u8 *dst, u32 n)
             return k;
         }
     }
+    if (f->wlen || f->lazy)
+        if (!wb_flush(f))
+            return 0;
     if (n >= RBLK) {  // крупное — мимо кеша
         ssize_t r = read_at(f, f->pos, dst, n);
         if (r <= 0)
@@ -711,20 +850,21 @@ static void close_file_(hfile *f)
     // не писался фоном по ходу (не сохранение): запись буфера и закрытие — в фоне
     if (!f->std && (f->wbuf || f->lazy) && !f->wsent && !f->wjob && !f->wstreamed && !f->img && wc_post(f))
         return;
-    f_open(f);  // отложенное открытие: CREATE_ALWAYS усекает файл и без записи
     if (f->listed) {
         pthread_mutex_lock(&g_wb_lock);
         u32 tail = f->wlen - f->wsent;
         for (int i = 0; i < f->ndirty; i++)
             tail += f->dirty[i][1] - f->dirty[i][0];
         u64 t0 = rt_ticks_ns();
-        wb_flush(f);
+        wb_flush_locked(f);
         if (f->wstreamed)  // большой файл (сохранение): сколько ушло фоном и чего стоило закрытие
             fprintf(stderr, "[file] %s: %llu KB written in background, %u KB at close, %.0f ms\n", f->path,
                     (unsigned long long)(f->wstreamed >> 10), tail >> 10, (double)(rt_ticks_ns() - t0) / 1e6);
         wb_unlist(f);
         pthread_mutex_unlock(&g_wb_lock);
         free(f->wbuf);
+    } else {
+        f_open(f);  // отложенное открытие: CREATE_ALWAYS усекает файл и без записи
     }
     if (!f->std && f->fd >= 0)
         close(f->fd);
@@ -733,6 +873,8 @@ static void close_file_(hfile *f)
         pthread_mutex_lock(&g_img_lock);
         f->img->refs--;
         f->img->used = ++g_img_clock;
+        if (atomic_load_explicit(&f->img->stale, memory_order_relaxed) && !f->img->refs && !f->img->busy)
+            fimg_unlink_free(f->img);
         pthread_mutex_unlock(&g_img_lock);
     }
     free(f);
@@ -749,9 +891,9 @@ static u32 std_handle(int i)
     return g_std[i];
 }
 
-static u32 last_errno_to_win(void)
+static u32 errno_to_win(int err)
 {
-    switch (errno) {
+    switch (err) {
     case ENOENT: return ERROR_FILE_NOT_FOUND;
     case ENOTDIR: return ERROR_PATH_NOT_FOUND;
     case EACCES: case EPERM: case EISDIR: return ERROR_ACCESS_DENIED;
@@ -759,6 +901,8 @@ static u32 last_errno_to_win(void)
     default: return 31;      // ERROR_GEN_FAILURE
     }
 }
+
+static u32 last_errno_to_win(void) { return errno_to_win(errno); }
 
 static u64 to_filetime(time_t t) { return (u64)t * 10000000ull + 116444736000000000ull; }
 
@@ -847,6 +991,7 @@ static u32 create_file_(const char *name, u32 access, u32 disp)
     char game[1100];
     if (is_file && disp == CREATE_ALWAYS && write && !(access & GENERIC_READ) &&
         !(vfs_find_game(rel, game, sizeof game) && !strcmp(game, host))) {  // перезапись файла оверлея: f_open
+        fimg_invalidate(host);
         hfile *f = calloc(1, sizeof *f);
         f->fd = -1;
         f->lazy = 1;
@@ -878,6 +1023,7 @@ static u32 create_file_(const char *name, u32 access, u32 disp)
             rt_set_last_error(ERROR_PATH_NOT_FOUND);
             return 0xFFFFFFFFu;
         }
+        fimg_invalidate(host);
         flags = (write ? ((access & GENERIC_READ) ? O_RDWR : O_WRONLY) : O_RDONLY) | O_CREAT;
         if (disp == CREATE_ALWAYS || disp == TRUNCATE_EXISTING)
             flags |= O_TRUNC;
@@ -900,12 +1046,20 @@ static u32 create_file_(const char *name, u32 access, u32 disp)
         f->trunc = (flags & O_TRUNC) != 0;
         sz_open_writer(f);
     }
-    s64 size;
-    if (flags == O_RDONLY && is_file && vfs_find_game(rel, game, sizeof game) && !strcmp(game, host) &&
-        (size = fd_size(f)) >= 0) {  // пакет игры (не копия в оверлее) — образ в памяти
-        pthread_mutex_lock(&g_img_lock);
-        f->img = fimg_open(host, size);
-        pthread_mutex_unlock(&g_img_lock);
+    if (flags == O_RDONLY && is_file) {
+        int in_game = vfs_find_game(rel, game, sizeof game) && !strcmp(game, host);
+        int is_loc = is_loc_ext(rel);
+        // пакет игры (включая AllDialog.uax 111 МБ) или read-only файл локализации (.int/.rus) в оверлее
+        if ((in_game || (is_loc && !has_open_writer(host)))) {
+            s64 size = fd_size(f);
+            if (size >= 0) {
+                s64 min_sz = is_loc ? 1 : (s64)FIMG_MIN;
+                s64 max_sz = in_game ? (s64)FIMG_MAX : (s64)FIMG_OVERLAY_MAX;
+                pthread_mutex_lock(&g_img_lock);
+                f->img = fimg_open(host, size, min_sz, max_sz);
+                pthread_mutex_unlock(&g_img_lock);
+            }
+        }
     }
     u32 h = hle_obj_new(OBJ_FILE, f);
     hle_obj_set_closer(h, close_file);
@@ -959,47 +1113,90 @@ void hle_kernel32_WriteFile(CPU *c)
 {
     HLE_ENTER("WriteFile", 5);
     hfile *f = hle_obj_get(ARG(0), OBJ_FILE);
+    if (ARG(3))
+        wr32(g_mem, ARG(3), 0);
     if (!f) {
         rt_set_last_error(ERROR_INVALID_HANDLE);
         RET(5, 0);
     }
     ssize_t r;
-    if (f->std)
+    int err = 0;
+    if (f->std) {
         r = write(f->fd, g_mem + ARG(1), ARG(2));
-    else {
+        if (r < 0)
+            err = errno;
+    } else {
         u32 n = ARG(2);
         rb_drop(f);
-        // внутри накопленного или сразу за ним и влезает — в буфер, иначе накопленное — на диск
-        if (f->wlen && !(f->pos >= f->wpos && f->pos <= f->wpos + f->wlen && (u64)(f->pos - f->wpos) + n <= WBUF))
-            wb_flush(f);
-        if (n < WBUF && !f->wbuf && (f->wbuf = malloc(WBUF)) != NULL) {
-            pthread_mutex_lock(&g_wb_lock);
-            wb_list(f);
+        pthread_mutex_lock(&g_wb_lock);
+        if (!f->lazy && f->fd < 0) {
+            // отложенное открытие уже провалилось раньше: не буферизовать в сломанный дескриптор
             pthread_mutex_unlock(&g_wb_lock);
+            rt_set_last_error(31);  // ERROR_GEN_FAILURE
+            RET(5, 0);
         }
+        // внутри накопленного или сразу за ним и влезает — в буфер, иначе накопленное — на диск
+        if (f->wlen && !(f->pos >= f->wpos && f->pos <= f->wpos + f->wlen && (u64)(f->pos - f->wpos) + n <= WBUF)) {
+            if (!wb_flush_locked(f)) {
+                err = errno;
+                pthread_mutex_unlock(&g_wb_lock);
+                rt_set_last_error(errno_to_win(err));
+                RET(5, 0);
+            }
+        }
+        if (n < WBUF && !f->wbuf && (f->wbuf = malloc(WBUF)) != NULL)
+            wb_list(f);
         if (n < WBUF && f->wbuf) {
             if (!f->wlen)
                 f->wpos = f->pos;
-            u32 at = (u32)(f->pos - f->wpos);
-            memcpy(f->wbuf + at, g_mem + ARG(1), n);
+            s64 diff = f->pos - f->wpos;
+            if (diff < 0 || (u64)diff + n > WBUF) {
+                // защитная проверка инварианта: не допускать выход за границы wbuf ни при каких ошибках выше
+                pthread_mutex_unlock(&g_wb_lock);
+                rt_set_last_error(31);  // ERROR_GEN_FAILURE
+                RET(5, 0);
+            }
+            u32 at = (u32)diff;
+            if (n)
+                memcpy(f->wbuf + at, g_mem + ARG(1), n);
             if (at < f->wsent)  // уже отдано фону: при сбросе — заново
                 ws_dirty(f, at, at + n < f->wsent ? at + n : f->wsent);
             if (at + n > f->wlen)
                 f->wlen = at + n;
-            if (f->wlen - f->wsent >= WS_CHUNK && f_open(f))
+            if (f->wlen - f->wsent >= WS_CHUNK) {
+                if (!f_open(f)) {
+                    err = errno;
+                    f->wlen = f->wsent = 0;
+                    f->ndirty = 0;
+                    pthread_mutex_unlock(&g_wb_lock);
+                    rt_set_last_error(errno_to_win(err));
+                    RET(5, 0);
+                }
                 ws_post(f);
-            r = n;
+            }
+            r = (ssize_t)n;
         } else {
-            r = !f_open(f) || lseek(f->fd, (off_t)f->pos, SEEK_SET) < 0 ? -1 : write(f->fd, g_mem + ARG(1), n);
+            if (!f_open(f) || !write_range(f->fd, g_mem + ARG(1), f->pos, n)) {
+                r = -1;
+                err = errno;
+            } else {
+                r = (ssize_t)n;
+            }
         }
-        if (r > 0)
+        if (r > 0) {
             f->pos += r;
-        if (r > 0 && f->pos > f->wend)
-            f->wend = f->pos;
+            if (f->pos > f->wend)
+                f->wend = f->pos;
+        }
+        pthread_mutex_unlock(&g_wb_lock);
+    }
+    if (r < 0) {
+        rt_set_last_error(errno_to_win(err ? err : EIO));
+        RET(5, 0);
     }
     if (ARG(3))
-        wr32(g_mem, ARG(3), r > 0 ? (u32)r : 0);
-    RET(5, r >= 0);
+        wr32(g_mem, ARG(3), (u32)r);
+    RET(5, 1);
 }
 
 void hle_kernel32_SetFilePointer(CPU *c)
@@ -1051,6 +1248,7 @@ void hle_kernel32_SetEndOfFile(CPU *c)
     hfile *f = hle_obj_get(ARG(0), OBJ_FILE);
     if (f) {
         rb_drop(f);
+        fimg_invalidate(f->path);
         f->size_bad = 1;
     }
     RET(1, f && wb_flush(f) && ftruncate(f->fd, (off_t)f->pos) == 0);
@@ -1196,6 +1394,7 @@ static int path_op(CPU *c, int wide, int op)  // 0 mkdir, 1 rmdir, 2 unlink
     }
     // удалить можно только то, что лежит в оверлее; каталог игры не меняется
     vfs_for_write(rel, host, sizeof host, 0);
+    fimg_invalidate(host);
     int r = op == 1 ? rmdir(host) : unlink(host);
     vfs_changed();
     if (r != 0) {
@@ -1227,10 +1426,12 @@ static int move_copy(CPU *c, int wide, int copy)
         return 0;
     }
     vfs_for_write(rb, hb, sizeof hb, 0);
+    fimg_invalidate(hb);
     if (!copy) {
         char ua[1100];
         vfs_for_write(ra, ua, sizeof ua, 0);
         if (!strcmp(ua, ha)) {
+            fimg_invalidate(ha);
             int ok = rename(ha, hb) == 0;
             vfs_changed();
             return ok;

@@ -30,8 +30,9 @@ typedef union {
 } xmm_t;
 
 // Состояние гостевого потока. Сгенерированные функции держат регистры в локальных
-// переменных и сбрасывают их сюда на вызовах и выходах.
-typedef struct CPU {
+// переменных и сбрасывают их сюда на вызовах и выходах. Выравнивание 16 байт безопасно
+// для calloc() в runtime/process.c под UBSan (64-байтное требует aligned_alloc).
+typedef struct __attribute__((aligned(16))) CPU {
     u32 eax, ecx, edx, ebx, esp, ebp, esi, edi; // порядок как в кодировке x86
     u32 fs_base;     // гостевой адрес TEB
     u32 fpucw;       // управляющее слово x87 (режим округления)
@@ -46,20 +47,25 @@ typedef struct CPU {
 
 typedef void (*guest_fn)(CPU *c);
 
+// hidden: всё линкуется в один исполняемый файл — адрес берётся напрямую (adrp), а не через GOT: на каждом входе
+// в функцию гостя (m = g_mem) и в каждом кеше косвенного вызова (rt_ic_base) на одну зависимую загрузку меньше
+#define RT_HIDDEN __attribute__((visibility("hidden")))
+#define RT_NORETURN_COLD __attribute__((noreturn, cold))
+
 // Закреплённые регистры (SNX_PIN — Switch, GCC; runtime/gen_rt.h): в сгенерированном коде регистры гостя живут в
-// x19–x26 (m — в x27) и между функциями гостя через CPU не ходят. Рантайм и HLE работают с CPU: вход из них в код
-// гостя — трамплин rt_pin_enter (сохраняет регистры хоста, берёт регистры гостя из CPU, после — кладёт обратно),
-// вызов из кода гостя в функцию хоста — с SPILL/RELOAD. Без SNX_PIN — обычный вызов.
+// x19–x26, m — в x27, указатель CPU *c — в x28 и между функциями гостя через CPU/x0 не ходят. Рантайм и HLE
+// работают с CPU: вход из них в код гостя — трамплин rt_pin_enter (сохраняет регистры хоста, берёт регистры
+// гостя из CPU и ставит x28 = c, после — кладёт обратно), вызов из кода гостя в функцию хоста — с SPILL/RELOAD.
+// Без SNX_PIN — обычный вызов с передачей c в x0.
 #ifdef SNX_PIN
-void rt_pin_enter(CPU *c, guest_fn fn);
+typedef void (*pin_fn)(void);
+void rt_pin_enter(CPU *c, guest_fn fn) RT_HIDDEN;
+guest_fn rt_pin_wrap_native(guest_fn fn) RT_HIDDEN;
 #define RT_ENTER_GEN(c, fn) rt_pin_enter((c), (fn))
 #else
 #define RT_ENTER_GEN(c, fn) ((fn)(c))
 #endif
 
-// hidden: всё линкуется в один исполняемый файл — адрес берётся напрямую (adrp), а не через GOT: на каждом входе
-// в функцию гостя (m = g_mem) и в каждом кеше косвенного вызова (rt_ic_base) на одну зависимую загрузку меньше
-#define RT_HIDDEN __attribute__((visibility("hidden")))
 extern u8 *g_mem RT_HIDDEN;
 
 // --- доступ к гостевой памяти -------------------------------------------------
@@ -83,22 +89,40 @@ void rt_call(CPU *c, u32 target);                      // косвенный в�
 // младшие 32 бита — гостевой адрес, старшие — смещение функции хоста от rt_ic_base (одна атомарная запись:
 // потоки гостя не увидят адрес от одной функции, а смещение от другой). Пустой кеш (0) совпадает только с
 // адресом 0 и ведёт в rt_ic_base — ловушку.
+#ifdef SNX_PIN
+void rt_ic_base(void) RT_HIDDEN;
+#else
 void rt_ic_base(CPU *c) RT_HIDDEN;
+#endif
 void rt_call_ic(CPU *c, u32 target, u64 *ic);
-// промахи мест вызова: общий кеш прямого отображения в том же формате (места с многими адресами — диспетчер
-// байт-кода UnrealScript GNatives, vtable в обходе сцены); заполняет rt_call_ic, с закреплёнными регистрами
-// его сначала смотрит само место вызова (runtime/gen_rt.h, rt_icall_slow)
-#define RT_IC2_SIZE 8192u
-#define RT_IC2_IDX(t) (((t) ^ ((t) >> 13)) & (RT_IC2_SIZE - 1))
+// промахи мест вызова: общий кеш прямого отображения в том же формате (полиморфные vtable в обходе сцены и
+// UProperty::CopySingleValue); 4096 слотов = 32 КБ (влезает в L1D, сдвиг >> 4 учитывает 16-байтное выравнивание
+// функций MSVC, вдвое сокращая число активных кэш-линий и коллизий). Заполняет rt_call_ic, с SNX_PIN сначала
+// смотрит rt_icall_slow (runtime/icall_pin.c)
+#define RT_IC2_SIZE 4096u
+#define RT_IC2_IDX(t) ((((t) ^ ((t) >> 12)) >> 4) & (RT_IC2_SIZE - 1))
 extern u64 rt_ic2[RT_IC2_SIZE] RT_HIDDEN;
+// Теневая таблица прямого отображения для диспетчера байткода UnrealScript GNatives (Core.dll, 4096 слотов):
+// формат слота тот же, что в ic_/rt_ic2 (младшие 32 бита — гостевой адрес, старшие — смещение от rt_ic_base).
+#define RT_GNATIVE_SIZE 4096u
+extern u64 rt_gnatives_cache[RT_GNATIVE_SIZE] RT_HIDDEN;
 #define RT_ICALL(c, t)                                                                                     \
     do {                                                                                                   \
         static u64 ic_;                                                                                    \
         u64 v_ = __atomic_load_n(&ic_, __ATOMIC_RELAXED);                                                  \
-        if ((u32)v_ == (t))                                                                                \
-            ((guest_fn)((uintptr_t)rt_ic_base + (uintptr_t)(intptr_t)(s32)(u32)(v_ >> 32)))(c);            \
+        if (__builtin_expect((u32)v_ == (t), 1))                                                           \
+            ((guest_fn)((uintptr_t)rt_ic_base + (intptr_t)((s64)v_ >> 32)))(c);                            \
         else                                                                                               \
             rt_call_ic((c), (t), &ic_);                                                                    \
+    } while (0)
+#define RT_GNATIVE_CALL(c, idx, t)                                                                         \
+    do {                                                                                                   \
+        u64 *ge_ = &rt_gnatives_cache[(u32)(idx) & (RT_GNATIVE_SIZE - 1)];                                 \
+        u64 v_ = __atomic_load_n(ge_, __ATOMIC_RELAXED);                                                   \
+        if (__builtin_expect((u32)v_ == (t), 1))                                                           \
+            ((guest_fn)((uintptr_t)rt_ic_base + (intptr_t)((s64)v_ >> 32)))(c);                            \
+        else                                                                                               \
+            rt_call_ic((c), (t), ge_);                                                                     \
     } while (0)
 // Проверка сводок по регистрам (генерация с SNX_REGCHECK=1, recomp/regs.py): после прямого вызова регистры вне
 // out цели должны остаться такими же; bad — маска разошедшихся (порядок как в CPU), печатается первое по месту.
@@ -134,12 +158,12 @@ void rt_eh_reset(void);    // забыть кадры потока (харнес
 guest_fn rt_lookup(u32 target);                        // NULL, если функции нет
 guest_fn rt_lookup_k(u32 target, int *native);         // то же; native — функция хоста (HLE, оверрайд)
 void rt_invoke(CPU *c, guest_fn fn, int native);       // вызов из рантайма: код гостя — через RT_ENTER_GEN
-void rt_trap(CPU *c, u32 addr, const char *what);      // фатальная ошибка гостя
-void rt_unimpl(CPU *c, u32 addr, const char *insn);    // нереализованная инструкция
+void rt_trap(CPU *c, u32 addr, const char *what) RT_NORETURN_COLD;      // фатальная ошибка гостя
+void rt_unimpl(CPU *c, u32 addr, const char *insn) RT_NORETURN_COLD;    // нереализованная инструкция
 void rt_cpuid(u32 leaf, u32 r[4]);  // r: eax, ebx, ecx, edx
 u64 rt_rdtsc(void);                 // edx:eax
-void rt_divzero(CPU *c, u32 addr);
-void rt_hle_missing(CPU *c, const char *dll, const char *name);
+void rt_divzero(CPU *c, u32 addr) RT_NORETURN_COLD;
+void rt_hle_missing(CPU *c, const char *dll, const char *name) RT_NORETURN_COLD;
 // rep movs/stos: n элементов по size байт; esi/edi/ecx после — считает вызывающий (REP_MOVS в gen_rt.h)
 void rt_rep_movs(u8 *m, u32 s, u32 d, u32 n, int size, int df);
 void rt_rep_stos(u8 *m, u32 d, u32 n, u32 val, int size, int df);

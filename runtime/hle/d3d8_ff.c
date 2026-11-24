@@ -1,11 +1,17 @@
-// HLE Direct3D 8: отрисовка поверх GL 4.1 core (Android — ES 3.0, platform/gles_shim.h) — цели рендера, состояние GL, фиксированный конвейер D3D
+// HLE Direct3D 8: отрисовка поверх GL 4.1 core (Android — ES 3.0, platform/gles_shim.h) — цели рендера, состояние GL,
+// фиксированный конвейер D3D
 // (преобразования, освещение по формулам D3D, туман, генерация/матрицы текстурных координат, текстурные стадии,
-// альфа-тест), сгенерированный в GLSL по ключу состояния с кешем программ; Present.
+// альфа-тест), сгенерированный в GLSL по ключу состояния с динамическим кешем программ, кешем бинарников GL
+// и пост-проходом Present (переворот по Y, пропорции / 4:3-pillarbox меню, гамма-LUT 256x1 RGB16).
 // Матрицы D3D (строки, вектор-строка) загружаются в GL как есть: GL читает их по столбцам, получается
 // транспонированная — ровно то, что нужно для M * v.
+// Все вызовы GL в этом файле выполняются исключительно на потоке рендера (Core 2, либо Core 1 в direct-режиме),
+// поэтому макросы cs_gl* здесь отключены (GL_CS_NO_WRAP).
+#define GL_CS_NO_WRAP
 #include <math.h>
 #include <stdarg.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -20,11 +26,12 @@
 #include "platform/android/perf.h"
 #endif
 #include "runtime/hle/bink.h"
-#include "runtime/hle/d3d8.h"
 #include "runtime/game/menu.h"
+#include "runtime/game/rumble.h"
+#include "runtime/hle/d3d8.h"
 #include "runtime/script_fix.h"
-#include "runtime/hle/overlay.h"
 #include "runtime/hle/d3d8_int.h"
+#include "runtime/hle/overlay.h"
 #include "runtime/hle/vfs.h"
 
 #ifndef GL_TEXTURE_MAX_ANISOTROPY_EXT
@@ -48,42 +55,55 @@ static void mat_mul(float *r, const float *a, const float *b)
     memcpy(r, t, 64);
 }
 
-// ================================================================ цели рендера
-static void check_fbo(void *arg)
+// Нормальная матрица N = transpose(inverse(mat3(u_wv))) в постолбцовом порядке GL.
+// В GLSL столбцы mat3(u_wv) — это первые 3 строки wv: c0 = wv[0..2], c1 = wv[4..6], c2 = wv[8..10].
+// Столбцы матрицы кофакторов: n0 = c1 x c2, n1 = c2 x c0, n2 = c0 x c1; det = dot(c0, n0).
+static void compute_normal_mat(float nm[9], const float wv[16])
 {
-    const u32 *rt = arg;
-    GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    if (st != GL_FRAMEBUFFER_COMPLETE)
-        fprintf(stderr, "[d3d8] framebuffer incomplete 0x%x (rt %ux%u fmt %u)\n", st, rt[0], rt[1], rt[2]);
+    const float *c0 = wv, *c1 = wv + 4, *c2 = wv + 8;
+    float n0[3] = {c1[1] * c2[2] - c1[2] * c2[1], c1[2] * c2[0] - c1[0] * c2[2], c1[0] * c2[1] - c1[1] * c2[0]};
+    float n1[3] = {c2[1] * c0[2] - c2[2] * c0[1], c2[2] * c0[0] - c2[0] * c0[2], c2[0] * c0[1] - c2[1] * c0[0]};
+    float n2[3] = {c0[1] * c1[2] - c0[2] * c1[1], c0[2] * c1[0] - c0[0] * c1[2], c0[0] * c1[1] - c0[1] * c1[0]};
+    float det = c0[0] * n0[0] + c0[1] * n0[1] + c0[2] * n0[2];
+    if (fabsf(det) > 1e-20f) {
+        float inv = 1.0f / det;
+        nm[0] = n0[0] * inv; nm[1] = n0[1] * inv; nm[2] = n0[2] * inv;
+        nm[3] = n1[0] * inv; nm[4] = n1[1] * inv; nm[5] = n1[2] * inv;
+        nm[6] = n2[0] * inv; nm[7] = n2[1] * inv; nm[8] = n2[2] * inv;
+    } else {
+        nm[0] = c0[0]; nm[1] = c0[1]; nm[2] = c0[2];
+        nm[3] = c1[0]; nm[4] = c1[1]; nm[5] = c1[2];
+        nm[6] = c2[0]; nm[7] = c2[1]; nm[8] = c2[2];
+    }
 }
 
-void d3d8_bind_target(d3ddev *d)
+// ================================================================ цели рендера (Core 2)
+static void dump_target_r(d3d_rstate *r);
+static int dumping_frame(int frame);
+
+static void bind_target_r(d3d_rstate *r)
 {
-    if (!d->fbo)
-        glGenFramebuffers(1, &d->fbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, d->fbo);
-    if (d->fbo_rt != d->rt) {
-        d3dsurf *s = d->rt;
-        if (s && s->tex)
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                   s->tex->cube ? (GLenum)(GL_TEXTURE_CUBE_MAP_POSITIVE_X + s->face) : GL_TEXTURE_2D,
-                                   s->tex->gl, s->level);
-        else
-            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, s ? s->rb : 0);
-        d->fbo_rt = s;
+    if (!r->fbo)
+        glGenFramebuffers(1, &r->fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, r->fbo);
+    if (r->fbo_rt != r->rt) {
+        d3d8_fbo_attach(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, r->rt);
+        r->fbo_rt = r->rt;
     }
-    if (d->fbo_ds != d->ds) {
-        d3dsurf *s = d->ds;
+    if (r->fbo_ds != r->ds) {
+        d3dsurf *s = r->ds;
         const d3dfmt *f = s ? d3d8_format(s->fmt) : NULL;
         glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 0);
         if (s)
-            glFramebufferRenderbuffer(GL_FRAMEBUFFER, f->stencil ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT,
-                                      GL_RENDERBUFFER, s->rb);
-        d->fbo_ds = s;
+            d3d8_fbo_attach(GL_FRAMEBUFFER, f->stencil ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT, s);
+        r->fbo_ds = s;
     }
-    u32 info[3] = {d->rt ? d->rt->w : 0, d->rt ? d->rt->h : 0, d->rt ? d->rt->fmt : 0};
-    cs_async(check_fbo, info, sizeof info);  // проверка в потоке рендера, без ожидания
-    d->gen_misc++;
+    GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (st != GL_FRAMEBUFFER_COMPLETE)
+        fprintf(stderr, "[d3d8] framebuffer incomplete 0x%x (rt %ux%u fmt %u)\n", st, r->rt ? r->rt->w : 0,
+                r->rt ? r->rt->h : 0, r->rt ? r->rt->fmt : 0);
+    r->gen_vp++;
+    r->gl_dirty |= GLD_ALL;
 }
 
 // ================================================================ ключ фиксированного конвейера
@@ -95,13 +115,13 @@ typedef struct {
 } stagekey;
 
 typedef struct {
+    u64 ps_hash;           // 64-битный хеш байткода ps.1.x (0 — фиксированные текстурные стадии)
     u16 inputs;            // маска регистров D3DVSDE (0..15), есть в вершине
     u8 tcsize[8];          // компонент во входных наборах текстурных координат
     u8 rhw, lighting, normalize, localviewer, specular, colorvertex;
     u8 fog, fogmode, rangefog, alphafunc, clipmask, nstages;
     u8 mat_src[4];         // diffuse, specular, ambient, emissive: 0 материал, 1 color1, 2 color2
     u8 light[MAX_LIGHTS];  // 0 выкл, 1 point, 2 spot, 3 directional
-    u32 ps;                // пиксельный шейдер (0 — стадии)
     stagekey st[MAX_STAGES];
 #ifdef SNX_GLES
     u16 bgra;              // входы D3DCOLOR (B,G,R,A в памяти): в ES нет размера GL_BGRA — переставляет шейдер
@@ -113,27 +133,59 @@ typedef struct {
     ffkey key;
     u32 hash;
     GLuint prog;
-    GLint u_wv, u_proj, u_world, u_vp, u_depth, u_texm, u_mat, u_power, u_ambient, u_ld, u_ls, u_la, u_lpos,
-        u_ldir, u_latt, u_fog, u_fogcolor, u_clip, u_tfactor, u_aref, u_psc, u_bump;
-    u32 gen_xf, gen_light, gen_mat, gen_misc;
-    int used;
+    GLint u_wv, u_proj, u_world, u_nrm_mat, u_vp, u_depth, u_texm, u_mat, u_power, u_ambient, u_ld, u_ls, u_la,
+        u_lpos, u_ldir, u_latt, u_fog, u_fogcolor, u_clip, u_tfactor, u_aref, u_psc, u_bump;
+    u32 gen_xf, gen_view, gen_texm, gen_vp, gen_clip, gen_light, gen_mat, gen_const, gen_psc, gen_bump;
+    int last_frame;
     _Atomic int ready;  // собрана потоком рендера (программы прошлых запусков собираются в фоне)
 } ffprog;
 
-#define PROG_CACHE 4096
-static ffprog g_progs[PROG_CACHE];
-static int g_nprogs;
+// Динамическая хеш-таблица указателей ffprog*: принадлежит ИСКЛЮЧИТЕЛЬНО потоку рендера (Core 2).
+#define PROG_INIT_CAP 4096u
+#define PROG_MAX_CAP 65536u
+static ffprog **g_progs;
+static u32 g_prog_cap;
+static _Atomic u32 g_nprogs;
+static GLuint g_cur_prog;
+static ffprog *g_mru[4];  // MRU-кеш последних программ: убирает хеширование и пробинг при повторяющихся материалах
+static ffkey g_cached_key;
+static ffprog *g_cached_prog;  // программа для текущего неизменного состояния (key_dirty == 0)
+
+// Копия таблицы объявлений вершинных шейдеров для Core 2 (обновляется через gl_cs)
+static struct {
+    int used;
+    vdecl decl;
+} g_r_vs[D3D8_MAX_VS];
+
+static int r_vdecl_for(const d3d_rstate *r, vdecl *out)
+{
+    if (r->vs < D3D8_VS_HANDLE_BASE) {
+        d3d8_decl_from_fvf(r->vs, out);
+        return out->n > 0;
+    }
+    u32 i = r->vs - D3D8_VS_HANDLE_BASE;
+    if (i >= D3D8_MAX_VS || !g_r_vs[i].used)
+        return 0;
+    *out = g_r_vs[i].decl;
+    return 1;
+}
 
 static u32 fnv(const void *p, size_t n)
 {
     const u8 *b = p;
-    u32 h = 2166136261u;
-    for (size_t i = 0; i < n; i++)
-        h = (h ^ b[i]) * 16777619u;
-    return h;
+    u64 h = 14695981039346656037ull;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        u64 w;
+        memcpy(&w, b + i, 8);
+        h = (h ^ w) * 1099511628211ull;
+    }
+    for (; i < n; i++)
+        h = (h ^ b[i]) * 1099511628211ull;
+    return (u32)(h ^ (h >> 32));
 }
 
-static void make_key(d3ddev *d, const vdecl *decl, ffkey *k)
+static void make_key(const d3d_rstate *d, const vdecl *decl, ffkey *k)
 {
     memset(k, 0, sizeof *k);
     for (int i = 0; i < decl->n; i++) {
@@ -188,16 +240,16 @@ static void make_key(d3ddev *d, const vdecl *decl, ffkey *k)
 #ifdef SNX_GLES
     k->clipvary = k->clipmask && !gles_caps.clip_distance;
 #endif
-    k->ps = d->ps;
+    k->ps_hash = d->ps ? d3d8_r_ps_hash(d->ps) : 0;
     int nst = 0;
     for (int s = 0; s < MAX_STAGES; s++) {
         const u32 *t = d->tss[s];
-        if (!d->ps && t[1] == 1)  // COLOROP DISABLE: дальше стадий нет
+        if (!k->ps_hash && t[1] == 1)  // COLOROP DISABLE: дальше стадий нет
             break;
-        if (d->ps && s >= 6)
+        if (k->ps_hash && s >= 6)
             break;
         stagekey *sk = &k->st[s];
-        if (!d->ps) {
+        if (!k->ps_hash) {
             sk->cop = (u8)t[1];
             sk->ca1 = (u8)t[2];
             sk->ca2 = (u8)t[3];
@@ -218,16 +270,23 @@ static void make_key(d3ddev *d, const vdecl *decl, ffkey *k)
     k->nstages = (u8)nst;
 }
 
-// ================================================================ генерация GLSL
+// ================================================================ генерация GLSL (GL 4.1 core / GL 4.3)
 typedef struct {
     char *p;
     size_t n, cap;
 } sbuf;
 
+static void put(sbuf *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void put(sbuf *b, const char *fmt, ...)
 {
     va_list ap;
     for (;;) {
+        if (!b->p) {
+            b->cap = 8192;
+            b->p = malloc(b->cap);
+            if (!b->p)
+                return;
+        }
         va_start(ap, fmt);
         int w = vsnprintf(b->p + b->n, b->cap - b->n, fmt, ap);
         va_end(ap);
@@ -235,8 +294,11 @@ static void put(sbuf *b, const char *fmt, ...)
             b->n += (size_t)w;
             return;
         }
-        b->cap = b->cap ? b->cap * 2 : 8192;
-        b->p = realloc(b->p, b->cap);
+        b->cap *= 2;
+        char *np = realloc(b->p, b->cap);
+        if (!np)
+            return;
+        b->p = np;
     }
 }
 
@@ -279,6 +341,7 @@ static void gen_vs(const ffkey *k, sbuf *b)
         if (k->inputs & (1u << (7 + i)))
             put(b, "layout(location=%d) in vec4 a_tc%d%s;\n", 7 + i, i, in_bgra(k, 7 + i) ? "_in" : "");
     put(b, "uniform mat4 u_wv, u_proj, u_world, u_texm[8];\n"
+           "uniform mat3 u_nrm_mat;\n"
            "uniform vec4 u_vp; uniform vec2 u_depth;\n"
            "uniform vec4 u_mat[4]; uniform float u_power; uniform vec4 u_ambient;\n"
            "uniform vec4 u_ld[8], u_ls[8], u_la[8], u_lpos[8], u_ldir[8], u_latt[8];\n"
@@ -325,7 +388,7 @@ static void gen_vs(const ffkey *k, sbuf *b)
     for (int s = 0; s < k->nstages; s++)
         need_en |= k->st[s].tcgen == 1 || k->st[s].tcgen == 3;
     if (need_en && !k->rhw)
-        put(b, "  vec3 En = %s;\n", (k->inputs & (1u << 3)) ? "transpose(inverse(mat3(u_wv))) * a_nrm" : "vec3(0.0)");
+        put(b, "  vec3 En = %s;\n", (k->inputs & (1u << 3)) ? "u_nrm_mat * a_nrm" : "vec3(0.0)");
     const char *c0 = (k->inputs & (1u << 5)) ? "a_col0" : "vec4(1.0)";
     const char *c1 = (k->inputs & (1u << 6)) ? "a_col1" : "vec4(0.0)";
     if (k->lighting) {
@@ -337,7 +400,9 @@ static void gen_vs(const ffkey *k, sbuf *b)
         put(b, "  vec3 N = En;\n");
         if (k->normalize)
             put(b, "  if (dot(N, N) > 0.0) N = normalize(N);\n");
-        put(b, "  vec3 V = %s;\n", k->localviewer ? "normalize(-epos.xyz)" : "vec3(0.0, 0.0, -1.0)");
+        put(b, "  vec3 V = %s;\n",
+            k->localviewer ? "(dot(epos.xyz, epos.xyz) > 0.0 ? normalize(-epos.xyz) : vec3(0.0, 0.0, -1.0))"
+                           : "vec3(0.0, 0.0, -1.0)");
         put(b, "  vec3 dif = vec3(0.0), amb = vec3(0.0), spe = vec3(0.0);\n");
         for (int i = 0; i < MAX_LIGHTS; i++) {
             if (!k->light[i])
@@ -356,7 +421,7 @@ static void gen_vs(const ffkey *k, sbuf *b)
             }
             put(b, "    float nl = max(dot(N, L), 0.0);\n"
                    "    dif += u_ld[%d].rgb * nl * att; amb += u_la[%d].rgb * att;\n"
-                   "    if (nl > 0.0 && u_power > 0.0) spe += u_ls[%d].rgb * pow(max(dot(N, normalize(L + V)), 0.0), u_power) * att;\n"
+                   "    if (nl > 0.0 && u_power > 0.0) { vec3 H = L + V; if (dot(H, H) > 0.0) spe += u_ls[%d].rgb * pow(max(dot(N, normalize(H)), 0.0), u_power) * att; }\n"
                    "  }\n",
                 i, i, i);
         }
@@ -392,7 +457,8 @@ static void gen_vs(const ffkey *k, sbuf *b)
         int n;  // компонент исходного вектора
         switch (sk->tcgen) {
         case 1:
-            put(b, "  vec4 tc%d = vec4(%s, 1.0);\n", s, k->rhw ? "vec3(0.0)" : "normalize(En)");
+            put(b, "  vec4 tc%d = vec4(%s, 1.0);\n", s,
+                k->rhw ? "vec3(0.0)" : "(dot(En, En) > 0.0 ? normalize(En) : vec3(0.0))");
             n = 3;
             break;
         case 2:
@@ -400,7 +466,10 @@ static void gen_vs(const ffkey *k, sbuf *b)
             n = 3;
             break;
         case 3:
-            put(b, "  vec4 tc%d = vec4(%s, 1.0);\n", s, k->rhw ? "vec3(0.0)" : "reflect(normalize(epos.xyz), normalize(En))");
+            put(b, "  vec4 tc%d = vec4(%s, 1.0);\n", s,
+                k->rhw ? "vec3(0.0)"
+                       : "reflect(dot(epos.xyz, epos.xyz) > 0.0 ? normalize(epos.xyz) : vec3(0.0, 0.0, 1.0), "
+                         "dot(En, En) > 0.0 ? normalize(En) : vec3(0.0, 0.0, 1.0))");
             n = 3;
             break;
         default:
@@ -424,7 +493,7 @@ static void gen_vs(const ffkey *k, sbuf *b)
     put(b, "}\n");
 }
 
-static const char *stage_arg(const ffkey *k, int s, u32 a, char *buf, int alpha)
+static const char *stage_arg(const ffkey *k, int s, u32 a, char *buf, size_t cap, int alpha)
 {
     (void)k;
     const char *base;
@@ -439,9 +508,9 @@ static const char *stage_arg(const ffkey *k, int s, u32 a, char *buf, int alpha)
     }
     const char *comp = alpha || (a & 0x20) ? ".aaaa" : "";
     if (a & 0x10)
-        sprintf(buf, "(vec4(1.0) - %s%s)", base, comp);
+        snprintf(buf, cap, "(vec4(1.0) - %s%s)", base, comp);
     else
-        sprintf(buf, "%s%s", base, comp);
+        snprintf(buf, cap, "%s%s", base, comp);
     return buf;
 }
 
@@ -477,7 +546,7 @@ static void stage_op(sbuf *b, const char *dst, u32 op, const char *a1, const cha
     }
 }
 
-static void gen_fs(const ffkey *k, sbuf *b)
+static void gen_fs(const ffkey *k, const char *ps_body, sbuf *b)
 {
     put(b, SNX_GLSL_HEADER);
     put(b, SNX_GLSL_PRECISION);
@@ -487,17 +556,17 @@ static void gen_fs(const ffkey *k, sbuf *b)
     for (int s = 0; s < k->nstages; s++)
         put(b, "in vec4 v_tc%d;\n", s);
     for (int s = 0; s < k->nstages; s++)
-        if (k->st[s].tex || k->ps)
-            put(b, "uniform %s u_tex%d;\n", k->st[s].tex == 2 ? "samplerCube" : "sampler2D", s);
+        if (k->st[s].tex || k->ps_hash)
+            put(b, "uniform %s u_tex%d;\n", (k->st[s].tex == 2 && !k->ps_hash) ? "samplerCube" : "sampler2D", s);
     put(b, "uniform vec4 u_tfactor, u_fogcolor, u_fog, u_psc[8], u_bump[8]; uniform float u_aref;\n"
            "out vec4 o_color;\n"
            "void main() {\n"
-           "  vec4 cur = v_col0, tmp = vec4(0.0), tex = vec4(1.0);\n");
+           "  vec4 cur = v_col0, tmp = vec4(0.0), tex = vec4(1.0), bump = vec4(0.0);\n");
     if (clip_vary(k))  // плоскости отсечения D3D (ES без GL_EXT_clip_cull_distance)
         for (int i = 0; i < 6; i++)
             if (k->clipmask & (1u << i))
                 put(b, "  if (v_clip[%d] < 0.0) discard;\n", i);
-    if (k->ps) {
+    if (k->ps_hash) {
         // интерфейс тела ps.1.x (d3d8_ps.c): v0, v1, tc0..tc5, u_tex0..5, u_psc[]; результат — в cur
         put(b, "  vec4 v0 = v_col0, v1 = v_col1;\n");
         for (int s = 0; s < 6; s++) {
@@ -506,8 +575,7 @@ static void gen_fs(const ffkey *k, sbuf *b)
             else
                 put(b, "  vec4 tc%d = vec4(0.0);\n", s);
         }
-        const char *body = d3d8_ps_glsl(k->ps);
-        put(b, "%s\n", body ? body : "  cur = v_col0;\n");
+        put(b, "%s\n", ps_body ? ps_body : "  cur = v_col0;\n");
     } else {
         for (int s = 0; s < k->nstages; s++) {
             const stagekey *sk = &k->st[s];
@@ -533,17 +601,17 @@ static void gen_fs(const ffkey *k, sbuf *b)
             } else if (uses_tex)
                 put(b, "  tex = vec4(1.0);\n");
             if (sk->cop == 22 || sk->cop == 23)
-                put(b, "  vec4 bump = tex;\n");
+                put(b, "  bump = tex;\n");
             char a1[64], a2[64], a0[64];
             put(b, "  { vec4 rc, ra;\n    ");
-            stage_op(b, "rc", sk->cop, stage_arg(k, s, sk->ca1, a1, 0), stage_arg(k, s, sk->ca2, a2, 0),
-                     stage_arg(k, s, sk->ca0, a0, 0), s);
+            stage_op(b, "rc", sk->cop, stage_arg(k, s, sk->ca1, a1, sizeof a1, 0),
+                     stage_arg(k, s, sk->ca2, a2, sizeof a2, 0), stage_arg(k, s, sk->ca0, a0, sizeof a0, 0), s);
             if (sk->cop == 24)  // DOTPRODUCT3 — во все каналы, и в альфу
                 put(b, "    ra = rc;\n");
             else {
                 put(b, "    ");
-                stage_op(b, "ra", sk->aop, stage_arg(k, s, sk->aa1, a1, 1), stage_arg(k, s, sk->aa2, a2, 1),
-                         stage_arg(k, s, sk->aa0, a0, 1), s);
+                stage_op(b, "ra", sk->aop, stage_arg(k, s, sk->aa1, a1, sizeof a1, 1),
+                         stage_arg(k, s, sk->aa2, a2, sizeof a2, 1), stage_arg(k, s, sk->aa0, a0, sizeof a0, 1), s);
             }
             put(b, "    %s = clamp(vec4(rc.rgb, ra.a), 0.0, 1.0); }\n", sk->res ? "tmp" : "cur");
         }
@@ -572,6 +640,154 @@ static void gen_fs(const ffkey *k, sbuf *b)
     put(b, "  o_color = cur;\n}\n");
 }
 
+// ================================================================ кеш программ и бинарников GL
+#define PROG_FILE "System/SnxPrograms.bin"
+#define PROG_MAGIC 0x50584E53u  // "SNXP"
+#define PROG_VERSION 2u
+#define PROG_GEN_VERSION 2u     // версия генератора GLSL (меняется при правке шейдеров)
+
+#define BIN_FILE "System/SnxProgramBins.bin"
+#define BIN_MAGIC 0x42584E53u   // "SNXB"
+#define BIN_VERSION 1u
+#define MAX_BIN_BYTES (16u << 20)
+#define MAX_PS_SAVED 4096u
+
+typedef struct {
+    u32 magic;
+    u32 version;
+    u32 gen_version;
+    u32 key_size;
+    char gl_version[128];
+    char gl_renderer[128];
+} bin_hdr;
+
+typedef struct {
+    ffkey key;
+    u32 format;
+    u32 size;
+} bin_rec_hdr;
+
+typedef struct {
+    ffkey key;
+    u32 hash, format, size;
+    u8 *data;
+    u8 state;  // 0 — пусто, 1 — занято, 2 — забрано (tombstone)
+} bin_entry;
+
+static int g_bin_ok;            // драйвер поддерживает glGetProgramBinary / glProgramBinary
+static bin_hdr g_bin_hdr;       // эталонный заголовок текущего драйвера и генератора
+static char g_prog_path[1100];
+static char g_bin_path[1100];
+static bin_entry *g_bins;
+static u32 g_bin_cap, g_nbins;
+
+static void bin_map_insert(const ffkey *k, u32 fmt, u8 *data, u32 size)
+{
+    if ((g_nbins + 1u) * 4u >= g_bin_cap * 3u) {
+        u32 ncap = g_bin_cap ? g_bin_cap * 2u : 512u;
+        bin_entry *nb = calloc(ncap, sizeof *nb);
+        if (!nb) {
+            free(data);
+            return;
+        }
+        for (u32 i = 0; i < g_bin_cap; i++) {
+            if (g_bins[i].state != 1)
+                continue;
+            u32 j = g_bins[i].hash & (ncap - 1u);
+            while (nb[j].state == 1)
+                j = (j + 1u) & (ncap - 1u);
+            nb[j] = g_bins[i];
+        }
+        free(g_bins);
+        g_bins = nb;
+        g_bin_cap = ncap;
+    }
+    u32 h = fnv(k, sizeof *k);
+    u32 i = h & (g_bin_cap - 1u);
+    while (g_bins[i].state == 1) {
+        if (g_bins[i].hash == h && !memcmp(&g_bins[i].key, k, sizeof *k)) {
+            free(g_bins[i].data);
+            g_bins[i].format = fmt;
+            g_bins[i].size = size;
+            g_bins[i].data = data;
+            return;
+        }
+        i = (i + 1u) & (g_bin_cap - 1u);
+    }
+    g_bins[i].key = *k;
+    g_bins[i].hash = h;
+    g_bins[i].format = fmt;
+    g_bins[i].size = size;
+    g_bins[i].data = data;
+    g_bins[i].state = 1;
+    g_nbins++;
+}
+
+// Забрать владение загруженным бинарником программы (освобождает поток рендера после загрузки)
+static u8 *bin_map_take(const ffkey *k, u32 h, u32 *out_fmt, u32 *out_size)
+{
+    if (!g_bin_cap)
+        return NULL;
+    u32 i = h & (g_bin_cap - 1u);
+    while (g_bins[i].state) {
+        if (g_bins[i].state == 1 && g_bins[i].hash == h && !memcmp(&g_bins[i].key, k, sizeof *k)) {
+            u8 *data = g_bins[i].data;
+            *out_fmt = g_bins[i].format;
+            *out_size = g_bins[i].size;
+            g_bins[i].data = NULL;
+            g_bins[i].state = 2;
+            return data;
+        }
+        i = (i + 1u) & (g_bin_cap - 1u);
+    }
+    return NULL;
+}
+
+// Вызывается на Core 2: пути уже разрешены на Core 1 через VFS (без обращений к vfs_* из потока рендера)
+static void bin_cache_init_r(const char *bin_in, const char *bin_out)
+{
+    if (!g_bin_ok)
+        return;
+    int valid = 0;
+    u32 loaded = 0;
+    if (bin_in[0]) {
+        FILE *f = fopen(bin_in, "rb");
+        if (f) {
+            bin_hdr h;
+            if (fread(&h, sizeof h, 1, f) == 1 && !memcmp(&h, &g_bin_hdr, sizeof h)) {
+                valid = 1;
+                bin_rec_hdr rh;
+                while (fread(&rh, sizeof rh, 1, f) == 1) {
+                    if (!rh.size || rh.size > MAX_BIN_BYTES)
+                        break;
+                    u8 *buf = malloc(rh.size);
+                    if (!buf)
+                        break;
+                    if (fread(buf, 1, rh.size, f) != rh.size) {
+                        free(buf);
+                        break;
+                    }
+                    bin_map_insert(&rh.key, rh.format, buf, rh.size);
+                    loaded++;
+                }
+            }
+            fclose(f);
+        }
+    }
+    snprintf(g_bin_path, sizeof g_bin_path, "%s", bin_out);
+    if (!g_bin_path[0])
+        return;
+    if (!valid) {
+        FILE *f = fopen(g_bin_path, "wb");
+        if (!f || fwrite(&g_bin_hdr, sizeof g_bin_hdr, 1, f) != 1)
+            g_bin_path[0] = 0;
+        if (f)
+            fclose(f);
+    }
+    if (loaded)
+        fprintf(stderr, "[d3d8] loaded %u cached GL program binaries\n", loaded);
+}
+
 static GLuint compile(GLenum type, const char *src)
 {
     GLuint s = glCreateShader(type);
@@ -592,50 +808,89 @@ static GLuint compile(GLenum type, const char *src)
 typedef struct {
     ffprog *p;
     const char *vs, *fs;
+    u8 *bin_data;
+    u32 bin_format, bin_size;
 } link_args;
 
-// программа и расположение униформ; prog = 0 — ошибка (рисование пропускается)
+// Программа и расположение униформ (исполняется в потоке рендера); prog = 0 — ошибка
 static void link_body(link_args *a)
 {
     ffprog *p = a->p;
-    GLint ok = 0;
-#ifdef SNX_GLES
-    // собранная в прошлый раз программа (glProgramBinary): без компиляции шейдеров драйвером
-    p->prog = gles_program_load(a->vs, a->fs);
-    ok = p->prog != 0;
+    int from_bin = 0;
+#ifdef GL_PROGRAM_BINARY_LENGTH
+    if (g_bin_ok && a->bin_data && a->bin_size) {
+        GLuint prog = glCreateProgram();
+        glProgramBinary(prog, (GLenum)a->bin_format, a->bin_data, (GLsizei)a->bin_size);
+        GLint ok = 0;
+        glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+        if (ok) {
+            p->prog = prog;
+            from_bin = 1;
+        } else {
+            glDeleteProgram(prog);
+            glGetError();  // сбросить возможную ошибку несовместимого бинарника перед фоллбэком на GLSL
+        }
+    }
 #endif
-    if (!ok) {
+    if (!from_bin) {
         GLuint v = compile(GL_VERTEX_SHADER, a->vs), f = compile(GL_FRAGMENT_SHADER, a->fs);
-        if (!v || !f)
+        if (!v || !f) {
+            if (v)
+                glDeleteShader(v);
+            if (f)
+                glDeleteShader(f);
             return;
+        }
         p->prog = glCreateProgram();
         glAttachShader(p->prog, v);
         glAttachShader(p->prog, f);
-#ifdef SNX_GLES
-        gles_program_hint(p->prog);
+#ifdef GL_PROGRAM_BINARY_RETRIEVABLE_HINT
+        if (g_bin_ok)
+            glProgramParameteri(p->prog, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
 #endif
         glLinkProgram(p->prog);
         glDeleteShader(v);
         glDeleteShader(f);
+        GLint ok = 0;
         glGetProgramiv(p->prog, GL_LINK_STATUS, &ok);
-#ifdef SNX_GLES
-        if (ok)
-            gles_program_store(p->prog, a->vs, a->fs);
+        if (!ok) {
+            char log[2048];
+            glGetProgramInfoLog(p->prog, sizeof log, NULL, log);
+            fprintf(stderr, "[d3d8] program link failed: %s\n", log);
+            glDeleteProgram(p->prog);
+            p->prog = 0;
+            return;
+        }
+#ifdef GL_PROGRAM_BINARY_LENGTH
+        if (g_bin_ok && g_bin_path[0]) {
+            GLint blen = 0;
+            glGetProgramiv(p->prog, GL_PROGRAM_BINARY_LENGTH, &blen);
+            if (blen > 0 && (u32)blen <= MAX_BIN_BYTES) {
+                u8 *buf = malloc((size_t)blen);
+                if (buf) {
+                    GLsizei out_len = 0;
+                    GLenum out_fmt = 0;
+                    glGetProgramBinary(p->prog, blen, &out_len, &out_fmt, buf);
+                    if (out_len > 0 && out_len <= blen) {
+                        FILE *bf = fopen(g_bin_path, "ab");
+                        if (bf) {
+                            bin_rec_hdr rh = {p->key, (u32)out_fmt, (u32)out_len};
+                            fwrite(&rh, sizeof rh, 1, bf);
+                            fwrite(buf, 1, (size_t)out_len, bf);
+                            fclose(bf);
+                        }
+                    }
+                    free(buf);
+                }
+            }
+        }
 #endif
-    }
-    if (!ok) {
-        char log[2048];
-        glGetProgramInfoLog(p->prog, sizeof log, NULL, log);
-        fprintf(stderr, "[d3d8] program link failed: %s\n", log);
-        glDeleteProgram(p->prog);
-        p->prog = 0;
-        return;
     }
     glUseProgram(p->prog);
 #define LOC(n) p->n = glGetUniformLocation(p->prog, #n)
-    LOC(u_wv); LOC(u_proj); LOC(u_world); LOC(u_vp); LOC(u_depth); LOC(u_mat); LOC(u_power); LOC(u_ambient);
-    LOC(u_ld); LOC(u_ls); LOC(u_la); LOC(u_lpos); LOC(u_ldir); LOC(u_latt); LOC(u_fog); LOC(u_fogcolor);
-    LOC(u_clip); LOC(u_tfactor); LOC(u_aref); LOC(u_psc); LOC(u_bump);
+    LOC(u_wv); LOC(u_proj); LOC(u_world); LOC(u_nrm_mat); LOC(u_vp); LOC(u_depth); LOC(u_mat); LOC(u_power);
+    LOC(u_ambient); LOC(u_ld); LOC(u_ls); LOC(u_la); LOC(u_lpos); LOC(u_ldir); LOC(u_latt); LOC(u_fog);
+    LOC(u_fogcolor); LOC(u_clip); LOC(u_tfactor); LOC(u_aref); LOC(u_psc); LOC(u_bump);
 #undef LOC
     p->u_texm = glGetUniformLocation(p->prog, "u_texm");
     for (int s = 0; s < MAX_STAGES; s++) {
@@ -647,9 +902,8 @@ static void link_body(link_args *a)
     }
 }
 
-static void link_program(void *arg)
+static void link_program(link_args *a)
 {
-    link_args *a = arg;
     u64 t0 = rt_ticks_ns();
     link_body(a);
     g_hitch.links++;  // строка [hitch] (d3d8_present)
@@ -657,126 +911,292 @@ static void link_program(void *arg)
     atomic_store_explicit(&a->p->ready, 1, memory_order_release);
 }
 
-// Программы прошлых запусков (d3d8_prog_preload): исходники в куче, освобождает поток рендера
-static void link_program_bg(void *arg)
+static int prog_rehash(u32 new_cap)
 {
-    link_args *a = arg;
-    link_program(a);
-    free((void *)a->vs);
-    free((void *)a->fs);
-}
-
-// Ключи программ между запусками: <user>/System/SnxPrograms.bin — заголовок и ключи подряд в порядке первого
-// использования. Новая программа — сборка в потоке рендера, а гость ждёт её целиком (шейдеры Mesa на A57 — десятки
-// мс: фризы на новых эффектах, взрывах грибов); при создании устройства программы из файла ставятся в очередь
-// потока рендера заранее и собираются в фоне (меню, ролики), а не посреди игры. Ключи с пиксельным шейдером не
-// пишутся: в ключе — его описатель, от запуска к запуску другой.
-#define PROG_FILE "System/SnxPrograms.bin"
-#define PROG_MAGIC 0x50584E53u  // "SNXP"
-#define PROG_VERSION 1u
-static char g_prog_path[1100];
-
-static ffprog *prog_insert(const ffkey *k, u32 h, u32 i)
-{
-    if (g_nprogs >= PROG_CACHE * 3 / 4) {
-        fprintf(stderr, "[d3d8] program cache full\n");
-        return NULL;
+    ffprog **nt = calloc(new_cap, sizeof *nt);
+    if (!nt)
+        return 0;
+    for (u32 i = 0; i < g_prog_cap; i++) {
+        ffprog *p = g_progs[i];
+        if (!p)
+            continue;
+        u32 j = p->hash & (new_cap - 1u);
+        while (nt[j])
+            j = (j + 1u) & (new_cap - 1u);
+        nt[j] = p;
     }
-    ffprog *p = &g_progs[i];
-    memset(p, 0, sizeof *p);
-    p->used = 1;
-    p->key = *k;
-    p->hash = h;
-    p->gen_xf = p->gen_light = p->gen_mat = p->gen_misc = 0xFFFFFFFFu;
-    g_nprogs++;
-    return p;
+    free(g_progs);
+    g_progs = nt;
+    g_prog_cap = new_cap;
+    return 1;
 }
 
-static ffprog *prog_find(const ffkey *k, u32 *h, u32 *slot)
+// Удаление слота с сохранением цепочек линейного пробирования (backward-shift, без аллокаций и OOM)
+static void prog_erase_at(u32 slot)
+{
+    u32 mask = g_prog_cap - 1u;
+    u32 hole = slot, cur = (slot + 1u) & mask;
+    g_progs[hole] = NULL;
+    while (g_progs[cur]) {
+        u32 home = g_progs[cur]->hash & mask;
+        if (((hole - home) & mask) < ((cur - home) & mask)) {
+            g_progs[hole] = g_progs[cur];
+            g_progs[cur] = NULL;
+            hole = cur;
+        }
+        cur = (cur + 1u) & mask;
+    }
+}
+
+static void prog_evict_old(int cur_frame)
+{
+    // Вызывается исключительно на Core 2: никаких cs_finish() не требуется
+    g_cur_prog = 0;
+    g_cached_prog = NULL;
+    memset(g_mru, 0, sizeof g_mru);
+    u32 removed = 0;
+    static const int ages[] = {120, 60, 30, 15, 7, 3, 1, 0, -1};
+    for (size_t k = 0; k < sizeof ages / sizeof ages[0] && g_nprogs >= g_prog_cap / 2u; k++) {
+        int age = ages[k];
+        for (u32 i = 0; i < g_prog_cap;) {
+            ffprog *p = g_progs[i];
+            if (p && (age < 0 || cur_frame - p->last_frame > age)) {
+                if (p->prog)
+                    glDeleteProgram(p->prog);
+                free(p);
+                prog_erase_at(i);
+                atomic_fetch_sub_explicit(&g_nprogs, 1, memory_order_relaxed);
+                removed++;
+                if (age < 0 && g_nprogs < g_prog_cap / 2u)
+                    break;
+                continue;  // проверить элемент, сдвинувшийся в слот i
+            }
+            i++;
+        }
+    }
+    fprintf(stderr, "[d3d8] program cache evicted %u unused programs (%u remain)\n", removed,
+            atomic_load_explicit(&g_nprogs, memory_order_relaxed));
+}
+
+static ffprog *prog_find(const ffkey *k, u32 *h)
 {
     *h = fnv(k, sizeof *k);
-    u32 i = *h & (PROG_CACHE - 1);
-    while (g_progs[i].used) {
-        if (g_progs[i].hash == *h && !memcmp(&g_progs[i].key, k, sizeof *k))
-            return &g_progs[i];
-        i = (i + 1) & (PROG_CACHE - 1);
+    if (!g_prog_cap)
+        return NULL;
+    u32 i = *h & (g_prog_cap - 1u);
+    while (g_progs[i]) {
+        if (g_progs[i]->hash == *h && !memcmp(&g_progs[i]->key, k, sizeof *k))
+            return g_progs[i];
+        i = (i + 1u) & (g_prog_cap - 1u);
     }
-    *slot = i;
     return NULL;
 }
 
-void d3d8_prog_preload(void)
+static ffprog *prog_insert(const ffkey *k, u32 h, int cur_frame)
 {
-    char host[1100];
-    u32 hdr[3] = {0}, n = 0;
-    if (vfs_find(PROG_FILE, host, sizeof host)) {
-        FILE *f = fopen(host, "rb");
+    if (!g_prog_cap) {
+        if (!prog_rehash(PROG_INIT_CAP))
+            return NULL;
+    } else if ((g_nprogs + 1u) * 4u >= g_prog_cap * 3u) {
+        if (g_prog_cap < PROG_MAX_CAP) {
+            if (!prog_rehash(g_prog_cap * 2u))
+                prog_evict_old(cur_frame);
+        } else {
+            prog_evict_old(cur_frame);
+        }
+    }
+    if (g_nprogs >= g_prog_cap)
+        return NULL;
+    ffprog *p = calloc(1, sizeof *p);
+    if (!p)
+        return NULL;
+    p->key = *k;
+    p->hash = h;
+    p->gen_xf = p->gen_view = p->gen_texm = p->gen_vp = p->gen_clip = 0xFFFFFFFFu;
+    p->gen_light = p->gen_mat = p->gen_const = p->gen_psc = p->gen_bump = 0xFFFFFFFFu;
+    p->last_frame = cur_frame;
+    u32 i = h & (g_prog_cap - 1u);
+    while (g_progs[i])
+        i = (i + 1u) & (g_prog_cap - 1u);
+    g_progs[i] = p;
+    atomic_fetch_add_explicit(&g_nprogs, 1, memory_order_relaxed);
+    return p;
+}
+
+typedef struct {
+    char bin_in[1100], bin_out[1100];
+    char prog_in[1100], prog_out[1100];
+} preload_args;
+
+static void x_prog_preload(void *arg)
+{
+    const preload_args *pa = arg;
+    bin_cache_init_r(pa->bin_in, pa->bin_out);
+    u32 hdr[3] = {0}, n = 0, n_ps = 0, n_bin = 0;
+    if (pa->prog_in[0]) {
+        FILE *f = fopen(pa->prog_in, "rb");
         if (f && fread(hdr, 4, 3, f) == 3 && hdr[0] == PROG_MAGIC && hdr[1] == PROG_VERSION &&
             hdr[2] == sizeof(ffkey)) {
             ffkey k;
-            while (fread(&k, sizeof k, 1, f) == 1) {
-                u32 h, i;
-                if (k.ps || prog_find(&k, &h, &i))
-                    continue;
-                ffprog *p = prog_insert(&k, h, i);
-                if (!p)
+            u32 ps_ntok;
+            while (fread(&k, sizeof k, 1, f) == 1 && fread(&ps_ntok, 4, 1, f) == 1) {
+                char *ps_body = NULL;
+                if (ps_ntok > MAX_PS_SAVED)
                     break;
+                if (ps_ntok > 0) {
+                    u32 *toks = malloc((size_t)ps_ntok * sizeof(u32));
+                    if (!toks || fread(toks, 4, ps_ntok, f) != ps_ntok) {
+                        free(toks);
+                        break;
+                    }
+                    u64 h64 = 0;
+                    ps_body = d3d8_ps_translate(toks, ps_ntok, NULL, &h64);
+                    free(toks);
+                    if (!ps_body || h64 != k.ps_hash) {
+                        free(ps_body);
+                        continue;
+                    }
+                } else if (k.ps_hash)
+                    continue;
+                u32 h;
+                if (prog_find(&k, &h)) {
+                    free(ps_body);
+                    continue;
+                }
+                ffprog *p = prog_insert(&k, h, 0);
+                if (!p) {
+                    free(ps_body);
+                    break;
+                }
+                u32 bfmt = 0, bsize = 0;
+                u8 *bdata = bin_map_take(&k, h, &bfmt, &bsize);
+                int had_bin = bdata != NULL;
                 sbuf vs = {0}, fs = {0};
                 gen_vs(&k, &vs);
-                gen_fs(&k, &fs);
-                link_args a = {p, vs.p, fs.p};
-                cs_async(link_program_bg, &a, sizeof a);
+                gen_fs(&k, ps_body, &fs);
+                free(ps_body);
+                link_args a = {p, vs.p, fs.p, bdata, bfmt, bsize};
+                link_program(&a);
+                free(vs.p);
+                free(fs.p);
+                free(bdata);
                 n++;
+                if (k.ps_hash)
+                    n_ps++;
+                if (had_bin)
+                    n_bin++;
             }
         } else if (f) {
-            hdr[0] = 0;  // старый формат ключа — файл заново
+            hdr[0] = 0;  // старый формат ключа — пересоздать файл
         }
         if (f)
             fclose(f);
     }
-    if (!vfs_for_write(PROG_FILE, g_prog_path, sizeof g_prog_path, 0)) {
-        g_prog_path[0] = 0;
-        return;
-    }
-    if (hdr[0] != PROG_MAGIC) {
+    snprintf(g_prog_path, sizeof g_prog_path, "%s", pa->prog_out);
+    if (g_prog_path[0] && hdr[0] != PROG_MAGIC) {
         FILE *f = fopen(g_prog_path, "wb");
         u32 h[3] = {PROG_MAGIC, PROG_VERSION, (u32)sizeof(ffkey)};
         if (!f || fwrite(h, 4, 3, f) != 3)
             g_prog_path[0] = 0;
         if (f)
             fclose(f);
-        vfs_changed();
     }
-    fprintf(stderr, "[d3d8] %u programs from earlier runs queued for background build\n", n);
+    g_cur_prog = 0;
+    fprintf(stderr, "[d3d8] %u programs (%u ps, %u binaries) preloaded on render thread\n", n, n_ps, n_bin);
 }
 
-static ffprog *program_for(d3ddev *d, const ffkey *k)
+// Ключи программ между запусками: <user>/System/SnxPrograms.bin (v2) и кеш бинарников SnxProgramBins.bin.
+// Пути VFS разрешаются на Core 1, а разбор и компиляция шейдеров выполняются асинхронно на Core 2.
+void d3d8_prog_preload(void)
 {
-    (void)d;
-    u32 h, i;
-    ffprog *p = prog_find(k, &h, &i);
-    if (p) {
-        if (!atomic_load_explicit(&p->ready, memory_order_acquire))
-            cs_finish();  // ещё в фоновой очереди: дождаться (только сразу после запуска)
-        return p;
+    preload_args pa;
+    memset(&pa, 0, sizeof pa);
+    if (g_bin_ok) {
+        if (!vfs_find(BIN_FILE, pa.bin_in, sizeof pa.bin_in))
+            pa.bin_in[0] = 0;
+        if (!vfs_for_write(BIN_FILE, pa.bin_out, sizeof pa.bin_out, 0))
+            pa.bin_out[0] = 0;
+        else if (!pa.bin_in[0])
+            vfs_changed();
     }
-    p = prog_insert(k, h, i);
-    if (!p)
-        return NULL;
-    sbuf vs = {0}, fs = {0};
-    gen_vs(k, &vs);
-    gen_fs(k, &fs);
-    link_args a = {p, vs.p, fs.p};
-    cs_sync(link_program, &a);  // компиляция и сборка — в потоке рендера, одним ожиданием
-    free(vs.p);
-    free(fs.p);
-    if (g_prog_path[0] && !k->ps) {  // в следующий раз — в фоне при создании устройства
-        FILE *f = fopen(g_prog_path, "ab");
-        if (f) {
-            fwrite(k, sizeof *k, 1, f);
-            fclose(f);
+    if (!vfs_find(PROG_FILE, pa.prog_in, sizeof pa.prog_in))
+        pa.prog_in[0] = 0;
+    if (!vfs_for_write(PROG_FILE, pa.prog_out, sizeof pa.prog_out, 0))
+        pa.prog_out[0] = 0;
+    else if (!pa.prog_in[0])
+        vfs_changed();
+    cs_async(x_prog_preload, &pa, sizeof pa);
+}
+
+static void prog_mru_put(ffprog *p)
+{
+    for (int i = 0; i < 4; i++) {
+        if (g_mru[i] == p) {
+            for (int j = i; j > 0; j--)
+                g_mru[j] = g_mru[j - 1];
+            g_mru[0] = p;
+            return;
         }
     }
+    g_mru[3] = g_mru[2];
+    g_mru[2] = g_mru[1];
+    g_mru[1] = g_mru[0];
+    g_mru[0] = p;
+}
+
+// Исполняется исключительно на Core 2: при промахе кеша шейдер компилируется и сохраняется прямо здесь,
+// без cs_sync и остановки потока гостя (Core 1)!
+static ffprog *program_for(d3d_rstate *r, const ffkey *k)
+{
+    for (int i = 0; i < 4; i++) {
+        ffprog *p = g_mru[i];
+        if (p && !memcmp(&p->key, k, sizeof *k)) {
+            if (i > 0) {
+                for (int j = i; j > 0; j--)
+                    g_mru[j] = g_mru[j - 1];
+                g_mru[0] = p;
+            }
+            p->last_frame = r->frame;
+            return p;
+        }
+    }
+    u32 h;
+    ffprog *p = prog_find(k, &h);
+    if (p) {
+        p->last_frame = r->frame;
+        prog_mru_put(p);
+        return p;
+    }
+    p = prog_insert(k, h, r->frame);
+    if (!p)
+        return NULL;
+    const char *ps_body = k->ps_hash ? d3d8_r_ps_glsl(r->ps) : NULL;
+    u32 bfmt = 0, bsize = 0;
+    u8 *bdata = bin_map_take(k, h, &bfmt, &bsize);
+    sbuf vs = {0}, fs = {0};
+    gen_vs(k, &vs);
+    gen_fs(k, ps_body, &fs);
+    link_args a = {p, vs.p, fs.p, bdata, bfmt, bsize};
+    link_program(&a);
+    g_cur_prog = 0;
+    free(vs.p);
+    free(fs.p);
+    free(bdata);
+    if (g_prog_path[0]) {
+        u32 ps_ntok = 0;
+        const u32 *ps_toks = k->ps_hash ? d3d8_r_ps_tokens(r->ps, &ps_ntok) : NULL;
+        if (!k->ps_hash || (ps_toks && ps_ntok > 0 && ps_ntok <= MAX_PS_SAVED)) {
+            FILE *f = fopen(g_prog_path, "ab");
+            if (f) {
+                fwrite(k, sizeof *k, 1, f);
+                fwrite(&ps_ntok, 4, 1, f);
+                if (ps_ntok)
+                    fwrite(ps_toks, 4, ps_ntok, f);
+                fclose(f);
+            }
+        }
+    }
+    prog_mru_put(p);
     return p;
 }
 
@@ -788,22 +1208,43 @@ static void color4(float *o, u32 c)
     o[3] = (float)(c >> 24) / 255.0f;
 }
 
-static void upload_uniforms(d3ddev *d, ffprog *p)
+static void upload_uniforms(d3d_rstate *d, ffprog *p)
 {
-    if (p->gen_xf != d->gen_xf || p->gen_misc != d->gen_misc) {
+    if (p->gen_xf != d->gen_xf) {
         float wv[16];
-        mat_mul(wv, d->world, d->view);
-        glUniformMatrix4fv(p->u_wv, 1, GL_FALSE, wv);
-        glUniformMatrix4fv(p->u_proj, 1, GL_FALSE, d->proj);
-        glUniformMatrix4fv(p->u_world, 1, GL_FALSE, d->world);
+        if (p->u_wv >= 0 || p->u_nrm_mat >= 0)
+            mat_mul(wv, d->world, d->view);
+        if (p->u_wv >= 0)
+            glUniformMatrix4fv(p->u_wv, 1, GL_FALSE, wv);
+        if (p->u_proj >= 0)
+            glUniformMatrix4fv(p->u_proj, 1, GL_FALSE, d->proj);
+        if (p->u_world >= 0)
+            glUniformMatrix4fv(p->u_world, 1, GL_FALSE, d->world);
+        if (p->u_nrm_mat >= 0) {
+            float nm[9];
+            compute_normal_mat(nm, wv);
+            glUniformMatrix3fv(p->u_nrm_mat, 1, GL_FALSE, nm);
+        }
+        p->gen_xf = d->gen_xf;
+    }
+    if (p->gen_texm != d->gen_texm) {
         if (p->u_texm >= 0)
             glUniformMatrix4fv(p->u_texm, MAX_STAGES, GL_FALSE, &d->texm[0][0]);
-        glUniform4f(p->u_vp, (float)d->vp[0], (float)d->vp[1], (float)d->vp[2], (float)d->vp[3]);
-        glUniform2f(p->u_depth, d->vpz[0], d->vpz[1]);
+        p->gen_texm = d->gen_texm;
+    }
+    if (p->gen_vp != d->gen_vp) {
+        if (p->u_vp >= 0)
+            glUniform4f(p->u_vp, (float)d->vp[0], (float)d->vp[1], (float)d->vp[2], (float)d->vp[3]);
+        if (p->u_depth >= 0)
+            glUniform2f(p->u_depth, d->vpz[0], d->vpz[1]);
+        p->gen_vp = d->gen_vp;
+    }
+    if (p->gen_clip != d->gen_clip) {
         if (p->u_clip >= 0)
             glUniform4fv(p->u_clip, 6, &d->clip[0][0]);
+        p->gen_clip = d->gen_clip;
     }
-    if (p->key.lighting && (p->gen_light != d->gen_light || p->gen_xf != d->gen_xf)) {
+    if (p->key.lighting && (p->gen_light != d->gen_light || p->gen_view != d->gen_view)) {
         float ld[MAX_LIGHTS][4], ls[MAX_LIGHTS][4], la[MAX_LIGHTS][4], lpos[MAX_LIGHTS][4], ldir[MAX_LIGHTS][4],
             latt[MAX_LIGHTS][4];
         const float *v = d->view;
@@ -830,30 +1271,56 @@ static void upload_uniforms(d3ddev *d, ffprog *p)
             latt[i][2] = l->att2;
             latt[i][3] = 0.0f;
         }
-        glUniform4fv(p->u_ld, MAX_LIGHTS, &ld[0][0]);
-        glUniform4fv(p->u_ls, MAX_LIGHTS, &ls[0][0]);
-        glUniform4fv(p->u_la, MAX_LIGHTS, &la[0][0]);
-        glUniform4fv(p->u_lpos, MAX_LIGHTS, &lpos[0][0]);
-        glUniform4fv(p->u_ldir, MAX_LIGHTS, &ldir[0][0]);
-        glUniform4fv(p->u_latt, MAX_LIGHTS, &latt[0][0]);
+        if (p->u_ld >= 0)
+            glUniform4fv(p->u_ld, MAX_LIGHTS, &ld[0][0]);
+        if (p->u_ls >= 0)
+            glUniform4fv(p->u_ls, MAX_LIGHTS, &ls[0][0]);
+        if (p->u_la >= 0)
+            glUniform4fv(p->u_la, MAX_LIGHTS, &la[0][0]);
+        if (p->u_lpos >= 0)
+            glUniform4fv(p->u_lpos, MAX_LIGHTS, &lpos[0][0]);
+        if (p->u_ldir >= 0)
+            glUniform4fv(p->u_ldir, MAX_LIGHTS, &ldir[0][0]);
+        if (p->u_latt >= 0)
+            glUniform4fv(p->u_latt, MAX_LIGHTS, &latt[0][0]);
+        p->gen_light = d->gen_light;
+        p->gen_view = d->gen_view;
     }
     if (p->key.lighting && p->gen_mat != d->gen_mat) {
-        glUniform4fv(p->u_mat, 4, d->material);
-        glUniform1f(p->u_power, d->material[16]);
+        if (p->u_mat >= 0)
+            glUniform4fv(p->u_mat, 4, d->material);
+        if (p->u_power >= 0)
+            glUniform1f(p->u_power, d->material[16]);
+        p->gen_mat = d->gen_mat;
     }
-    if (p->gen_misc != d->gen_misc) {
+    if (p->gen_const != d->gen_const) {
         float c[4];
-        color4(c, d->rs[60]);
-        glUniform4fv(p->u_tfactor, 1, c);
-        color4(c, d->rs[34]);
-        glUniform4fv(p->u_fogcolor, 1, c);
-        color4(c, d->rs[139]);
-        glUniform4fv(p->u_ambient, 1, c);
-        float fs = u2f(d->rs[36]), fe = u2f(d->rs[37]);
-        glUniform4f(p->u_fog, fs, fe, u2f(d->rs[38]), fe != fs ? 1.0f / (fe - fs) : 0.0f);
-        glUniform1f(p->u_aref, (float)(d->rs[24] & 0xFF));
+        if (p->u_tfactor >= 0) {
+            color4(c, d->rs[60]);
+            glUniform4fv(p->u_tfactor, 1, c);
+        }
+        if (p->u_fogcolor >= 0) {
+            color4(c, d->rs[34]);
+            glUniform4fv(p->u_fogcolor, 1, c);
+        }
+        if (p->u_ambient >= 0) {
+            color4(c, d->rs[139]);
+            glUniform4fv(p->u_ambient, 1, c);
+        }
+        if (p->u_fog >= 0) {
+            float fs = u2f(d->rs[36]), fe = u2f(d->rs[37]);
+            glUniform4f(p->u_fog, fs, fe, u2f(d->rs[38]), fe != fs ? 1.0f / (fe - fs) : 0.0f);
+        }
+        if (p->u_aref >= 0)
+            glUniform1f(p->u_aref, (float)(d->rs[24] & 0xFF));
+        p->gen_const = d->gen_const;
+    }
+    if (p->gen_psc != d->gen_psc) {
         if (p->u_psc >= 0)
             glUniform4fv(p->u_psc, 8, &d->psc[0][0]);
+        p->gen_psc = d->gen_psc;
+    }
+    if (p->gen_bump != d->gen_bump) {
         if (p->u_bump >= 0) {
             float bm[MAX_STAGES][4];
             for (int s = 0; s < MAX_STAGES; s++)
@@ -861,14 +1328,11 @@ static void upload_uniforms(d3ddev *d, ffprog *p)
                     bm[s][j] = u2f(d->tss[s][7 + j]);
             glUniform4fv(p->u_bump, MAX_STAGES, &bm[0][0]);
         }
+        p->gen_bump = d->gen_bump;
     }
-    p->gen_xf = d->gen_xf;
-    p->gen_light = d->gen_light;
-    p->gen_mat = d->gen_mat;
-    p->gen_misc = d->gen_misc;
 }
 
-// ================================================================ состояние GL
+// ================================================================ состояние GL (гранулярно по d->gl_dirty)
 static GLenum gl_blend(u32 b)
 {
     static const GLenum t[14] = {GL_ONE, GL_ZERO, GL_ONE, GL_SRC_COLOR, GL_ONE_MINUS_SRC_COLOR, GL_SRC_ALPHA,
@@ -891,68 +1355,85 @@ static GLenum gl_stencil_op(u32 o)
     return o < 9 ? t[o] : GL_KEEP;
 }
 
-static u32 g_applied_gen = 0xFFFFFFFFu;
-
-static void apply_state(d3ddev *d)
+static void apply_state(d3d_rstate *d)
 {
-    if (g_applied_gen == d->gen_misc)
+    u32 dirty = d->gl_dirty;
+    if (!dirty)
         return;
-    g_applied_gen = d->gen_misc;
+    d->gl_dirty = 0;
     const u32 *rs = d->rs;
-    glViewport((GLint)d->vp[0], (GLint)d->vp[1], (GLsizei)d->vp[2], (GLsizei)d->vp[3]);
-    glDepthRange(d->vpz[0], d->vpz[1]);
-    glDisable(GL_SCISSOR_TEST);
-    if (rs[7] && d->ds) {
-        glEnable(GL_DEPTH_TEST);
-        glDepthFunc(gl_cmp(rs[23]));
-    } else
-        glDisable(GL_DEPTH_TEST);
-    glDepthMask(rs[14] && d->ds ? GL_TRUE : GL_FALSE);
-    if (rs[27]) {
-        glEnable(GL_BLEND);
-        u32 src = rs[19], dst = rs[20];
-        if (src == 12) {  // BOTHSRCALPHA
-            src = 5;
-            dst = 6;
-        } else if (src == 13) {  // BOTHINVSRCALPHA
-            src = 6;
-            dst = 5;
+    if (dirty & GLD_VP) {
+        glViewport((GLint)d->vp[0], (GLint)d->vp[1], (GLsizei)d->vp[2], (GLsizei)d->vp[3]);
+        glDepthRange(d->vpz[0], d->vpz[1]);
+    }
+    if (dirty & GLD_SCISSOR)
+        glDisable(GL_SCISSOR_TEST);
+    if (dirty & GLD_DEPTH) {
+        if (rs[7] && d->ds) {
+            glEnable(GL_DEPTH_TEST);
+            glDepthFunc(gl_cmp(rs[23]));
+        } else
+            glDisable(GL_DEPTH_TEST);
+        glDepthMask(rs[14] && d->ds ? GL_TRUE : GL_FALSE);
+    }
+    if (dirty & GLD_BLEND) {
+        if (rs[27]) {
+            glEnable(GL_BLEND);
+            u32 src = rs[19], dst = rs[20];
+            if (src == 12) {  // BOTHSRCALPHA
+                src = 5;
+                dst = 6;
+            } else if (src == 13) {  // BOTHINVSRCALPHA
+                src = 6;
+                dst = 5;
+            }
+            glBlendFunc(gl_blend(src), gl_blend(dst));
+            static const GLenum ops[6] = {GL_FUNC_ADD, GL_FUNC_ADD, GL_FUNC_SUBTRACT, GL_FUNC_REVERSE_SUBTRACT,
+                                          GL_MIN, GL_MAX};
+            glBlendEquation(rs[171] < 6 ? ops[rs[171]] : GL_FUNC_ADD);
+        } else
+            glDisable(GL_BLEND);
+    }
+    if (dirty & GLD_CULL) {
+        // D3D «по часовой» = GL «против часовой» (кадр хранится сверху вниз)
+        glFrontFace(GL_CCW);
+        if (rs[22] == 2) {
+            glEnable(GL_CULL_FACE);
+            glCullFace(GL_FRONT);
+        } else if (rs[22] == 3) {
+            glEnable(GL_CULL_FACE);
+            glCullFace(GL_BACK);
+        } else
+            glDisable(GL_CULL_FACE);
+    }
+    if (dirty & GLD_STENCIL) {
+        if (rs[52] && d->ds) {
+            glEnable(GL_STENCIL_TEST);
+            glStencilFunc(gl_cmp(rs[56]), (GLint)rs[57], rs[58]);
+            glStencilOp(gl_stencil_op(rs[53]), gl_stencil_op(rs[54]), gl_stencil_op(rs[55]));
+            glStencilMask(rs[59]);
+        } else
+            glDisable(GL_STENCIL_TEST);
+    }
+    if (dirty & GLD_COLORMASK) {
+        u32 cw = rs[168];
+        glColorMask(cw & 1, (cw >> 1) & 1, (cw >> 2) & 1, (cw >> 3) & 1);
+    }
+    if (dirty & GLD_POLY) {
+        glPolygonMode(GL_FRONT_AND_BACK, rs[8] == 1 ? GL_POINT : rs[8] == 2 ? GL_LINE : GL_FILL);
+        if (rs[47]) {  // ZBIAS 0..16: больше — ближе
+            glEnable(GL_POLYGON_OFFSET_FILL);
+            glPolygonOffset(-1.0f, -(float)rs[47]);
+        } else
+            glDisable(GL_POLYGON_OFFSET_FILL);
+    }
+    if (dirty & GLD_CLIP) {
+        for (int i = 0; i < 6; i++) {
+            if (rs[152] & (1u << i))
+                glEnable(GL_CLIP_DISTANCE0 + i);
+            else
+                glDisable(GL_CLIP_DISTANCE0 + i);
         }
-        glBlendFunc(gl_blend(src), gl_blend(dst));
-        static const GLenum ops[6] = {GL_FUNC_ADD, GL_FUNC_ADD, GL_FUNC_SUBTRACT, GL_FUNC_REVERSE_SUBTRACT, GL_MIN, GL_MAX};
-        glBlendEquation(rs[171] < 6 ? ops[rs[171]] : GL_FUNC_ADD);
-    } else
-        glDisable(GL_BLEND);
-    // D3D «по часовой» = GL «против часовой» (кадр хранится сверху вниз)
-    glFrontFace(GL_CCW);
-    if (rs[22] == 2) {
-        glEnable(GL_CULL_FACE);
-        glCullFace(GL_FRONT);
-    } else if (rs[22] == 3) {
-        glEnable(GL_CULL_FACE);
-        glCullFace(GL_BACK);
-    } else
-        glDisable(GL_CULL_FACE);
-    if (rs[52] && d->ds) {
-        glEnable(GL_STENCIL_TEST);
-        glStencilFunc(gl_cmp(rs[56]), (GLint)rs[57], rs[58]);
-        glStencilOp(gl_stencil_op(rs[53]), gl_stencil_op(rs[54]), gl_stencil_op(rs[55]));
-        glStencilMask(rs[59]);
-    } else
-        glDisable(GL_STENCIL_TEST);
-    u32 cw = rs[168];
-    glColorMask(cw & 1, (cw >> 1) & 1, (cw >> 2) & 1, (cw >> 3) & 1);
-    glPolygonMode(GL_FRONT_AND_BACK, rs[8] == 1 ? GL_POINT : rs[8] == 2 ? GL_LINE : GL_FILL);
-    if (rs[47]) {  // ZBIAS 0..16: больше — ближе
-        glEnable(GL_POLYGON_OFFSET_FILL);
-        glPolygonOffset(-1.0f, -(float)rs[47]);
-    } else
-        glDisable(GL_POLYGON_OFFSET_FILL);
-    for (int i = 0; i < 6; i++) {
-        if (rs[152] & (1u << i))
-            glEnable(GL_CLIP_DISTANCE0 + i);
-        else
-            glDisable(GL_CLIP_DISTANCE0 + i);
     }
 }
 
@@ -966,20 +1447,61 @@ static GLint gl_address(u32 a)
     }
 }
 
-// анизотропная фильтрация (GL_EXT_texture_filter_anisotropic) — проверяется один раз при создании устройства
+// Возможности GL (анизотропия и кеш бинарников программ) — проверяются один раз при создании устройства
 static int g_aniso;
 
-static void probe_caps(void *arg)
+static void x_init_gl(void *arg)
 {
     d3ddev *d = arg;
+    d3d_rstate *r = &d->r;
+    glGenVertexArrays(1, &r->vao);
+    glBindVertexArray(r->vao);
+    glGenBuffers(1, &r->up_vbo);
+    glGenBuffers(1, &r->up_ibo);
+    glGenSamplers(MAX_STAGES, r->samplers);
     glGetError();
-    glSamplerParameterf(d->samplers[0], GL_TEXTURE_MAX_ANISOTROPY_EXT, 1.0f);
+    glSamplerParameterf(r->samplers[0], GL_TEXTURE_MAX_ANISOTROPY_EXT, 1.0f);
     g_aniso = glGetError() == GL_NO_ERROR;
+#ifdef GL_NUM_PROGRAM_BINARY_FORMATS
+    GLint nfmts = 0;
+    glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS, &nfmts);
+    g_bin_ok = nfmts > 0;
+#if SNX_GL_NEEDS_LOADER
+    if (!glGetProgramBinary || !glProgramBinary || !glProgramParameteri)
+        g_bin_ok = 0;
+#endif
+#ifdef SNX_GLES
+    {
+        const char *e = getenv("SNX_SHADER_CACHE");  // SNX_SHADER_CACHE=0 — без кэша бинарников (docs/ANDROID.md)
+        if (e && !strcmp(e, "0"))
+            g_bin_ok = 0;
+    }
+#endif
+    if (g_bin_ok) {
+        const char *ver = (const char *)glGetString(GL_VERSION);
+        const char *ren = (const char *)glGetString(GL_RENDERER);
+        memset(&g_bin_hdr, 0, sizeof g_bin_hdr);
+        g_bin_hdr.magic = BIN_MAGIC;
+        g_bin_hdr.version = BIN_VERSION;
+        g_bin_hdr.gen_version = PROG_GEN_VERSION;
+        g_bin_hdr.key_size = (u32)sizeof(ffkey);
+        if (ver)
+            snprintf(g_bin_hdr.gl_version, sizeof g_bin_hdr.gl_version, "%s", ver);
+#ifdef SNX_GLES
+        // генератор GLSL сборки ES отличается от настольного (точность, BGRA, v_clip): бинарники — только своей сборки
+        size_t vl = strlen(g_bin_hdr.gl_version);
+        snprintf(g_bin_hdr.gl_version + vl, sizeof g_bin_hdr.gl_version - vl, "|es " __DATE__ " " __TIME__);
+#endif
+        if (ren)
+            snprintf(g_bin_hdr.gl_renderer, sizeof g_bin_hdr.gl_renderer, "%s", ren);
+    }
+    glGetError();
+#endif
 }
 
-void d3d8_caps_probe(d3ddev *d) { cs_sync(probe_caps, d); }
+void d3d8_cmd_init_gl(d3ddev *d) { cs_sync(x_init_gl, d); }
 
-static void update_sampler(d3ddev *d, int s)
+static void update_sampler(d3d_rstate *d, int s)
 {
     const u32 *t = d->tss[s];
     GLuint sm = d->samplers[s];
@@ -1025,7 +1547,7 @@ static u32 g_attr_enabled;
 // ES без glDrawElementsBaseVertex: базовая вершина — сдвигом указателей атрибутов (вершин от начала буфера)
 static u32 g_attr_base;
 
-static void setup_attribs(d3ddev *d, const vdecl *decl, const void *up, u32 up_stride, u32 up_bytes)
+static void setup_attribs(d3d_rstate *d, const vdecl *decl, const void *up, u32 up_stride, u32 up_bytes)
 {
     u32 want = 0;
     if (up) {
@@ -1045,7 +1567,6 @@ static void setup_attribs(d3ddev *d, const vdecl *decl, const void *up, u32 up_s
             d3dbuf *b = d->stream[e->stream];
             if (!b)
                 continue;
-            d3d8_buf_sync(b);
             glBindBuffer(GL_ARRAY_BUFFER, b->gl);
             stride = d->stride[e->stream];
         }
@@ -1080,17 +1601,19 @@ static void setup_attribs(d3ddev *d, const vdecl *decl, const void *up, u32 up_s
 }
 
 // SNX_DUMP_DRAWS=N: состояние каждой отрисовки кадра N (стадии, смешивание, матрицы текстур) — в stderr
-int d3d8_dumping(const d3ddev *d)
+static int dumping_frame(int cur_frame)
 {
     static int frame = -2;
     if (frame == -2) {
         const char *e = getenv("SNX_DUMP_DRAWS");
         frame = e ? atoi(e) : -1;
     }
-    return d->frame == frame;
+    return cur_frame == frame;
 }
 
-static void dump_draw(d3ddev *d, const ffkey *k, u32 prim, u32 count, int indexed)
+int d3d8_dumping(const d3ddev *d) { return d && dumping_frame(d->frame); }
+
+static void dump_draw(const d3d_rstate *d, const ffkey *k, u32 prim, u32 count, int indexed)
 {
     const u32 *rs = d->rs;
     fprintf(stderr, "[dump] draw %u: prim %u n %u %s rhw %u light %u | blend %u %u/%u z %u/%u/%u atest %u/%u/%u "
@@ -1115,80 +1638,677 @@ static void dump_draw(d3ddev *d, const ffkey *k, u32 prim, u32 count, int indexe
     }
 }
 
-void d3d8_draw(d3ddev *d, u32 prim, u32 count, int indexed, u32 first, u32 min_index, u32 num_vertices,
-               const void *up_vertices, u32 up_stride, const void *up_indices, u32 up_index_fmt)
+// ================================================================ команды D3D8 (Core 1 -> gl_cs -> Core 2)
+static u32 f2u_r(float f)
+{
+    u32 v;
+    memcpy(&v, &f, 4);
+    return v;
+}
+
+static void identity_r(float *m)
+{
+    memset(m, 0, 64);
+    m[0] = m[5] = m[10] = m[15] = 1.0f;
+}
+
+// Чистые функции обновления d3d_rstate (выполняются на Core 2 и проверяются в d3d8_cs_test)
+void d3d8_r_apply_rs(d3d_rstate *r, u32 state, u32 val)
+{
+    if (state >= 256 || r->rs[state] == val)
+        return;
+    r->rs[state] = val;
+    switch (state) {
+    case 7: case 14: case 23:
+        r->gl_dirty |= GLD_DEPTH;
+        break;
+    case 8: case 47:
+        r->gl_dirty |= GLD_POLY;
+        break;
+    case 15: case 25: case 28: case 29: case 35: case 48:
+    case 137: case 140: case 141: case 142: case 143:
+    case 145: case 146: case 147: case 148:
+        r->key_dirty = 1;
+        break;
+    case 19: case 20: case 27: case 171:
+        r->gl_dirty |= GLD_BLEND;
+        break;
+    case 22:
+        r->gl_dirty |= GLD_CULL;
+        break;
+    case 24: case 34: case 36: case 37: case 38: case 60: case 139:
+        r->gen_const++;
+        break;
+    case 52: case 53: case 54: case 55: case 56: case 57: case 58: case 59:
+        r->gl_dirty |= GLD_STENCIL;
+        break;
+    case 152:
+        r->gl_dirty |= GLD_CLIP;
+        r->key_dirty = 1;
+        break;
+    case 168:
+        r->gl_dirty |= GLD_COLORMASK;
+        break;
+    default:
+        break;
+    }
+}
+
+void d3d8_r_apply_tss(d3d_rstate *r, u32 s, u32 t, u32 val)
+{
+    if (s >= MAX_STAGES || t >= 32 || r->tss[s][t] == val)
+        return;
+    r->tss[s][t] = val;
+    if (t >= 7 && t <= 10)
+        r->gen_bump++;
+    else if ((t >= 13 && t <= 21) || t == 25)
+        r->sampler_dirty |= 1u << s;
+    else if ((t >= 1 && t <= 6) || t == 11 || t == 24 || (t >= 26 && t <= 28))
+        r->key_dirty = 1;
+}
+
+void d3d8_r_apply_xf(d3d_rstate *r, u32 state, const float mat[16])
+{
+    if (state == 2) {
+        memcpy(r->view, mat, 64);
+        r->gen_xf++;
+        r->gen_view++;
+    } else if (state == 3) {
+        memcpy(r->proj, mat, 64);
+        r->gen_xf++;
+    } else if (state == 256) {
+        memcpy(r->world, mat, 64);
+        r->gen_xf++;
+    } else if (state >= 16 && state < 16 + MAX_STAGES) {
+        memcpy(r->texm[state - 16], mat, 64);
+        r->gen_texm++;
+    }
+}
+
+void d3d8_r_apply_tex(d3d_rstate *r, u32 s, d3dtex *t)
+{
+    if (s >= MAX_STAGES)
+        return;
+    d3dtex *old = r->tex[s];
+    u8 old_k = old ? (u8)(old->cube ? 2 : 1) : 0;
+    u8 new_k = t ? (u8)(t->cube ? 2 : 1) : 0;
+    r->tex[s] = t;
+    if (old_k != new_k)
+        r->key_dirty = 1;
+}
+
+typedef struct { d3ddev *d; int has_autodepth; u32 bb_w, bb_h; } cmd_reset_t;
+static void x_reset_defaults(void *p)
+{
+    const cmd_reset_t *q = p;
+    d3d_rstate *r = &q->d->r;
+    memset(r->rs, 0, sizeof r->rs);
+    r->rs[7] = q->has_autodepth ? 1 : 0;
+    r->rs[8] = 3;
+    r->rs[9] = 2;
+    r->rs[14] = 1;
+    r->rs[16] = 1;
+    r->rs[19] = 2;
+    r->rs[20] = 1;
+    r->rs[22] = 3;
+    r->rs[23] = 4;
+    r->rs[25] = 8;
+    r->rs[37] = f2u_r(1.0f);
+    r->rs[38] = f2u_r(1.0f);
+    r->rs[53] = r->rs[54] = r->rs[55] = 1;
+    r->rs[56] = 8;
+    r->rs[58] = r->rs[59] = 0xFFFFFFFFu;
+    r->rs[60] = 0xFFFFFFFFu;
+    r->rs[136] = 1;
+    r->rs[137] = 1;
+    r->rs[141] = 1;
+    r->rs[142] = 1;
+    r->rs[145] = 1;
+    r->rs[146] = 2;
+    r->rs[154] = f2u_r(1.0f);
+    r->rs[155] = f2u_r(1.0f);
+    r->rs[166] = f2u_r(64.0f);
+    r->rs[161] = 1;
+    r->rs[162] = 0xFFFFFFFFu;
+    r->rs[164] = f2u_r(1.0f);
+    r->rs[168] = 0xF;
+    r->rs[171] = 1;
+    r->rs[172] = 3;
+    r->rs[173] = 1;
+    for (int s = 0; s < MAX_STAGES; s++) {
+        u32 *t = r->tss[s];
+        memset(t, 0, 32 * 4);
+        t[1] = s == 0 ? 4 : 1;
+        t[2] = 2;
+        t[3] = 1;
+        t[4] = s == 0 ? 2 : 1;
+        t[5] = 2;
+        t[6] = 1;
+        t[11] = (u32)s;
+        t[13] = t[14] = t[25] = 1;
+        t[16] = t[17] = 1;
+        t[21] = 1;
+        t[26] = t[27] = t[28] = 1;
+    }
+    identity_r(r->view);
+    identity_r(r->proj);
+    identity_r(r->world);
+    for (int s = 0; s < MAX_STAGES; s++)
+        identity_r(r->texm[s]);
+    memset(r->material, 0, sizeof r->material);
+    memset(r->light_on, 0, sizeof r->light_on);
+    r->vp[0] = r->vp[1] = 0;
+    r->vp[2] = q->bb_w;
+    r->vp[3] = q->bb_h;
+    r->vpz[0] = 0.0f;
+    r->vpz[1] = 1.0f;
+    r->sampler_dirty = 0xFF;
+    r->gen_xf++;
+    r->gen_view++;
+    r->gen_texm++;
+    r->gen_vp++;
+    r->gen_clip++;
+    r->gen_light++;
+    r->gen_mat++;
+    r->gen_const++;
+    r->gen_psc++;
+    r->gen_bump++;
+    r->gl_dirty = GLD_ALL;
+    r->key_dirty = 1;
+    r->decl_dirty = 1;
+    g_cached_prog = NULL;
+}
+
+void d3d8_cmd_reset_defaults(d3ddev *d, int has_autodepth, u32 bb_w, u32 bb_h)
+{
+    cmd_reset_t cmd = {d, has_autodepth, bb_w, bb_h};
+    cs_cmd_push(x_reset_defaults, &cmd, sizeof cmd);
+}
+
+static void x_unbind_all(void *p)
+{
+    d3ddev *d = *(d3ddev **)p;
+    d3d_rstate *r = &d->r;
+    memset(r->tex, 0, sizeof r->tex);
+    memset(r->stream, 0, sizeof r->stream);
+    r->indices = NULL;
+    r->gl_dirty = GLD_ALL;
+    r->key_dirty = 1;
+    g_cached_prog = NULL;
+}
+
+void d3d8_cmd_unbind_all(d3ddev *d) { cs_cmd_push(x_unbind_all, &d, sizeof d); }
+
+typedef struct { d3ddev *d; u32 state, val; } cmd_rs_t;
+static void x_rs(void *p) { const cmd_rs_t *q = p; d3d8_r_apply_rs(&q->d->r, q->state, q->val); }
+void d3d8_cmd_rs(d3ddev *d, u32 state, u32 val)
+{
+    cmd_rs_t cmd = {d, state, val};
+    cs_cmd_push(x_rs, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; u32 stage, type, val; } cmd_tss_t;
+static void x_tss(void *p) { const cmd_tss_t *q = p; d3d8_r_apply_tss(&q->d->r, q->stage, q->type, q->val); }
+void d3d8_cmd_tss(d3ddev *d, u32 stage, u32 type, u32 val)
+{
+    cmd_tss_t cmd = {d, stage, type, val};
+    cs_cmd_push(x_tss, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; u32 state; float mat[16]; } cmd_xf_t;
+static void x_xf(void *p) { const cmd_xf_t *q = p; d3d8_r_apply_xf(&q->d->r, q->state, q->mat); }
+void d3d8_cmd_xf(d3ddev *d, u32 state, const float mat[16])
+{
+    cmd_xf_t cmd;
+    cmd.d = d;
+    cmd.state = state;
+    memcpy(cmd.mat, mat, 64);
+    cs_cmd_push(x_xf, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; u32 vp[4]; float vpz[2]; } cmd_vp_t;
+static void x_vp(void *p)
+{
+    const cmd_vp_t *q = p;
+    d3d_rstate *r = &q->d->r;
+    memcpy(r->vp, q->vp, sizeof r->vp);
+    memcpy(r->vpz, q->vpz, sizeof r->vpz);
+    if (dumping_frame(r->frame))
+        fprintf(stderr, "[dump] SetViewport %u,%u %ux%u\n", r->vp[0], r->vp[1], r->vp[2], r->vp[3]);
+    r->gen_vp++;
+    r->gl_dirty |= GLD_VP;
+}
+void d3d8_cmd_vp(d3ddev *d, const u32 vp[4], const float vpz[2])
+{
+    cmd_vp_t cmd;
+    cmd.d = d;
+    memcpy(cmd.vp, vp, sizeof cmd.vp);
+    memcpy(cmd.vpz, vpz, sizeof cmd.vpz);
+    cs_cmd_push(x_vp, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; float mat[17]; } cmd_mat_t;
+static void x_mat(void *p)
+{
+    const cmd_mat_t *q = p;
+    memcpy(q->d->r.material, q->mat, sizeof q->d->r.material);
+    q->d->r.gen_mat++;
+}
+void d3d8_cmd_mat(d3ddev *d, const float mat[17])
+{
+    cmd_mat_t cmd;
+    cmd.d = d;
+    memcpy(cmd.mat, mat, sizeof cmd.mat);
+    cs_cmd_push(x_mat, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; u32 idx; d3dlight l; } cmd_light_t;
+static void x_light(void *p)
+{
+    const cmd_light_t *q = p;
+    d3d_rstate *r = &q->d->r;
+    if (r->lights[q->idx].type != q->l.type)
+        r->key_dirty = 1;
+    r->lights[q->idx] = q->l;
+    r->gen_light++;
+}
+void d3d8_cmd_light(d3ddev *d, u32 idx, const d3dlight *l)
+{
+    cmd_light_t cmd = {d, idx, *l};
+    cs_cmd_push(x_light, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; u32 idx; u8 on; } cmd_light_en_t;
+static void x_light_en(void *p)
+{
+    const cmd_light_en_t *q = p;
+    d3d_rstate *r = &q->d->r;
+    if (r->light_on[q->idx] != q->on)
+        r->key_dirty = 1;
+    r->light_on[q->idx] = q->on;
+    r->gen_light++;
+}
+void d3d8_cmd_light_enable(d3ddev *d, u32 idx, u8 on)
+{
+    cmd_light_en_t cmd = {d, idx, on};
+    cs_cmd_push(x_light_en, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; u32 idx; float plane[4]; } cmd_clip_t;
+static void x_clip(void *p)
+{
+    const cmd_clip_t *q = p;
+    memcpy(q->d->r.clip[q->idx], q->plane, 16);
+    q->d->r.gen_clip++;
+}
+void d3d8_cmd_clip(d3ddev *d, u32 idx, const float plane[4])
+{
+    cmd_clip_t cmd = {d, idx, {plane[0], plane[1], plane[2], plane[3]}};
+    cs_cmd_push(x_clip, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; d3dtex *t; u32 stage; } cmd_tex_t;
+static void x_tex(void *p) { const cmd_tex_t *q = p; d3d8_r_apply_tex(&q->d->r, q->stage, q->t); }
+void d3d8_cmd_tex(d3ddev *d, u32 stage, d3dtex *t)
+{
+    cmd_tex_t cmd = {d, t, stage};
+    cs_cmd_push(x_tex, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; d3dbuf *b; u32 n, stride; } cmd_stream_t;
+static void x_stream(void *p)
+{
+    const cmd_stream_t *q = p;
+    q->d->r.stream[q->n] = q->b;
+    q->d->r.stride[q->n] = q->stride;
+}
+void d3d8_cmd_stream(d3ddev *d, u32 n, d3dbuf *b, u32 stride)
+{
+    cmd_stream_t cmd = {d, b, n, stride};
+    cs_cmd_push(x_stream, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; d3dbuf *b; u32 base_vertex; } cmd_indices_t;
+static void x_indices(void *p)
+{
+    const cmd_indices_t *q = p;
+    q->d->r.indices = q->b;
+    q->d->r.base_vertex = q->base_vertex;
+}
+void d3d8_cmd_indices(d3ddev *d, d3dbuf *b, u32 base_vertex)
+{
+    cmd_indices_t cmd = {d, b, base_vertex};
+    cs_cmd_push(x_indices, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; u32 val; } cmd_u32_t;
+static void x_vs(void *p)
+{
+    const cmd_u32_t *q = p;
+    q->d->r.vs = q->val;
+    q->d->r.decl_dirty = 1;
+    q->d->r.key_dirty = 1;
+}
+void d3d8_cmd_vs(d3ddev *d, u32 vs)
+{
+    cmd_u32_t cmd = {d, vs};
+    cs_cmd_push(x_vs, &cmd, sizeof cmd);
+}
+
+typedef struct { u32 idx; vdecl decl; } cmd_vs_set_t;
+static void x_vs_set(void *p)
+{
+    const cmd_vs_set_t *q = p;
+    if (q->idx < D3D8_MAX_VS) {
+        g_r_vs[q->idx].used = 1;
+        g_r_vs[q->idx].decl = q->decl;
+    }
+}
+void d3d8_cmd_vs_set(u32 idx, const vdecl *decl)
+{
+    cmd_vs_set_t cmd = {idx, *decl};
+    cs_cmd_push(x_vs_set, &cmd, sizeof cmd);
+}
+
+static void x_vs_del(void *p)
+{
+    u32 idx = *(const u32 *)p;
+    if (idx < D3D8_MAX_VS) {
+        g_r_vs[idx].used = 0;
+        memset(&g_r_vs[idx].decl, 0, sizeof g_r_vs[idx].decl);
+    }
+}
+void d3d8_cmd_vs_del(u32 idx) { cs_cmd_push(x_vs_del, &idx, sizeof idx); }
+
+static void x_ps(void *p)
+{
+    const cmd_u32_t *q = p;
+    q->d->r.ps = q->val;
+    q->d->r.key_dirty = 1;
+}
+void d3d8_cmd_ps(d3ddev *d, u32 ps)
+{
+    cmd_u32_t cmd = {d, ps};
+    cs_cmd_push(x_ps, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; u32 reg, count; float data[8][4]; } cmd_psc_t;
+static void x_psc(void *p)
+{
+    const cmd_psc_t *q = p;
+    memcpy(q->d->r.psc[q->reg], q->data, (size_t)q->count * 16u);
+    q->d->r.gen_psc++;
+}
+void d3d8_cmd_psc(d3ddev *d, u32 reg, u32 count, const float data[][4])
+{
+    cmd_psc_t cmd;
+    cmd.d = d;
+    cmd.reg = reg;
+    cmd.count = count;
+    memcpy(cmd.data, data, (size_t)count * 16u);
+    cs_cmd_push(x_psc, &cmd, sizeof cmd);
+}
+
+typedef struct { d3ddev *d; d3dsurf *rt, *ds; int reset_vp; } cmd_rt_t;
+static void x_set_rt(void *p)
+{
+    const cmd_rt_t *q = p;
+    d3d_rstate *r = &q->d->r;
+    if (q->reset_vp && dumping_frame(r->frame) && r->rt && r->rt->tex)
+        dump_target_r(r);
+    r->rt = q->rt;
+    r->ds = q->ds;
+    if (q->reset_vp && r->rt) {
+        if (dumping_frame(r->frame))
+            fprintf(stderr, "[dump] SetRenderTarget %ux%u fmt %x%s ds %ux%u\n", r->rt->w, r->rt->h, r->rt->fmt,
+                    r->rt->tex ? " (texture)" : "", r->ds ? r->ds->w : 0, r->ds ? r->ds->h : 0);
+        r->vp[0] = r->vp[1] = 0;
+        r->vp[2] = r->rt->w;
+        r->vp[3] = r->rt->h;
+        r->vpz[0] = 0.0f;
+        r->vpz[1] = 1.0f;
+    }
+    bind_target_r(r);
+}
+void d3d8_cmd_set_rt(d3ddev *d, d3dsurf *rt, d3dsurf *ds, int reset_vp)
+{
+    cmd_rt_t cmd = {d, rt, ds, reset_vp};
+    cs_cmd_push(x_set_rt, &cmd, sizeof cmd);
+}
+
+void d3d8_bind_target(d3ddev *d)
+{
+    if (d)
+        d3d8_cmd_set_rt(d, d->rt, d->ds, 0);
+}
+
+typedef struct {
+    d3ddev *d;
+    u32 flags, color, stencil, count;
+    float z;
+    const s32 *rects;
+    void *heap;
+} cmd_clear_t;
+
+static void x_clear(void *p)
+{
+    const cmd_clear_t *q = p;
+    d3d_rstate *r = &q->d->r;
+    u32 flags = q->flags, color = q->color, count = q->count;
+    GLbitfield mask = 0;
+    if (flags & 1) {
+        mask |= GL_COLOR_BUFFER_BIT;
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glClearColor((float)((color >> 16) & 0xFF) / 255.0f, (float)((color >> 8) & 0xFF) / 255.0f,
+                     (float)(color & 0xFF) / 255.0f, (float)(color >> 24) / 255.0f);
+    }
+    if ((flags & 2) && r->ds) {
+        mask |= GL_DEPTH_BUFFER_BIT;
+        glDepthMask(GL_TRUE);
+        glClearDepth(q->z);
+    }
+    if ((flags & 4) && r->ds) {
+        mask |= GL_STENCIL_BUFFER_BIT;
+        glStencilMask(0xFF);
+        glClearStencil((GLint)q->stencil);
+    }
+    if (dumping_frame(r->frame))
+        fprintf(stderr, "[dump] Clear flags %x color %08x z %g rects %u vp %u,%u %ux%u\n", flags, color, q->z, count,
+                r->vp[0], r->vp[1], r->vp[2], r->vp[3]);
+    if (mask) {
+        glEnable(GL_SCISSOR_TEST);
+        if (!count || !q->rects) {
+            glScissor((GLint)r->vp[0], (GLint)r->vp[1], (GLsizei)r->vp[2], (GLsizei)r->vp[3]);
+            glClear(mask);
+        }
+        for (u32 i = 0; q->rects && i < count; i++) {
+            s32 x1 = q->rects[4u * i + 0], y1 = q->rects[4u * i + 1];
+            s32 x2 = q->rects[4u * i + 2], y2 = q->rects[4u * i + 3];
+            if (x2 > x1 && y2 > y1) {
+                glScissor(x1, y1, x2 - x1, y2 - y1);
+                glClear(mask);
+            }
+        }
+        r->gl_dirty |= GLD_SCISSOR;
+        if (flags & 1)
+            r->gl_dirty |= GLD_COLORMASK;
+        if ((flags & 2) && r->ds)
+            r->gl_dirty |= GLD_DEPTH;
+        if ((flags & 4) && r->ds)
+            r->gl_dirty |= GLD_STENCIL;
+    }
+    free(q->heap);
+}
+
+void d3d8_cmd_clear(d3ddev *d, u32 flags, u32 color, float z, u32 stencil, u32 count, const s32 *rects)
+{
+    cmd_clear_t cmd = {d, flags, color, stencil, count, z, rects, NULL};
+    cs_cmd_push_var(x_clear, &cmd, sizeof cmd, rects, (size_t)count * 16u,
+                    offsetof(cmd_clear_t, rects), offsetof(cmd_clear_t, heap));
+}
+
+// Исполнение отрисовки на Core 2: vdecl/ffkey/program кешируются между вызовами по флагам decl_dirty/key_dirty
+static void exec_draw(d3d_rstate *r, u32 prim, u32 count, int indexed, u32 first, u32 min_index, u32 num_vertices,
+                      const void *up_vertices, u32 up_stride, const void *up_indices, u32 up_index_fmt)
 {
     if (!count)
         return;
-    d->draws++;
-    vdecl decl;
-    if (!d3d8_vdecl_for(d, &decl)) {
+    r->draws++;
+    if (r->decl_dirty) {
+        r->decl_ok = r_vdecl_for(r, &r->cached_decl);
+        r->decl_dirty = 0;
+    }
+    if (!r->decl_ok) {
         hle_todo("d3d8: draw with an unknown vertex format");
         return;
     }
     GLenum mode;
     u32 n;
     vertex_count(prim, count, &mode, &n);
-    ffkey key;
-    make_key(d, &decl, &key);
-    if (d3d8_dumping(d))
-        dump_draw(d, &key, prim, count, indexed);
-    ffprog *p = program_for(d, &key);
+    if (r->key_dirty || !g_cached_prog) {
+        make_key(r, &r->cached_decl, &g_cached_key);
+        g_cached_prog = program_for(r, &g_cached_key);
+        r->key_dirty = 0;
+    }
+    if (dumping_frame(r->frame))
+        dump_draw(r, &g_cached_key, prim, count, indexed);
+    ffprog *p = g_cached_prog;
     if (!p || !p->prog)
         return;
-    apply_state(d);
-    glUseProgram(p->prog);
-    upload_uniforms(d, p);
-    for (int s = 0; s < key.nstages; s++) {
-        d3dtex *t = d->tex[s];
+    p->last_frame = r->frame;
+    apply_state(r);
+    if (g_cur_prog != p->prog) {
+        glUseProgram(p->prog);
+        g_cur_prog = p->prog;
+    }
+    upload_uniforms(r, p);
+    for (int s = 0; s < g_cached_key.nstages; s++) {
+        d3dtex *t = r->tex[s];
         if (!t)
             continue;
         glActiveTexture(GL_TEXTURE0 + (GLenum)s);
         glBindTexture(t->cube ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D, t->gl);
-        if (d->sampler_dirty & (1u << s)) {
-            update_sampler(d, s);
-            d->sampler_dirty &= ~(1u << s);
+        if (r->sampler_dirty & (1u << s)) {
+            update_sampler(r, s);
+            r->sampler_dirty &= ~(1u << s);
         }
-        glBindSampler((GLuint)s, d->samplers[s]);
+        glBindSampler((GLuint)s, r->samplers[s]);
     }
-    glBindVertexArray(d->vao);
+    glBindVertexArray(r->vao);
     if (!indexed) {
         if (up_vertices) {
-            setup_attribs(d, &decl, up_vertices, up_stride, n * up_stride);
+            setup_attribs(r, &r->cached_decl, up_vertices, up_stride, n * up_stride);
             glDrawArrays(mode, 0, (GLsizei)n);
         } else {
-            setup_attribs(d, &decl, NULL, 0, 0);
+            setup_attribs(r, &r->cached_decl, NULL, 0, 0);
             glDrawArrays(mode, (GLint)first, (GLsizei)n);
         }
     } else if (up_vertices) {
         u32 isize = up_index_fmt == FMT_INDEX32 ? 4 : 2;
-        setup_attribs(d, &decl, up_vertices, up_stride, (min_index + num_vertices) * up_stride);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, d->up_ibo);
+        setup_attribs(r, &r->cached_decl, up_vertices, up_stride, (min_index + num_vertices) * up_stride);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, r->up_ibo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, n * isize, up_indices, GL_STREAM_DRAW);
         glDrawElements(mode, (GLsizei)n, isize == 4 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT, 0);
     } else {
-        d3dbuf *ib = d->indices;
+        d3dbuf *ib = r->indices;
         if (!ib)
             return;
         u32 isize = ib->fmt == FMT_INDEX32 ? 4 : 2;
 #ifdef SNX_GLES
-        if (!gles_caps.base_vertex && d->base_vertex) {
-            g_attr_base = d->base_vertex;
-            setup_attribs(d, &decl, NULL, 0, 0);
+        if (!gles_caps.base_vertex && r->base_vertex) {
+            g_attr_base = r->base_vertex;
+            setup_attribs(r, &r->cached_decl, NULL, 0, 0);
             g_attr_base = 0;  // указатели атрибутов ставятся заново при каждой отрисовке
-            d3d8_buf_sync(ib);
             glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib->gl);
             glDrawElements(mode, (GLsizei)n, isize == 4 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT,
                            (const void *)(uintptr_t)(first * isize));
             return;
         }
 #endif
-        setup_attribs(d, &decl, NULL, 0, 0);
-        d3d8_buf_sync(ib);
+        setup_attribs(r, &r->cached_decl, NULL, 0, 0);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib->gl);
         glDrawElementsBaseVertex(mode, (GLsizei)n, isize == 4 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT,
-                                 (const void *)(uintptr_t)(first * isize), (GLint)d->base_vertex);
+                                 (const void *)(uintptr_t)(first * isize), (GLint)r->base_vertex);
     }
+}
+
+typedef struct {
+    d3ddev *d;
+    u32 prim, count, first, min_index, num_vertices;
+    int indexed;
+} cmd_draw_t;
+
+static void x_draw(void *p)
+{
+    const cmd_draw_t *q = p;
+    exec_draw(&q->d->r, q->prim, q->count, q->indexed, q->first, q->min_index, q->num_vertices, NULL, 0, NULL, 0);
+}
+
+void d3d8_cmd_draw(d3ddev *d, u32 prim, u32 count, int indexed, u32 first, u32 min_index, u32 num_vertices)
+{
+    cmd_draw_t cmd = {d, prim, count, first, min_index, num_vertices, indexed};
+    cs_cmd_push(x_draw, &cmd, sizeof cmd);
+}
+
+typedef struct {
+    d3ddev *d;
+    u32 prim, count, min_index, num_vertices, up_stride, up_index_fmt, idx_off;
+    int indexed;
+    const void *data;  // вершины в [0..vbytes), индексы в [idx_off..idx_off+ibytes) или up_indices в direct
+    const void *direct_idx;
+    void *heap;
+} cmd_draw_up_t;
+
+static void x_draw_up(void *p)
+{
+    const cmd_draw_up_t *q = p;
+    const u8 *base = q->data;
+    const void *idx = q->indexed ? (q->direct_idx ? q->direct_idx : (base ? base + q->idx_off : NULL)) : NULL;
+    exec_draw(&q->d->r, q->prim, q->count, q->indexed, 0, q->min_index, q->num_vertices, base, q->up_stride, idx,
+              q->up_index_fmt);
+    q->d->r.stream[0] = NULL;
+    q->d->r.stride[0] = 0;
+    if (q->indexed)
+        q->d->r.indices = NULL;
+    free(q->heap);
+}
+
+void d3d8_cmd_draw_up(d3ddev *d, u32 prim, u32 count, int indexed, u32 min_index, u32 num_vertices,
+                      const void *up_vertices, u32 up_stride, const void *up_indices, u32 up_index_fmt)
+{
+    if (!cs_enabled()) {
+        cmd_draw_up_t cmd = {d, prim, count, min_index, num_vertices, up_stride, up_index_fmt, 0, indexed,
+                             up_vertices, up_indices, NULL};
+        x_draw_up(&cmd);
+        return;
+    }
+    GLenum mode;
+    u32 n;
+    vertex_count(prim, count, &mode, &n);
+    u32 vbytes = indexed ? (min_index + num_vertices) * up_stride : n * up_stride;
+    u32 ibytes = indexed ? n * (up_index_fmt == FMT_INDEX32 ? 4u : 2u) : 0u;
+    if (!ibytes) {
+        cmd_draw_up_t cmd = {d, prim, count, min_index, num_vertices, up_stride, up_index_fmt, 0, indexed,
+                             up_vertices, NULL, NULL};
+        cs_cmd_push_var(x_draw_up, &cmd, sizeof cmd, up_vertices, vbytes,
+                        offsetof(cmd_draw_up_t, data), offsetof(cmd_draw_up_t, heap));
+        return;
+    }
+    u32 idx_off = (vbytes + 15u) & ~15u;
+    size_t total = (size_t)idx_off + ibytes;
+    u8 sbuf[4096];
+    u8 *pack = total <= sizeof sbuf ? sbuf : malloc(total);
+    if (!pack)
+        return;
+    if (vbytes)
+        memcpy(pack, up_vertices, vbytes);
+    memcpy(pack + idx_off, up_indices, ibytes);
+    cmd_draw_up_t cmd = {d, prim, count, min_index, num_vertices, up_stride, up_index_fmt, idx_off, indexed,
+                         pack, NULL, NULL};
+    cs_cmd_push_var(x_draw_up, &cmd, sizeof cmd, pack, total,
+                    offsetof(cmd_draw_up_t, data), offsetof(cmd_draw_up_t, heap));
+    if (pack != sbuf)
+        free(pack);
 }
 
 // ================================================================ снимки кадров (отладка)
@@ -1280,19 +2400,21 @@ static void write_png(const char *path, const u8 *rgba, u32 w, u32 h)
     free(z);
 }
 
-// кадр SNX_DUMP_DRAWS: содержимое текущей цели рендера (из её FBO) -> <SNX_SHOT_DIR>/dump_<n>.png
-void d3d8_dump_target(d3ddev *d)
+// кадр SNX_DUMP_DRAWS: содержимое текущей цели рендера (из её FBO на Core 2) -> <SNX_SHOT_DIR>/dump_<n>.png
+static void dump_target_r(d3d_rstate *r)
 {
     static int n;
-    if (!d->rt)
+    if (!r->rt)
         return;
-    u32 w = d->rt->w, h = d->rt->h;
+    u32 w = r->rt->w, h = r->rt->h;
     u8 *px = malloc((size_t)w * h * 4);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, d->fbo);
+    if (!px)
+        return;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, r->fbo);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glPixelStorei(GL_PACK_ROW_LENGTH, 0);
     glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, px);
-    glBindFramebuffer(GL_FRAMEBUFFER, d->fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, r->fbo);
     char path[512];
     const char *dir = getenv("SNX_SHOT_DIR");
     snprintf(path, sizeof path, "%s%sdump_%02d.png", dir ? dir : "", dir ? "/" : "", n++);
@@ -1301,7 +2423,31 @@ void d3d8_dump_target(d3ddev *d)
     fprintf(stderr, "[dump] target %ux%u -> %s\n", w, h, path);
 }
 
-static void maybe_shot(d3ddev *d)
+typedef struct {
+    d3ddev *d;
+    int from_win;
+    u32 w, h;
+    u8 *px;
+} shot_read_args;
+
+static void x_read_shot(void *arg)
+{
+    const shot_read_args *a = arg;
+    d3d_rstate *r = &a->d->r;
+    if (!a->from_win) {
+        if (!r->blit_fbo)
+            glGenFramebuffers(1, &r->blit_fbo);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, r->blit_fbo);
+        d3d8_fbo_attach(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, a->d->backbuffer);
+    } else {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    }
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+    glReadPixels(0, 0, (GLsizei)a->w, (GLsizei)a->h, GL_RGBA, GL_UNSIGNED_BYTE, a->px);
+}
+
+static void maybe_shot(d3ddev *d, int win_w, int win_h)
 {
     static int first = -2, step;
     if (first == -2) {
@@ -1312,23 +2458,40 @@ static void maybe_shot(d3ddev *d)
     }
     if (first < 0 || d->frame < first || (d->frame != first && (!step || (d->frame - first) % step)))
         return;
-    u8 *px = malloc((size_t)d->bb_w * d->bb_h * 4);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, d->blit_fbo);
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
-    glReadPixels(0, 0, (GLsizei)d->bb_w, (GLsizei)d->bb_h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    // Читаем итоговый кадр окна после пост-прохода Present (видны 4:3 pillarbox, гамма-LUT и оверлей); если окна
+    // нет — резервный снимок из заднего буфера blit_fbo.
+    int from_win = win_w > 0 && win_h > 0;
+    u32 w = from_win ? (u32)win_w : d->bb_w, h = from_win ? (u32)win_h : d->bb_h;
+    u8 *px = malloc((size_t)w * h * 4);
+    if (!px)
+        return;
+    shot_read_args sa = {d, from_win, w, h, px};
+    cs_sync(x_read_shot, &sa);
+    if (from_win) {  // окно GL — снизу вверх; переворачиваем строки для PNG
+        size_t row = (size_t)w * 4;
+        u8 *tmp = malloc(row);
+        if (tmp) {
+            for (u32 y = 0; y < h / 2; y++) {
+                memcpy(tmp, px + (size_t)y * row, row);
+                memcpy(px + (size_t)y * row, px + (size_t)(h - 1 - y) * row, row);
+                memcpy(px + (size_t)(h - 1 - y) * row, tmp, row);
+            }
+            free(tmp);
+        }
+    }
     char path[512];
     const char *dir = getenv("SNX_SHOT_DIR");
     snprintf(path, sizeof path, "%s%sshot_%05d.png", dir ? dir : "", dir ? "/" : "", d->frame);
-    write_png(path, px, d->bb_w, d->bb_h);  // кадр хранится сверху вниз, как и строки PNG
+    write_png(path, px, w, h);
     free(px);
     fprintf(stderr, "[d3d8] frame %d: %u draws -> %s\n", d->frame, d->draws, path);
 }
 
-// ================================================================ Present
+// ================================================================ Present: пост-проход, гамма-LUT и 4:3 меню
 // Ограничение частоты кадров (SNX_FPS_CAP=30 и т. п.; лаунчер Android — «Ограничение FPS»: меньше нагрев и
-// троттлинг телефона; если частота экрана равна ему — только vsync, platform/window.c plat_set_display) и подсказки производительности Android (ADPF): длительность работы кадра потоком гостя —
-// без ожиданий потока рендера и ограничителя.
+// троттлинг телефона; если частота экрана равна ему — только vsync, platform/window.c plat_set_display) и подсказки
+// производительности Android (ADPF): длительность работы кадра потоком гостя — без ожиданий потока рендера и
+// ограничителя.
 static void frame_pace(void)
 {
     static int cap = -1;
@@ -1364,11 +2527,307 @@ static void frame_pace(void)
     last = rt_ticks_ns();
 }
 
-// счётчик кадров: семисегментные цифры прямоугольниками glClear с ножницами (без шейдеров и текстур)
 static _Atomic int g_fps_overlay;
 void d3d8_set_fps_overlay(int on) { g_fps_overlay = on; }
 int d3d8_fps_overlay(void) { return g_fps_overlay; }
 
+// Режим 4:3-pillarbox для страниц меню (выключен по умолчанию: у страниц книги Shrek 2 есть собственные
+// кинематографические чёрные полосы 12.5% сверху и снизу; включается в Quick Menu или Snx.ini)
+static _Atomic int g_menu_aspect;
+
+static void sync_menu_aspect_flag(const d3ddev *d)
+{
+    int active = d && d->bb_h && atomic_load_explicit(&g_menu_aspect, memory_order_relaxed) && game_menu_open(NULL) &&
+                 (float)d->bb_w / (float)d->bb_h > 4.0f / 3.0f + 0.01f;
+    __atomic_store_n(&rt_menu_aspect_4x3, active, __ATOMIC_RELAXED);
+}
+
+void d3d8_set_menu_aspect(int on)
+{
+    atomic_store_explicit(&g_menu_aspect, on != 0, memory_order_relaxed);
+    sync_menu_aspect_flag(d3d8_dev());
+}
+
+int d3d8_menu_aspect(void) { return atomic_load_explicit(&g_menu_aspect, memory_order_relaxed); }
+
+// Единый расчёт прямоугольника вывода кадра в окне w x h (используется и в Present, и в пересчёте координат ввода)
+static void present_rect(const d3ddev *d, int w, int h, float *dx, float *dy, float *dw, float *dh)
+{
+    float disp_aspect = (float)d->bb_w / (float)d->bb_h;
+    if (atomic_load_explicit(&g_menu_aspect, memory_order_relaxed) && game_menu_open(NULL) &&
+        disp_aspect > 4.0f / 3.0f + 0.01f)
+        disp_aspect = 4.0f / 3.0f;
+    float win_aspect = (float)w / (float)h;
+    if (win_aspect >= disp_aspect) {
+        *dh = (float)h;
+        *dw = (float)h * disp_aspect;
+    } else {
+        *dw = (float)w;
+        *dh = (float)w / disp_aspect;
+    }
+    *dx = ((float)w - *dw) * 0.5f;
+    *dy = ((float)h - *dh) * 0.5f;
+}
+
+typedef struct {
+    GLuint bb_tex;
+    int win_w, win_h;
+    int dx, dy, dw, dh;
+    int update_gamma;
+    u16 gamma_rgb[256][3];  // 256x1 RGB16 LUT (0..65535 -> [0, 1])
+} present_pass_args;
+
+static GLuint g_post_prog, g_post_vao, g_gamma_tex;
+
+// ================================================================ 1-проходное GPU-размытие теней-проекторов
+// Эквивалент 9 проходов FCanvasUtil::DrawTile (3x3, смещение ±step_px, SrcAlpha=28/255, Dest=One)
+// в Engine.dll!0x121e0050 (UShadowBitmapMaterial::Get). Обе поверхности — D3D8 RTT («сверху вниз»),
+// поэтому UV без Y-переворота; GL_BLEND выключен, альфа результата = 1.0.
+static GLuint g_blur_prog, g_blur_vao, g_blur_sampler, g_blur_fbo;
+static GLint g_blur_u_step = -1;
+
+static void blur_init_gl(void)
+{
+    static const char vs_src[] =
+        SNX_GLSL_HEADER
+        "out vec2 v_uv;\n"
+        "void main() {\n"
+        "  vec2 p = vec2((gl_VertexID & 1) * 2, (gl_VertexID & 2));\n"
+        "  v_uv = p;\n"
+        "  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+        "}\n";
+    static const char fs_src[] =
+        SNX_GLSL_HEADER
+        SNX_GLSL_PRECISION
+        "in vec2 v_uv;\n"
+        "uniform sampler2D u_src;\n"
+        "uniform vec2 u_step;\n"
+        "out vec4 o_color;\n"
+        "void main() {\n"
+        "  vec3 s = vec3(0.0);\n"
+        "  s += texture(u_src, v_uv + vec2(-u_step.x, -u_step.y)).rgb;\n"
+        "  s += texture(u_src, v_uv + vec2(      0.0, -u_step.y)).rgb;\n"
+        "  s += texture(u_src, v_uv + vec2( u_step.x, -u_step.y)).rgb;\n"
+        "  s += texture(u_src, v_uv + vec2(-u_step.x,       0.0)).rgb;\n"
+        "  s += texture(u_src, v_uv                             ).rgb;\n"
+        "  s += texture(u_src, v_uv + vec2( u_step.x,       0.0)).rgb;\n"
+        "  s += texture(u_src, v_uv + vec2(-u_step.x,  u_step.y)).rgb;\n"
+        "  s += texture(u_src, v_uv + vec2(      0.0,  u_step.y)).rgb;\n"
+        "  s += texture(u_src, v_uv + vec2( u_step.x,  u_step.y)).rgb;\n"
+        "  o_color = vec4(s * (28.0 / 255.0), 1.0);\n"
+        "}\n";
+    GLuint v = compile(GL_VERTEX_SHADER, vs_src), f = compile(GL_FRAGMENT_SHADER, fs_src);
+    if (v && f) {
+        g_blur_prog = glCreateProgram();
+        glAttachShader(g_blur_prog, v);
+        glAttachShader(g_blur_prog, f);
+        glLinkProgram(g_blur_prog);
+        GLint ok = 0;
+        glGetProgramiv(g_blur_prog, GL_LINK_STATUS, &ok);
+        if (!ok) {
+            glDeleteProgram(g_blur_prog);
+            g_blur_prog = 0;
+        } else {
+            glUseProgram(g_blur_prog);
+            glUniform1i(glGetUniformLocation(g_blur_prog, "u_src"), 0);
+            g_blur_u_step = glGetUniformLocation(g_blur_prog, "u_step");
+            g_cur_prog = 0;
+        }
+    }
+    if (v)
+        glDeleteShader(v);
+    if (f)
+        glDeleteShader(f);
+    glGenVertexArrays(1, &g_blur_vao);
+    glGenFramebuffers(1, &g_blur_fbo);
+    glGenSamplers(1, &g_blur_sampler);
+    glSamplerParameteri(g_blur_sampler, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glSamplerParameteri(g_blur_sampler, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glSamplerParameteri(g_blur_sampler, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glSamplerParameteri(g_blur_sampler, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+}
+
+typedef struct {
+    d3ddev *d;
+    d3dtex *src_tex;
+    d3dsurf *src_surf;
+    d3dsurf *dst_surf;
+    float step_px;
+} cmd_shadow_blur_t;
+
+static void x_shadow_blur(void *p)
+{
+    const cmd_shadow_blur_t *q = p;
+    d3d_rstate *r = &q->d->r;
+    GLuint src_gl = q->src_tex ? q->src_tex->gl : (q->src_surf ? q->src_surf->color_tex : 0);
+    u32 src_w = q->src_tex ? q->src_tex->w : (q->src_surf ? q->src_surf->w : 0);
+    u32 src_h = q->src_tex ? q->src_tex->h : (q->src_surf ? q->src_surf->h : 0);
+    d3dsurf *dst = q->dst_surf;
+    if (!src_gl || !src_w || !src_h || !dst || !dst->w || !dst->h)
+        return;
+    if (!g_blur_prog)
+        blur_init_gl();
+    if (!g_blur_prog)
+        return;
+
+    int own_fbo = !(r->fbo && r->fbo_rt == dst);
+    if (own_fbo) {
+        glBindFramebuffer(GL_FRAMEBUFFER, g_blur_fbo);
+        d3d8_fbo_attach(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, dst);
+    } else {
+        glBindFramebuffer(GL_FRAMEBUFFER, r->fbo);
+    }
+
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    for (int i = 0; i < 6; i++)
+        glDisable(GL_CLIP_DISTANCE0 + i);
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glViewport(0, 0, (GLsizei)dst->w, (GLsizei)dst->h);
+
+    glUseProgram(g_blur_prog);
+    glUniform2f(g_blur_u_step, q->step_px / (float)src_w, q->step_px / (float)src_h);
+    glBindVertexArray(g_blur_vao);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, src_gl);
+    glBindSampler(0, g_blur_sampler);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    // Восстановить FBO, VAO, сэмплер/текстуру 0 и пометить фиксированное состояние GL грязным
+    if (own_fbo) {
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, r->fbo);
+    }
+    glBindVertexArray(r->vao);
+    glBindSampler(0, r->samplers[0]);
+    glBindTexture(GL_TEXTURE_2D, (r->tex[0] && !r->tex[0]->cube) ? r->tex[0]->gl : 0);
+    r->gl_dirty = GLD_ALL;
+    r->sampler_dirty |= 1u;
+    g_cur_prog = 0;
+    r->draws++;
+}
+
+void d3d8_cmd_shadow_blur(d3ddev *d, d3dtex *src_tex, d3dsurf *src_surf, d3dsurf *dst_surf, float step_px)
+{
+    cmd_shadow_blur_t cmd = {d, src_tex, src_surf, dst_surf, step_px};
+    cs_cmd_push(x_shadow_blur, &cmd, sizeof cmd);
+}
+
+static void post_init_gl(void)
+{
+    static const char vs_src[] =
+        SNX_GLSL_HEADER
+        "out vec2 v_uv;\n"
+        "void main() {\n"
+        "  vec2 p = vec2((gl_VertexID & 1) * 2, (gl_VertexID & 2));\n"
+        "  v_uv = vec2(p.x, 1.0 - p.y);\n"  // переворот по Y: кадр D3D хранится сверху вниз
+        "  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+        "}\n";
+    static const char fs_src[] =
+        SNX_GLSL_HEADER
+        SNX_GLSL_PRECISION
+        "in vec2 v_uv;\n"
+        "uniform sampler2D u_frame;\n"
+        "uniform sampler2D u_gamma;\n"
+        "out vec4 o_color;\n"
+        "void main() {\n"
+        "  vec3 c = clamp(texture(u_frame, v_uv).rgb, 0.0, 1.0);\n"
+        "  vec3 u = (c * 255.0 + 0.5) / 256.0;\n"
+        "  o_color = vec4(texture(u_gamma, vec2(u.r, 0.5)).r,\n"
+        "                 texture(u_gamma, vec2(u.g, 0.5)).g,\n"
+        "                 texture(u_gamma, vec2(u.b, 0.5)).b, 1.0);\n"
+        "}\n";
+    GLuint v = compile(GL_VERTEX_SHADER, vs_src), f = compile(GL_FRAGMENT_SHADER, fs_src);
+    if (v && f) {
+        g_post_prog = glCreateProgram();
+        glAttachShader(g_post_prog, v);
+        glAttachShader(g_post_prog, f);
+        glLinkProgram(g_post_prog);
+        GLint ok = 0;
+        glGetProgramiv(g_post_prog, GL_LINK_STATUS, &ok);
+        if (!ok) {
+            glDeleteProgram(g_post_prog);
+            g_post_prog = 0;
+        } else {
+            glUseProgram(g_post_prog);
+            glUniform1i(glGetUniformLocation(g_post_prog, "u_frame"), 0);
+            glUniform1i(glGetUniformLocation(g_post_prog, "u_gamma"), 1);
+        }
+    }
+    if (v)
+        glDeleteShader(v);
+    if (f)
+        glDeleteShader(f);
+    glGenVertexArrays(1, &g_post_vao);
+    glGenTextures(1, &g_gamma_tex);
+    glBindTexture(GL_TEXTURE_2D, g_gamma_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+}
+
+static void x_present_pass(void *arg)
+{
+    const present_pass_args *a = arg;
+    int first = !g_post_prog;
+    if (first)
+        post_init_gl();
+    if (a->update_gamma || first) {
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, g_gamma_tex);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+#ifdef SNX_GLES
+        // в ES 3.0 нет нормализованных 16-битных текстур (GL_RGB16): LUT в 8 битах на канал
+        u8 lut[256][4];
+        for (int i = 0; i < 256; i++) {
+            lut[i][0] = (u8)(a->gamma_rgb[i][0] >> 8);
+            lut[i][1] = (u8)(a->gamma_rgb[i][1] >> 8);
+            lut[i][2] = (u8)(a->gamma_rgb[i][2] >> 8);
+            lut[i][3] = 255;
+        }
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, lut);
+#else
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16, 256, 1, 0, GL_RGB, GL_UNSIGNED_SHORT, a->gamma_rgb);
+#endif
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    for (int i = 0; i < 6; i++)
+        glDisable(GL_CLIP_DISTANCE0 + i);
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glViewport(0, 0, a->win_w, a->win_h);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (!g_post_prog || !a->bb_tex)
+        return;
+    glViewport(a->dx, a->dy, a->dw, a->dh);
+    glUseProgram(g_post_prog);
+    glBindVertexArray(g_post_vao);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, a->bb_tex);
+    glBindSampler(0, 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, g_gamma_tex);
+    glBindSampler(1, 0);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+// счётчик кадров: семисегментные цифры прямоугольниками glClear с ножницами (без шейдеров и текстур)
 static void fill(int x, int y, int w, int h)
 {
     glScissor(x, y, w, h);
@@ -1378,6 +2837,7 @@ static void fill(int x, int y, int w, int h)
 // число n в левом верхнем углу окна w x h (у GL начало — внизу)
 static void draw_fps(int n, int w, int h)
 {
+    (void)w;
     static const u8 seg[10] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F};  // биты: a b c d e f g
     char s[8];
     int len = snprintf(s, sizeof s, "%d", n < 0 ? 0 : n > 999 ? 999 : n);
@@ -1398,6 +2858,31 @@ static void draw_fps(int n, int w, int h)
         if (b & 0x40) fill(x, mid, dw, t);                        // g
     }
     glDisable(GL_SCISSOR_TEST);
+}
+
+typedef struct { int n, w, h; } draw_fps_args;
+
+static void x_draw_fps(void *arg)
+{
+    const draw_fps_args *a = arg;
+    draw_fps(a->n, a->w, a->h);
+}
+
+static void x_post_present(void *arg)
+{
+    d3ddev *d = *(d3ddev **)arg;
+    d3d_rstate *r = &d->r;
+    glBindFramebuffer(GL_FRAMEBUFFER, r->fbo);
+    glBindVertexArray(r->vao);
+    r->gl_dirty = GLD_ALL;
+    g_cur_prog = 0;
+    r->draws = 0;
+    r->frame++;
+    if (r->frame < 5 || r->frame % 300 == 0) {
+        GLenum err = glGetError();
+        if (err)
+            fprintf(stderr, "[d3d8] GL error 0x%x by frame %d\n", err, r->frame);
+    }
 }
 
 // Долгий кадр (дольше 40 мс и в полтора раза дольше обычного): что в нём было — сборка программ GL, чтения файлов
@@ -1429,75 +2914,120 @@ static void hitch_check(d3ddev *d)
 // Ролик, кадр которого игра не вывела в задний буфер (больше кадра: 800x600 в 1200x540 и т. п. — D3DDrv тогда
 // кадр не копирует, остаются звук и чёрный экран): порт рисует текущий кадр ролика сам, вписанным в задний буфер с
 // чёрными полями, как write_movie (d3d8_res.c). Если игра сама выводит кадры ролика (write_movie за последние
-// 250 мс) — ничего.
+// 250 мс) — ничего. Кадр берётся в потоке гостя (bink.c), рисуется командой в потоке рендера (копия пикселей).
+typedef struct {
+    d3ddev *d;
+    u32 w, h;
+    const u8 *px;
+    void *heap;
+} cmd_movie_overlay_t;
+
+static void x_movie_overlay(void *p)
+{
+    const cmd_movie_overlay_t *q = p;
+    d3ddev *d = q->d;
+    d3d_rstate *r = &d->r;
+    d3dsurf *bb = d->backbuffer;
+    static GLuint tex, fb[2];
+    static u32 tw, th;
+    if (bb && q->px) {
+        if (!fb[0])
+            glGenFramebuffers(2, fb);
+        glActiveTexture(GL_TEXTURE0);
+        if (!tex || tw != q->w || th != q->h) {
+            if (!tex)
+                glGenTextures(1, &tex);
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)q->w, (GLsizei)q->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            tw = q->w;
+            th = q->h;
+        } else
+            glBindTexture(GL_TEXTURE_2D, tex);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)q->w, (GLsizei)q->h, GL_RGBA, GL_UNSIGNED_BYTE, q->px);
+        glBindTexture(GL_TEXTURE_2D, (r->tex[0] && !r->tex[0]->cube) ? r->tex[0]->gl : 0);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, fb[0]);
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb[1]);
+        d3d8_fbo_attach(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, bb);
+        glDisable(GL_SCISSOR_TEST);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glClearColor(0, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        GLint W = (GLint)bb->w, H = (GLint)bb->h;
+        float sc = fminf((float)W / (float)q->w, (float)H / (float)q->h);
+        GLint w = (GLint)((float)q->w * sc), h = (GLint)((float)q->h * sc);
+        glBlitFramebuffer(0, 0, (GLint)q->w, (GLint)q->h, (W - w) / 2, (H - h) / 2, (W - w) / 2 + w, (H - h) / 2 + h,
+                          GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+        glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, r->fbo);
+        r->gl_dirty = GLD_ALL;
+    }
+    free(q->heap);
+}
+
 static void movie_overlay(d3ddev *d)
 {
     const u8 *px;
     u32 mw, mh;
-    if (rt_ticks_ns() - g_movie_drawn_ns < 250000000ull || !d->backbuffer || !d->backbuffer->rb ||
-        !bink_movie_overlay(&px, &mw, &mh))
+    if (rt_ticks_ns() - g_movie_drawn_ns < 250000000ull || !d->backbuffer || !bink_movie_overlay(&px, &mw, &mh))
         return;
-    static GLuint tex;
-    static u32 tw, th;
     static int logged;
     if (!logged++)
         fprintf(stderr, "[bink] movie %ux%u is not in the %ux%u frame: drawn by the port\n", mw, mh, d->bb_w, d->bb_h);
-    if (!tex || tw != mw || th != mh) {
-        if (!tex)
-            glGenTextures(1, &tex);
-        glBindTexture(GL_TEXTURE_2D, tex);
-        cs_TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)mw, (GLsizei)mh, GL_RGBA, GL_UNSIGNED_BYTE, NULL, 0);
-        tw = mw;
-        th = mh;
-    } else
-        glBindTexture(GL_TEXTURE_2D, tex);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    cs_TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)mw, (GLsizei)mh, GL_RGBA, GL_UNSIGNED_BYTE, px, (size_t)mw * 4,
-                     (size_t)mw * 4);
-    glBindTexture(GL_TEXTURE_2D, 0);
-    GLuint fb[2];
-    glGenFramebuffers(2, fb);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, fb[0]);
-    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb[1]);
-    glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, d->backbuffer->rb);
-    glDisable(GL_SCISSOR_TEST);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glClearColor(0, 0, 0, 1);
-    glClear(GL_COLOR_BUFFER_BIT);
-    GLint W = (GLint)d->bb_w, H = (GLint)d->bb_h;
-    float sc = fminf((float)W / (float)mw, (float)H / (float)mh);
-    GLint w = (GLint)((float)mw * sc), h = (GLint)((float)mh * sc);
-    glBlitFramebuffer(0, 0, (GLint)mw, (GLint)mh, (W - w) / 2, (H - h) / 2, (W - w) / 2 + w, (H - h) / 2 + h,
-                      GL_COLOR_BUFFER_BIT, GL_LINEAR);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glDeleteFramebuffers(2, fb);
-    d3d8_bind_target(d);
+    cmd_movie_overlay_t cmd = {d, mw, mh, px, NULL};
+    if (!cs_enabled())
+        x_movie_overlay(&cmd);
+    else
+        cs_cmd_push_var(x_movie_overlay, &cmd, sizeof cmd, px, (size_t)mw * mh * 4u, offsetof(cmd_movie_overlay_t, px),
+                        offsetof(cmd_movie_overlay_t, heap));
     g_movie_overlay_ns = rt_ticks_ns();
 }
 
 void d3d8_present(d3ddev *d)
 {
-    game_menu_frame(d->bb_w, d->bb_h);  // состояние меню игры — для ввода хоста
+    game_menu_frame(d->bb_w, d->bb_h);  // состояние меню игры — для ввода хоста и 4:3-режима
+    game_rumble_frame();                // вибрация по урону игрока
+    sync_menu_aspect_flag(d);
     script_fix_scan(1);                 // запасной поиск неисправленного байткода (runtime/script_fix.c)
     movie_overlay(d);
     int w, h;
     plat_drawable_size(&w, &h);
-    if (!d->blit_fbo)
-        glGenFramebuffers(1, &d->blit_fbo);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, d->blit_fbo);
-    glFramebufferRenderbuffer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, d->backbuffer->rb);
-    ov_flush(d->blit_fbo, (int)d->bb_w, (int)d->bb_h);  // слой интерфейса порта (game_menu_frame) — в задний буфер
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-    glDisable(GL_SCISSOR_TEST);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glClearColor(0, 0, 0, 1);
-    glClear(GL_COLOR_BUFFER_BIT);
-    // вписать с сохранением пропорций; кадр хранится сверху вниз — переворот при копировании
-    float sx = (float)w / (float)d->bb_w, sy = (float)h / (float)d->bb_h, sc = sx < sy ? sx : sy;
-    int dw = (int)((float)d->bb_w * sc), dh = (int)((float)d->bb_h * sc), dx = (w - dw) / 2, dy = (h - dh) / 2;
-    glBlitFramebuffer(0, 0, (GLint)d->bb_w, (GLint)d->bb_h, dx, dy + dh, dx + dw, dy, GL_COLOR_BUFFER_BIT, GL_LINEAR);
-    maybe_shot(d);
+    float fdx = 0, fdy = 0, fdw = (float)w, fdh = (float)h;
+    if (w > 0 && h > 0 && d->bb_w && d->bb_h)
+        present_rect(d, w, h, &fdx, &fdy, &fdw, &fdh);
+    present_pass_args pa;
+    memset(&pa, 0, sizeof pa);
+    pa.bb_tex = d->backbuffer ? d->backbuffer->color_tex : 0;
+    pa.win_w = w;
+    pa.win_h = h;
+    pa.dx = (int)(fdx + 0.5f);
+    pa.dy = (int)(fdy + 0.5f);
+    pa.dw = (int)(fdw + 0.5f);
+    pa.dh = (int)(fdh + 0.5f);
+    if (d->gamma_dirty || d->frame == 0) {
+        pa.update_gamma = 1;
+        for (int i = 0; i < 256; i++) {
+            pa.gamma_rgb[i][0] = d->gamma[0][i];
+            pa.gamma_rgb[i][1] = d->gamma[1][i];
+            pa.gamma_rgb[i][2] = d->gamma[2][i];
+        }
+        d->gamma_dirty = 0;
+    }
+    cs_async(x_present_pass, &pa, sizeof pa);
+    // Слой интерфейса порта (значки Switch, легенда меню, Quick Menu) — прямо в окно поверх пост-прохода:
+    // квадратные пиксели 1:1 даже в режиме 4:3 и без искажения гаммой игры
+    if (w > 0 && h > 0) {
+        ov_begin();
+        game_menu_draw_overlay(w, h, fdx, fdy, fdw, fdh);
+        ov_flush(0, w, h);
+    }
     // счётчик на экране: кадров за последние полсекунды
     static u64 ov_t0;
     static int ov_frame0, ov_fps;
@@ -1508,13 +3038,17 @@ void d3d8_present(d3ddev *d)
         ov_t0 = ov_now;
         ov_frame0 = d->frame;
     }
-    if (g_fps_overlay)
-        draw_fps(ov_fps, w, h);
+    if (g_fps_overlay) {
+        draw_fps_args fa = {ov_fps, w, h};
+        cs_cmd_push(x_draw_fps, &fa, sizeof fa);
+    }
+    maybe_shot(d, w, h);
     hitch_check(d);
     if (hle_frame_hook)
         hle_frame_hook(d->frame);
     if (d->frame < 5 || d->frame % 600 == 0)
-        fprintf(stderr, "[d3d8] frame %d: %u draws, %d programs\n", d->frame, d->draws, g_nprogs);
+        fprintf(stderr, "[d3d8] frame %d: %u draws, %u programs\n", d->frame, d->draws,
+                atomic_load_explicit(&g_nprogs, memory_order_relaxed));
     // частота кадров раз в 5 с (на Switch — в терминал nxlink)
     static u64 fps_t0;
     static int fps_frame0;
@@ -1561,15 +3095,8 @@ void d3d8_present(d3ddev *d)
     d->draws = 0;
     cs_swap();
     frame_pace();
-    glBindFramebuffer(GL_FRAMEBUFFER, d->fbo);
-    g_applied_gen = 0xFFFFFFFFu;
+    cs_cmd_push(x_post_present, &d, sizeof d);
     d->frame++;
-    // glGetError ждёт драйвер (с glthread/потоком рендера — всю очередь): не каждый кадр
-    if (d->frame < 5 || d->frame % 300 == 0) {
-        GLenum err = glGetError();
-        if (err)
-            fprintf(stderr, "[d3d8] GL error 0x%x by frame %d\n", err, d->frame);
-    }
 }
 
 int d3d8_window_to_target(float u, float v, int *x, int *y)
@@ -1577,12 +3104,12 @@ int d3d8_window_to_target(float u, float v, int *x, int *y)
     d3ddev *d = d3d8_dev();
     int w, h;
     plat_drawable_size(&w, &h);
-    if (!d || !w || !h)
+    if (!d || !w || !h || !d->bb_w || !d->bb_h)
         return 0;
-    float sx = (float)w / (float)d->bb_w, sy = (float)h / (float)d->bb_h, sc = sx < sy ? sx : sy;
-    float dx = ((float)w - (float)d->bb_w * sc) / 2, dy = ((float)h - (float)d->bb_h * sc) / 2;
-    *x = (int)((u * (float)w - dx) / sc);
-    *y = (int)((v * (float)h - dy) / sc);
+    float dx, dy, dw, dh;
+    present_rect(d, w, h, &dx, &dy, &dw, &dh);
+    *x = (int)floorf((u * (float)w - dx) / dw * (float)d->bb_w);
+    *y = (int)floorf((v * (float)h - dy) / dh * (float)d->bb_h);
     return 1;
 }
 
@@ -1591,11 +3118,11 @@ int d3d8_target_to_window(float x, float y, float *u, float *v)
     d3ddev *d = d3d8_dev();
     int w, h;
     plat_drawable_size(&w, &h);
-    if (!d || !w || !h)
+    if (!d || !w || !h || !d->bb_w || !d->bb_h)
         return 0;
-    float sx = (float)w / (float)d->bb_w, sy = (float)h / (float)d->bb_h, sc = sx < sy ? sx : sy;
-    float dx = ((float)w - (float)d->bb_w * sc) / 2, dy = ((float)h - (float)d->bb_h * sc) / 2;
-    *u = (x * sc + dx) / (float)w;
-    *v = (y * sc + dy) / (float)h;
+    float dx, dy, dw, dh;
+    present_rect(d, w, h, &dx, &dy, &dw, &dh);
+    *u = (x / (float)d->bb_w * dw + dx) / (float)w;
+    *v = (y / (float)d->bb_h * dh + dy) / (float)h;
     return 1;
 }

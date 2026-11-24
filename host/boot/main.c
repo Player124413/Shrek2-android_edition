@@ -20,6 +20,7 @@
 #endif
 #include <pthread.h>
 #include <stdalign.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,15 +37,21 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
 #endif
 
 #include "boot_modules.h"
 #include "host/boot/config.h"
 #include "host/boot/input.h"
 #include "host/boot/prof.h"
+#include "platform/platform.h"
 #include "platform/window.h"
 #include "runtime/game/uobj.h"
+#include "runtime/hle/gl_cs.h"
 #include "runtime/hle/hle.h"
+#include "runtime/hle/openal.h"
 #include "runtime/hle/user32.h"
 #include "runtime/process.h"
 #include "runtime/rt.h"
@@ -78,8 +85,12 @@ static size_t g_stack_size = RT_HOST_STACK_MAIN;
 static void stack_report(void)
 {
     size_t pg = (size_t)getpagesize(), n = g_stack_size / pg, lo = n;
+#ifdef __linux__
+    unsigned char *v = malloc(n);
+#else
     char *v = malloc(n);
-    if (v && mincore(g_stack, g_stack_size, (void *)v) == 0)
+#endif
+    if (v && mincore(g_stack, g_stack_size, v) == 0)
         for (size_t i = 0; i < n && lo == n; i++)
             if (v[i] & 0x7F)  // в памяти, сжата или выгружена (0x80 — просто «анонимная»)
                 lo = i;
@@ -119,6 +130,10 @@ static int error_hist(char *text, size_t cap)
     return 1;
 }
 
+#ifdef SNX_PGO_GEN
+static void pgo_dump(void);
+#endif
+
 // Ловушка: бэктрейс гостя, текст фатальной ошибки движка, сброс логов
 static void on_trap(CPU *c, u32 addr, const char *what)
 {
@@ -128,8 +143,14 @@ static void on_trap(CPU *c, u32 addr, const char *what)
     char text[4096];
     if (error_hist(text, sizeof text))
         fprintf(stderr, "[boot] GErrorHist: %s\n", text);
-    flush_guest_logs(c);
+    GuestThread *t = rt_thread_current();
+    if (!t || (c->esp > t->stack_lo + 64 && c->esp <= t->stack_hi))  // esp мусорный (ловушка вне кода гостя) — без
+        flush_guest_logs(c);                                          // вызовов гостя: rt_guest_call кладёт на стек
     hle_file_flush_all();
+    rt_platform_cpu_boost_reset();
+#ifdef SNX_PGO_GEN
+    pgo_dump();  // счётчики — в памяти хоста: прогон до ловушки не пропадает
+#endif
     fflush(stderr);
 #ifdef __SWITCH__
     // abort() вернул бы управление hbloader, а поток рендера, звук и фоновые потоки гостя жили бы дальше:
@@ -246,11 +267,62 @@ static void cfg_test(void)
     g_cfg_test_ns = g_cfg_test_n > 0 ? rt_ticks_ns() + g_cfg_test_gap_ns : 0;
 }
 
-// --seconds и SNX_EH_TEST: проверяются в цикле сообщений гостя (PeekMessage/GetMessage)
+// --seconds, отладочные таймеры и доставка отложенного WM_ACTIVATEAPP: проверяются в цикле сообщений гостя
 static u64 g_uo_dump_ns;  // SNX_UO_DUMP=<с>: разведка объектов гостя (runtime/game/uobj.h)
+static _Atomic int g_pending_focus;  // 0 — нет, 1 — потеря фокуса, 2 — возврат фокуса
+static _Atomic int g_guest_done;
+static _Atomic int g_exit_code;
+static _Atomic int g_shutdown_done;
+static void boot_shutdown(void);
 
-static void deadline_check(void)
+// События жизненного цикла ОС (главный поток SDL/libnx -> гость, звук, игровые часы)
+static void on_focus(int focused)
 {
+    fprintf(stderr, "[boot] focus %s\n", focused ? "gained" : "lost");
+    rt_clock_pause(!focused);
+    openal_pause(!focused);
+    u32 hwnd = user32_focus();
+    if (hwnd) {
+        atomic_store(&g_pending_focus, 0);
+        user32_post(hwnd, 0x1C /* WM_ACTIVATEAPP */, focused ? 1u : 0u, 0);
+    } else {
+        atomic_store(&g_pending_focus, focused ? 2 : 1);
+    }
+}
+
+static void on_resume(void)
+{
+    fprintf(stderr, "[boot] resume from sleep\n");
+    // Поглотить время во сне в смещении часов гостя, чтобы UE2 не получил гигантский dt
+    rt_clock_sync();
+}
+
+static void on_screen_mode(int w, int h)
+{
+    fprintf(stderr, "[boot] screen mode changed: %dx%d\n", w, h);
+    user32_set_screen(w, h);
+}
+
+static void on_exit_request(void)
+{
+    fprintf(stderr, "[boot] system exit requested\n");
+    u32 hwnd = user32_focus();
+    if (hwnd)
+        user32_post(hwnd, 0x10 /* WM_CLOSE */, 0, 0);
+}
+
+static void pump_hook(void)
+{
+    int pf = atomic_exchange_explicit(&g_pending_focus, 0, memory_order_acq_rel);
+    if (pf) {
+        u32 hwnd = user32_focus();
+        if (hwnd) {
+            user32_post(hwnd, 0x1C /* WM_ACTIVATEAPP */, pf == 2 ? 1u : 0u, 0);
+        } else {
+            int expected = 0;
+            atomic_compare_exchange_strong(&g_pending_focus, &expected, pf);
+        }
+    }
     if (g_eh_test_ns && rt_ticks_ns() >= g_eh_test_ns) {
         g_eh_test_ns = 0;
         eh_test();
@@ -271,7 +343,7 @@ static void deadline_check(void)
     fprintf(stderr, "[boot] --seconds elapsed, exiting\n");
     if (t)
         flush_guest_logs(&t->cpu);
-    prof_dump();
+    boot_shutdown();
 #ifndef __SWITCH__
     stack_report();
 #endif
@@ -291,7 +363,8 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx)
     u64 far = ctx->far.x;
     GuestThread *t = rt_thread_current();
     char what[160];
-    if (t && far >= (u64)(uintptr_t)g_mem && far < (u64)(uintptr_t)g_mem + 0x100000000ull) {
+    // На Switch окно гостя — RT_WINDOW (1 ГБ), дальше идёт куча хоста: не принимать её сбои за гостевой AV
+    if (t && far >= (u64)(uintptr_t)g_mem && far < (u64)(uintptr_t)g_mem + (u64)RT_WINDOW) {
 #ifdef SNX_PIN
         // регистры гостя закреплены за x19–x26 (runtime/gen_rt.h): в отчёте — из контекста исключения
         t->cpu.eax = (u32)ctx->cpu_gprs[19].x, t->cpu.ecx = (u32)ctx->cpu_gprs[20].x;
@@ -307,6 +380,20 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx)
     } else
         snprintf(what, sizeof what, "host exception %#x at pc %#llx, far %#llx", ctx->error_desc,
                  (unsigned long long)ctx->pc.x, (unsigned long long)far);
+    // место в образе: смещения от _start — адреса snx_boot.elf (addr2line -f -e snx_boot.elf); lr — вызывающий для
+    // листовых функций (memcpy), затем цепочка x29 в пределах стека потока
+    extern char _start[];
+    u64 base = (u64)(uintptr_t)_start, fp = ctx->fp.x, sp = ctx->sp.x;
+    fprintf(stderr, "[boot] host pc +%#llx, lr +%#llx (snx_boot.elf), frames:", (unsigned long long)(ctx->pc.x - base),
+            (unsigned long long)(ctx->lr.x - base));
+    for (int i = 0; i < 12 && fp >= sp && fp < sp + (512ull << 20) && !(fp & 15); i++) {
+        u64 next = ((u64 *)(uintptr_t)fp)[0], ret = ((u64 *)(uintptr_t)fp)[1];
+        fprintf(stderr, " +%#llx", (unsigned long long)(ret - base));
+        if (next <= fp)
+            break;
+        fp = next;
+    }
+    fprintf(stderr, "\n");
     if (t)
         on_trap(&t->cpu, 0, what);
     fprintf(stderr, "[boot] %s\n", what);
@@ -391,16 +478,31 @@ static void *pgo_timer(void *arg)
 }
 #endif
 
-#ifdef __SWITCH__
-// NRO исполняется в процессе hbloader: после обычного exit() код NRO выгружается, а поток рендера, звук и фоновые
-// потоки гостя ещё работают — падение («программа закрыта, потому что произошла ошибка»). Поэтому любой exit()
-// завершает процесс целиком (выход в HOME, а не в hbmenu); файлы гостя к этому времени закрыты им самим.
-static void exit_process(void)
+// Аккуратная остановка подсистем при штатном выходе (идемпотентна). Не вызывается из on_trap.
+static void boot_shutdown(void)
 {
+    if (atomic_exchange(&g_shutdown_done, 1))
+        return;
+    plat_quit();
+    cs_stop();
+    openal_shutdown();
+    hle_file_flush_all();
+    rt_platform_cpu_boost_reset();
+    prof_dump();
 #ifdef SNX_PGO_GEN
     pgo_dump();
 #endif
     fflush(NULL);
+}
+
+#ifdef __SWITCH__
+// NRO исполняется в процессе hbloader: поток рендера и OpenAL останавливаются в boot_shutdown(), а файлы сбрасываются
+// через hle_file_flush_all(), но фоновые потоки файлового слоя (kernel32_file.c: ws_worker, wc_worker, fimg_worker)
+// и фоновые потоки гостя (CreateThread) пока не имеют кооперативного завершения. Обычный возврат в hbmenu выгрузил
+// бы код NRO при живых потоках -> падение; поэтому завершаем процесс целиком через svcExitProcess [проверить на Switch].
+static void exit_process(void)
+{
+    boot_shutdown();
     svcExitProcess();
 }
 #elif defined(__ANDROID__)
@@ -418,28 +520,36 @@ static void exit_process(void)
 static void *boot(void *arg)
 {
     (void)arg;
+    int rc = 1;
     rt_platform_thread_core(1);
     prof_guest_thread();
     if (rt_process_init(boot_modules, g_game, g_user, "C:\\Shrek2", g_args) != 0) {
         fprintf(stderr, "[boot] process init failed\n");
-        exit(1);
+        goto done;
     }
     boot_config_apply(g_res_w, g_res_h);
     rt_module *exe = rt_module_main();
     if (!exe) {
         fprintf(stderr, "[boot] no game.exe among recompiled modules\n");
-        exit(1);
+        goto done;
     }
     // как загрузчик Windows: сначала DllMain всех статически импортируемых модулей
     if (rt_module_attach(exe) != 0)
-        exit(1);
+        goto done;
     fprintf(stderr, "[boot] static DLLs initialized\n");
-    if (g_dlls_only)
-        exit(0);
+    if (g_dlls_only) {
+        rc = 0;
+        goto done;
+    }
     GuestThread *t = rt_thread_current();
     u32 r = rt_guest_call(&t->cpu, exe->desc->entry, 0, NULL);
     fprintf(stderr, "[boot] game.exe entry returned %u\n", r);
-    exit((int)r);
+    rc = (int)r;
+done:
+    atomic_store(&g_exit_code, rc);
+    atomic_store(&g_guest_done, 1);
+    plat_quit();
+    return NULL;
 }
 
 int main(int argc, char **argv)
@@ -501,6 +611,8 @@ int main(int argc, char **argv)
             dup2(fileno(stderr), fileno(stdout));
         }
     }
+    if (!rt_platform_preflight())
+        return 1;  // applet-режим: подсказка показана, SDL и потоков ещё нет — обычный возврат в hbloader
 #endif
 #ifdef SNX_NO_GAME
     // APK из CI без файлов игры (host/boot/CMakeLists.txt): код порта собран, модулей игры нет
@@ -541,8 +653,7 @@ int main(int argc, char **argv)
         if (gap && atof(gap + 1) >= 0)
             g_cfg_test_gap_ns = (u64)(atof(gap + 1) * 1e6);
     }
-    if (g_deadline_ns || g_eh_test_ns || g_uo_dump_ns || g_err_test_ns || g_cfg_test_ns)
-        user32_pump_hook = deadline_check;
+    user32_pump_hook = pump_hook;
     rt_file_size_hook = hle_file_size_known;  // FileSize без открытия (runtime/overrides_launch.c)
     // гостевая рекурсия исполняется рекурсией хоста: главному потоку гостя — большой стек
     pthread_attr_t a;
@@ -555,7 +666,7 @@ int main(int argc, char **argv)
     sa.sa_flags = SA_SIGINFO;
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
-    g_stack = mmap(NULL, g_stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    g_stack = mmap(NULL, g_stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (g_stack == MAP_FAILED)
         return 1;
     pthread_attr_setstack(&a, g_stack, g_stack_size);
@@ -569,6 +680,10 @@ int main(int argc, char **argv)
     if (pthread_create(&pgo_th, NULL, pgo_timer, NULL) == 0)
         pthread_detach(pgo_th);
 #endif
+    plat_on_focus = on_focus;
+    plat_on_resume = on_resume;
+    plat_on_screen_mode = on_screen_mode;
+    plat_on_exit_request = on_exit_request;
     if (!g_headless && plat_init() != 0) {
         fprintf(stderr, "[boot] no SDL video, running headless\n");
         g_headless = 1;
@@ -595,6 +710,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "[boot] render %dx%d (scale %.2f, aspect %.3f%s)\n", g_res_w, g_res_h, (double)k,
                 (double)g_res_w / (double)g_res_h, lim > 0 ? ", limited" : "");
     }
+#else
+    atexit(boot_shutdown);
 #endif
     if (g_res_w > 0)
         user32_set_screen(g_res_w, g_res_h);
@@ -604,9 +721,44 @@ int main(int argc, char **argv)
     pthread_t th;
     if (pthread_create(&th, &a, boot, NULL) != 0)
         return 1;
-    if (g_headless)
+    if (g_headless) {
         pthread_join(th, NULL);
-    else
-        plat_run();  // до выхода гостя (exit в его потоке)
-    return 0;
+        boot_shutdown();
+    } else {
+        plat_run();  // до выхода гостя или системного OnExitRequest
+        // Дать потоку гостя короткое время завершиться после WM_CLOSE (если выход инициировал хост/HOME)
+        for (int i = 0; i < 50 && !atomic_load(&g_guest_done); i++)
+            usleep(10000);
+        if (atomic_load(&g_guest_done)) {
+            pthread_join(th, NULL);
+            boot_shutdown();
+#ifdef __ANDROID__
+            // процесс :game завершаем целиком, без деструкторов SDL/EGL (см. exit_process): иначе он может остаться
+            // жить, и следующий запуск из лаунчера попадёт в него
+            exit_process();
+#endif
+            plat_shutdown();
+        } else {
+            // Гость ещё занят (например, загрузка карты при OnExitRequest): кольцо gl_cs не освобождаем на ходу,
+            // чтобы не получить гонку с писателем, но закрываем звук и сбрасываем файлы на диск.
+            atomic_store(&g_shutdown_done, 1);
+            openal_shutdown();
+            hle_file_flush_all();
+            rt_platform_cpu_boost_reset();
+            prof_dump();
+#ifdef SNX_PGO_GEN
+            pgo_dump();
+#endif
+            fflush(NULL);
+#ifdef __SWITCH__
+            svcExitProcess();
+#else
+            _exit(atomic_load(&g_exit_code));
+#endif
+        }
+    }
+#ifndef __SWITCH__
+    stack_report();
+#endif
+    return atomic_load(&g_exit_code);
 }

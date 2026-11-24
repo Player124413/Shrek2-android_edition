@@ -4,6 +4,7 @@
 // поэтому передаются указателями прямо в память гостя; строки результатов копируются в гостевую кучу.
 // Устройство и контекст для гостя — непрозрачные описатели (блоки в гостевой куче). EAX нет — как у
 // DefOpenAL32 без звуковой карты Creative. SNX_LOG_AUDIO=1 — буферы, запуски источников, ошибки AL.
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -16,13 +17,15 @@
 #include <AL/alc.h>
 #endif
 
-#ifndef ALC_APIENTRY
-#define ALC_APIENTRY
-#endif
-
 #include "platform/window.h"
 #include "runtime/heap.h"
 #include "runtime/hle/hle.h"
+#include "runtime/hle/openal.h"
+
+#ifndef ALC_APIENTRY
+#define ALC_APIENTRY
+#endif
+typedef void (ALC_APIENTRY *alc_device_pause_fn)(ALCdevice *device);
 
 #define RETV() RET(0, 0)
 #define P(i) (ARG(i) ? (void *)(g_mem + ARG(i)) : NULL)
@@ -44,13 +47,27 @@ static float argf(CPU *c, int i)
 }
 
 // ---------------------------------------------------------------- описатели устройств и контекстов
+enum { H_NONE = 0, H_DEV = 1, H_CTX = 2 };
 #define MAX_H 8
 static struct {
     u32 h;
     void *p;
+    int kind;
+    int guest_suspended;  // гость сам вызвал alcSuspendContext для этого контекста
 } g_handles[MAX_H];
+static pthread_mutex_t g_al_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_al_paused;
+static int g_al_shutdown;
 
-static u32 handle_of(void *p)
+static int find_handle_locked(u32 h)
+{
+    for (int i = 0; h && i < MAX_H; i++)
+        if (g_handles[i].h == h && g_handles[i].p)
+            return i;
+    return -1;
+}
+
+static u32 handle_of_locked(void *p, int kind)
 {
     if (!p)
         return 0;
@@ -62,28 +79,98 @@ static u32 handle_of(void *p)
             if (!g_handles[i].h)
                 g_handles[i].h = heap_alloc(heap_process(), HEAP_ZERO_MEMORY, 16);
             g_handles[i].p = p;
+            g_handles[i].kind = kind;
+            g_handles[i].guest_suspended = 0;
             return g_handles[i].h;
         }
     return 0;
 }
 
-static void *host_of(u32 h)
+static void *host_of_locked(u32 h)
 {
-    for (int i = 0; h && i < MAX_H; i++)
-        if (g_handles[i].h == h)
-            return g_handles[i].p;
-    return NULL;
+    int i = find_handle_locked(h);
+    return i >= 0 ? g_handles[i].p : NULL;
 }
 
-static void handle_drop(void *p)
+static void handle_drop_locked(void *p)
 {
     for (int i = 0; p && i < MAX_H; i++)
-        if (g_handles[i].p == p)
+        if (g_handles[i].p == p) {
             g_handles[i].p = NULL;  // блок гостя остаётся для следующего описателя
+            g_handles[i].kind = H_NONE;
+            g_handles[i].guest_suspended = 0;
+        }
 }
 
-// строки результатов: одна копия в гостевой куче на каждое значение (+ два NUL)
-static u32 guest_str(const char *s, size_t len)
+// Если openal-soft поддерживает ALC_SOFT_pause_device (Switch/Linux), ставим на паузу само устройство вывода.
+static void device_pause_soft_locked(ALCdevice *d, int paused)
+{
+    if (!d || !alcIsExtensionPresent(d, "ALC_SOFT_pause_device"))
+        return;
+    void *sym = alcGetProcAddress(d, paused ? "alcDevicePauseSOFT" : "alcDeviceResumeSOFT");
+    if (!sym)
+        return;
+    alc_device_pause_fn fn;
+    memcpy(&fn, &sym, sizeof fn);
+    fn(d);
+}
+
+void openal_pause(int paused)
+{
+    paused = paused ? 1 : 0;
+    pthread_mutex_lock(&g_al_lock);
+    if (g_al_shutdown || g_al_paused == paused) {
+        pthread_mutex_unlock(&g_al_lock);
+        return;
+    }
+    g_al_paused = paused;
+    if (paused) {
+        for (int i = 0; i < MAX_H; i++)
+            if (g_handles[i].p && g_handles[i].kind == H_CTX)
+                alcSuspendContext((ALCcontext *)g_handles[i].p);
+        for (int i = 0; i < MAX_H; i++)
+            if (g_handles[i].p && g_handles[i].kind == H_DEV)
+                device_pause_soft_locked((ALCdevice *)g_handles[i].p, 1);
+    } else {
+        for (int i = 0; i < MAX_H; i++)
+            if (g_handles[i].p && g_handles[i].kind == H_DEV)
+                device_pause_soft_locked((ALCdevice *)g_handles[i].p, 0);
+        for (int i = 0; i < MAX_H; i++)
+            if (g_handles[i].p && g_handles[i].kind == H_CTX && !g_handles[i].guest_suspended)
+                alcProcessContext((ALCcontext *)g_handles[i].p);
+    }
+    pthread_mutex_unlock(&g_al_lock);
+}
+
+void openal_shutdown(void)
+{
+    pthread_mutex_lock(&g_al_lock);
+    if (g_al_shutdown) {
+        pthread_mutex_unlock(&g_al_lock);
+        return;
+    }
+    g_al_shutdown = 1;
+    alcMakeContextCurrent(NULL);
+    for (int i = 0; i < MAX_H; i++) {
+        if (g_handles[i].p && g_handles[i].kind == H_CTX) {
+            alcDestroyContext((ALCcontext *)g_handles[i].p);
+            g_handles[i].p = NULL;
+            g_handles[i].kind = H_NONE;
+            g_handles[i].guest_suspended = 0;
+        }
+    }
+    for (int i = 0; i < MAX_H; i++) {
+        if (g_handles[i].p && g_handles[i].kind == H_DEV) {
+            alcCloseDevice((ALCdevice *)g_handles[i].p);
+            g_handles[i].p = NULL;
+            g_handles[i].kind = H_NONE;
+        }
+    }
+    pthread_mutex_unlock(&g_al_lock);
+}
+
+// строки результатов: одна копия в гостевой куче на каждое значение (+ два NUL); вызывать под g_al_lock
+static u32 guest_str_locked(const char *s, size_t len)
 {
     static struct {
         char *s;
@@ -108,45 +195,47 @@ static u32 guest_str(const char *s, size_t len)
     return g;
 }
 
-// ---------------------------------------------------------------- ALC
-// приложение в фоне (Android: свёрнуто) — вывод звука на паузе (ALC_SOFT_pause_device), иначе он играет дальше
-static ALCdevice *g_pause_dev;
-
-static void on_pause(int paused)
+static u32 guest_str(const char *s, size_t len)
 {
-    ALCdevice *d = g_pause_dev;
-    if (!d || !alcIsExtensionPresent(d, "ALC_SOFT_pause_device"))
-        return;
-    void(ALC_APIENTRY * fn)(ALCdevice *) =
-        (void(ALC_APIENTRY *)(ALCdevice *))alcGetProcAddress(d, paused ? "alcDevicePauseSOFT" : "alcDeviceResumeSOFT");
-    if (fn)
-        fn(d);
+    pthread_mutex_lock(&g_al_lock);
+    u32 g = guest_str_locked(s, len);
+    pthread_mutex_unlock(&g_al_lock);
+    return g;
 }
 
+// ---------------------------------------------------------------- ALC
+// приложение в фоне (Android: свёрнуто) — звук на паузе (openal_pause: контексты и ALC_SOFT_pause_device), иначе
+// он играет дальше
 static void alc_OpenDevice(CPU *c)
 {
     const char *want = ARG(0) ? hle_cstr(ARG(0)) : "(default)";
+    pthread_mutex_lock(&g_al_lock);
+    if (g_al_shutdown) {
+        pthread_mutex_unlock(&g_al_lock);
+        RET(0, 0);
+    }
     ALCdevice *d = alcOpenDevice(NULL);
     static int hooked;
-    if (d) {
-        g_pause_dev = d;
-        if (!hooked) {
-            hooked = 1;
-            plat_add_pause_hook(on_pause);
-        }
+    if (d && !hooked) {
+        hooked = 1;
+        plat_add_pause_hook(openal_pause);
     }
     fprintf(stderr, "[openal] alcOpenDevice(%s) -> %s\n", want,
             d ? alcGetString(d, ALC_DEVICE_SPECIFIER) : "failed");
-    RET(0, handle_of(d));
+    if (d && g_al_paused)
+        device_pause_soft_locked(d, 1);
+    u32 h = handle_of_locked(d, H_DEV);
+    pthread_mutex_unlock(&g_al_lock);
+    RET(0, h);
 }
 
 static void alc_CloseDevice(CPU *c)
 {
-    ALCdevice *d = host_of(ARG(0));
-    if (d == g_pause_dev)
-        g_pause_dev = NULL;
+    pthread_mutex_lock(&g_al_lock);
+    ALCdevice *d = host_of_locked(ARG(0));
     ALCboolean r = d ? alcCloseDevice(d) : ALC_FALSE;
-    handle_drop(d);
+    handle_drop_locked(d);
+    pthread_mutex_unlock(&g_al_lock);
     RET(0, r);
 }
 
@@ -162,35 +251,101 @@ static void alc_CreateContext(CPU *c)
         n += 2;
     }
     attrs[n] = 0;
-    ALCcontext *x = alcCreateContext(host_of(ARG(0)), ARG(1) ? attrs : NULL);
-    RET(0, handle_of(x));
+    pthread_mutex_lock(&g_al_lock);
+    if (g_al_shutdown) {
+        pthread_mutex_unlock(&g_al_lock);
+        RET(0, 0);
+    }
+    ALCcontext *x = alcCreateContext(host_of_locked(ARG(0)), ARG(1) ? attrs : NULL);
+    if (x && g_al_paused)
+        alcSuspendContext(x);
+    u32 h = handle_of_locked(x, H_CTX);
+    pthread_mutex_unlock(&g_al_lock);
+    RET(0, h);
 }
 
 static void alc_DestroyContext(CPU *c)
 {
-    ALCcontext *x = host_of(ARG(0));
+    pthread_mutex_lock(&g_al_lock);
+    ALCcontext *x = host_of_locked(ARG(0));
     if (x)
         alcDestroyContext(x);
-    handle_drop(x);
+    handle_drop_locked(x);
+    pthread_mutex_unlock(&g_al_lock);
     RETV();
 }
 
-static void alc_MakeContextCurrent(CPU *c) { RET(0, alcMakeContextCurrent(host_of(ARG(0)))); }
-static void alc_GetCurrentContext(CPU *c) { RET(0, handle_of(alcGetCurrentContext())); }
-static void alc_GetContextsDevice(CPU *c) { RET(0, handle_of(alcGetContextsDevice(host_of(ARG(0))))); }
-static void alc_GetError(CPU *c) { RET(0, alcGetError(host_of(ARG(0)))); }
-static void alc_ProcessContext(CPU *c) { alcProcessContext(host_of(ARG(0))); RETV(); }
-static void alc_SuspendContext(CPU *c) { alcSuspendContext(host_of(ARG(0))); RETV(); }
+static void alc_MakeContextCurrent(CPU *c)
+{
+    pthread_mutex_lock(&g_al_lock);
+    ALCboolean r = g_al_shutdown ? ALC_FALSE : alcMakeContextCurrent(host_of_locked(ARG(0)));
+    pthread_mutex_unlock(&g_al_lock);
+    RET(0, r);
+}
+
+static void alc_GetCurrentContext(CPU *c)
+{
+    pthread_mutex_lock(&g_al_lock);
+    u32 h = handle_of_locked(alcGetCurrentContext(), H_CTX);
+    pthread_mutex_unlock(&g_al_lock);
+    RET(0, h);
+}
+
+static void alc_GetContextsDevice(CPU *c)
+{
+    pthread_mutex_lock(&g_al_lock);
+    ALCcontext *x = host_of_locked(ARG(0));
+    u32 h = handle_of_locked(x ? alcGetContextsDevice(x) : NULL, H_DEV);
+    pthread_mutex_unlock(&g_al_lock);
+    RET(0, h);
+}
+
+static void alc_GetError(CPU *c)
+{
+    pthread_mutex_lock(&g_al_lock);
+    ALCenum e = alcGetError(host_of_locked(ARG(0)));
+    pthread_mutex_unlock(&g_al_lock);
+    RET(0, e);
+}
+
+static void alc_ProcessContext(CPU *c)
+{
+    pthread_mutex_lock(&g_al_lock);
+    int i = find_handle_locked(ARG(0));
+    if (i >= 0 && g_handles[i].kind == H_CTX) {
+        g_handles[i].guest_suspended = 0;
+        if (!g_al_paused && !g_al_shutdown)
+            alcProcessContext((ALCcontext *)g_handles[i].p);
+    }
+    pthread_mutex_unlock(&g_al_lock);
+    RETV();
+}
+
+static void alc_SuspendContext(CPU *c)
+{
+    pthread_mutex_lock(&g_al_lock);
+    int i = find_handle_locked(ARG(0));
+    if (i >= 0 && g_handles[i].kind == H_CTX) {
+        g_handles[i].guest_suspended = 1;
+        if (!g_al_shutdown)
+            alcSuspendContext((ALCcontext *)g_handles[i].p);
+    }
+    pthread_mutex_unlock(&g_al_lock);
+    RETV();
+}
 
 static void alc_GetIntegerv(CPU *c)
 {
-    alcGetIntegerv(host_of(ARG(0)), (ALCenum)ARG(1), (ALCsizei)ARG(2), P(3));
+    pthread_mutex_lock(&g_al_lock);
+    alcGetIntegerv(host_of_locked(ARG(0)), (ALCenum)ARG(1), (ALCsizei)ARG(2), P(3));
+    pthread_mutex_unlock(&g_al_lock);
     RETV();
 }
 
 static void alc_GetString(CPU *c)
 {
-    ALCdevice *d = host_of(ARG(0));
+    pthread_mutex_lock(&g_al_lock);
+    ALCdevice *d = host_of_locked(ARG(0));
     ALCenum p = (ALCenum)ARG(1);
     const char *s = alcGetString(d, p);
     size_t len = 0;
@@ -199,7 +354,9 @@ static void alc_GetString(CPU *c)
             len++;
     else if (s)
         len = strlen(s);
-    RET(0, guest_str(s, len));
+    u32 g = guest_str_locked(s, len);
+    pthread_mutex_unlock(&g_al_lock);
+    RET(0, g);
 }
 
 // ---------------------------------------------------------------- AL: состояние

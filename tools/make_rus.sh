@@ -1,13 +1,13 @@
 #!/bin/sh
 # Каталог русской версии для порта: build/game-rus — копия установленной русской игры (клоны APFS, места не
-# занимают), в которой защищённый SafeDisc System/Game.exe заменён распакованным английским game.exe из
-# «Таблетки» (у русских DLL те же экспорты; .text защищённого Game.exe зашифрован, рекомпилировать нечего).
-#   tools/make_rus.sh <русская игра, напр. Shrek2RUS> [game.exe, по умолчанию original/Shrek 2/Таблетка/game.exe]
+# занимают), в которой защищённый SafeDisc System/Game.exe заменён совместимым распакованным английским
+# game.exe из локальной копии (у русских DLL те же экспорты; .text защищённого Game.exe зашифрован).
+#   tools/make_rus.sh <каталог русской игры, напр. Shrek2RUS> <путь к распакованному game.exe>
 # Дальше: recomp gen --game build/game-rus/System --out build/gen-rus; tools/build.sh mac-rus|switch-rus.
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-src=${1:?usage: $0 <russian game dir> [game.exe]}
-exe=${2:-"$ROOT/original/Shrek 2/Таблетка/game.exe"}
+src=${1:?usage: $0 <russian game dir> <unpacked game.exe>}
+exe=${2:?usage: $0 <russian game dir> <unpacked game.exe>}
 out="$ROOT/build/game-rus"
 [ -f "$src/System/Core.dll" ] || { echo "make_rus: $src/System/Core.dll not found" >&2; exit 1; }
 [ -f "$exe" ] || { echo "make_rus: $exe not found" >&2; exit 1; }

@@ -18,21 +18,33 @@
 #include <string.h>
 #include <strings.h>
 
+#ifdef __SWITCH__
+#include <switch.h>
+#endif
+
 #include "runtime/game/uobj.h"
+#include "runtime/hle/hle.h"
+#include "runtime/hle/overlay.h"
+#include "runtime/rt.h"
 
 #define MAX_ITEMS 96
+#define MAX_CLS 256
 
 static u32 g_ctrl;  // GUIController игры
 static u32 g_frames;
+static u32 g_cls_epoch;  // эпоха CollectGarbage, для которой актуален кеш g_cls[]
 static struct {
-    u32 active_page, controls, menu_state, bounds, focused, owner, mouse_x, mouse_y;
+    u32 active_page, controls, menu_state, bounds, focused, owner, mouse_x, mouse_y, win_left, win_width;
     uo_prop visible, accepts, hide_cursor, never_focus, force_check;
     int ok;
 } g_off;
-enum { C_MULTI = 1, C_SLIDER = 2, C_COMBO = 4, C_TABS = 8 };
+enum {
+    C_MULTI = 1, C_SLIDER = 2, C_COMBO = 4, C_TABS = 8, C_EDIT = 16,
+    C_OPT_GAME = 32, C_OPT_VIDEO = 64, C_OPT_PAGE = 128,
+};
 static struct {
     u32 cls, kind, caption;  // C_*; смещение FString Caption (0 — нет)
-} g_cls[96];                 // кеш по классам
+} g_cls[MAX_CLS];            // кеш по классам (сбрасывается при каждой CollectGarbage)
 
 typedef struct {
     u32 comp;
@@ -44,7 +56,7 @@ typedef struct {
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_open, g_focus_kind, g_has_back;
 static game_rect g_back;
-static int g_req_nav[8], g_req_nav_n, g_req_tab, g_req_cursor = -1;
+static int g_req_nav[8], g_req_nav_n, g_req_tab, g_req_cursor = -1, g_req_edit;
 static unsigned g_point_req, g_point_done;  // номер последнего запроса точки и исполненного
 static float g_point_x, g_point_y;
 static u32 g_point_frame;  // кадр, в котором точка поставлена
@@ -54,19 +66,28 @@ static float g_moved_x, g_moved_y;
 static int cls_slot(u32 obj)
 {
     u32 cls = uo_class(obj);
-    for (int i = 0; i < 96; i++) {
+    if (!cls)
+        return -1;
+    for (int i = 0; i < MAX_CLS; i++) {
         if (g_cls[i].cls == cls)
             return i;
         if (!g_cls[i].cls) {
             uo_prop p;
             g_cls[i].cls = cls;
-            g_cls[i].kind = (uo_is_a(obj, "GUIMultiComponent") ? C_MULTI : 0) | (uo_is_a(obj, "GUISlider") ? C_SLIDER : 0) |
-                            (uo_is_a(obj, "GUIComboBox") ? C_COMBO : 0) | (uo_is_a(obj, "GUITabControl") ? C_TABS : 0);
+            g_cls[i].kind = (uo_is_a(obj, "GUIMultiComponent") ? C_MULTI : 0) |
+                            (uo_is_a(obj, "GUISlider") ? C_SLIDER : 0) |
+                            (uo_is_a(obj, "GUIComboBox") ? C_COMBO : 0) |
+                            (uo_is_a(obj, "GUITabControl") ? C_TABS : 0) |
+                            (uo_is_a(obj, "GUIEditBox") ? C_EDIT : 0) |
+                            (uo_is_a(obj, "Tab_OptionsGame") ? C_OPT_GAME : 0) |
+                            (uo_is_a(obj, "Tab_OptionsVideo") ? C_OPT_VIDEO : 0) |
+                            (uo_is_a(obj, "Tab_Options") ? C_OPT_PAGE : 0);
             g_cls[i].caption = uo_find_prop(cls, "Caption", &p) ? p.offset : 0;
             return i;
         }
     }
-    return -1;
+    memset(g_cls, 0, sizeof g_cls);
+    return cls_slot(obj);
 }
 
 static u32 kind_of(u32 obj)
@@ -140,6 +161,10 @@ static int init_offsets(u32 page)
         !uo_find_prop(uo_class(g_ctrl), "bHideMouseCursor", &g_off.hide_cursor) ||
         !uo_find_prop(uo_class(g_ctrl), "bForceMouseCheck", &g_off.force_check))
         return 0;
+    if (uo_find_prop(uo_class(page), "WinLeft", &p))
+        g_off.win_left = p.offset;
+    if (uo_find_prop(uo_class(page), "WinWidth", &p))
+        g_off.win_width = p.offset;
     return g_off.ok = 1;
 }
 
@@ -160,11 +185,10 @@ static void rect_of(u32 comp, game_rect *r)
 
 // ---------------------------------------------------------------- правки страниц настроек
 // Панели вкладок настроек (и в игре, и в главном меню — подклассы): Tab_OptionsGame — клавиши, скорость мыши,
-// Reset; Tab_OptionsVideo — яркость, разрешение, глубина цвета, рендерер, детализация. Ссылки на элементы —
-// свойства панели (btnKeyForward, cbResolution...). Правки повторяются каждый кадр, пока панель видна: игра
-// сама переписывает подписи и видимость при показе вкладки.
-static u32 g_cls_game, g_cls_video;
-static int g_cls_tries;
+// Reset; Tab_OptionsVideo / Tab_InGameOptionsVideo — яркость, разрешение, глубина цвета, рендерер, детализация.
+// Ссылки на элементы — свойства панели (btnKeyForward, cbResolution...). Правки повторяются каждый кадр, пока
+// панель видна: игра сама переписывает подписи и видимость при показе вкладки. Признаки C_OPT_GAME/C_OPT_VIDEO
+// хранятся в кеше классов g_cls[], который сбрасывается при каждой CollectGarbage (смена карты, новая игра).
 
 static u32 member(u32 panel, const char *name)
 {
@@ -178,8 +202,16 @@ static void hide(u32 comp)
         set_flag(comp, &g_off.visible, 0);
 }
 
-// вкладка GAME — схема управления геймпадом: подписи строк и кнопок (переназначение клавиш выключено)
+// вкладка GAME — схема управления геймпадом: подписи строк и значки кнопок Switch (переназначение клавиш выключено).
+// Проверка btnHelp (tools/recon/upkg.py по SHGame.u): единственная btnHelp в пакетах — DriveThroughMenu.btnHelp;
+// InternalOnClick вызывает PlayHelpDialog() (озвученная подсказка магазина через SaySimpleComment, без внешних
+// документов/URL), поэтому btnHelp работает внутри игры и скрывать её не нужно.
 static int g_rus;  // русская версия (game_menu_set_language)
+static unsigned g_bb_w, g_bb_h;
+static int g_game_vis;
+static game_rect g_game_btns[6];
+static int g_game_btn_ok[6];
+static int g_draw_open, g_draw_focus_kind, g_draw_has_tabs;
 
 static const struct {
     const char *label, *button, *caption[2], *keys[2];  // [0] — английская, [1] — русская
@@ -202,14 +234,64 @@ static void unbind(u32 comp, const char *delegate)
     }
 }
 
-static void patch_game(u32 panel)
+// за край экрана (WinLeft больше 1 — в пикселях) и без ввода/фокуса: видимость элементам панели игра выставляет
+// заново каждый кадр (Tab_OptionsVideo.Internal_OnDraw, Tab_OptionsGame.RefreshPage), но WinLeft и делегаты не
+// трогает. У составных элементов (GUIComboBox: Edit, MyShowListBtn, MyListBox) Internal_OnDraw возвращает
+// bVisible=true родителю уже после PreDraw, из-за чего UGUIComboBox::PreDraw пропускает SetDims дочерних, а Draw
+// рисует их на старом месте — поэтому уводим и скрываем рекурсивно все дочерние Controls (их игра не трогает).
+static void move_away_rec(u32 comp, int depth)
 {
+    if (!comp)
+        return;
+    hide(comp);
+    set_flag(comp, &g_off.accepts, 0);
+    set_flag(comp, &g_off.never_focus, 1);
+    unbind(comp, "__OnClick__Delegate");
+    unbind(comp, "__OnChange__Delegate");
+    u32 off = g_off.win_left;
+    if (!off) {
+        uo_prop p;
+        if (uo_find_prop(uo_class(comp), "WinLeft", &p))
+            off = p.offset;
+    }
+    if (off)
+        wrf32(g_mem, comp + off, 100000.0f);
+    if (depth < 3 && is_multi(comp)) {
+        u32 arr = rd32(g_mem, comp + g_off.controls), num = rd32(g_mem, comp + g_off.controls + 4);
+        for (u32 i = 0; i < num && i < 64; i++) {
+            u32 ch = rd32(g_mem, arr + 4 * i);
+            if (ch && ch != comp)
+                move_away_rec(ch, depth + 1);
+        }
+    }
+}
+
+static void move_away(u32 comp) { move_away_rec(comp, 0); }
+
+static void patch_game(u32 panel, int draw_icons)
+{
+    if (draw_icons) {
+        g_game_vis = 1;
+        memset(g_game_btn_ok, 0, sizeof g_game_btn_ok);
+    }
     for (size_t i = 0; i < sizeof g_rows / sizeof g_rows[0]; i++) {
         uo_set_str(member(panel, g_rows[i].label), "Caption", g_rows[i].caption[g_rus]);
         u32 b = member(panel, g_rows[i].button);
         if (b) {
-            uo_set_str(b, "Caption", g_rows[i].keys[g_rus]);
+            // Очищаем текст кнопки — поверх рамки кнопки рисуем значки Switch через overlay.c.
+            // Запасной текст в Caption не пишем, иначе на первом кадре показа вкладки он проступает под значками.
+            uo_set_str(b, "Caption", "");
+            if (draw_icons) {
+                game_rect r;
+                rect_of(b, &r);
+                if (r.x1 - r.x0 >= 8.0f && r.y1 - r.y0 >= 8.0f && r.x0 >= 0.0f && r.y0 >= 0.0f &&
+                    r.x1 <= (float)g_bb_w && r.y1 <= (float)g_bb_h) {
+                    g_game_btns[i] = r;
+                    g_game_btn_ok[i] = 1;
+                }
+            }
             set_flag(b, &g_off.accepts, 0);
+            set_flag(b, &g_off.never_focus, 1);
             // Щелчок (или нажатие «мыши», пока кнопка в фокусе) запускает у панели ожидание клавиши (bPolling), и
             // следующая нажатая кнопка — в том числе геймпада — забирает действие строки: Tab_OptionsGame.ProcessKey
             // стирает его у остальных клавиш (W, Ctrl, Joy2...) и сохраняет в User.ini. Обработчики кнопок клавиш
@@ -220,40 +302,57 @@ static void patch_game(u32 panel)
     }
     uo_set_bool(panel, "bPolling", 0);
     uo_set_str(member(panel, "lblMouseSpeedGame"), "Caption", g_rus ? "СКОРОСТЬ КАМЕРЫ" : "LOOK SPEED");
-    hide(member(panel, "btnReset"));  // сброс клавиш стёр бы и привязки геймпада в User.ini
+    move_away(member(panel, "btnReset"));  // сброс клавиш стёр бы и привязки геймпада в User.ini
 }
 
-// за край экрана (WinLeft больше 1 — в пикселях): видимость этим элементам игра выставляет заново каждый кадр
-static void move_away(u32 comp)
+// Отцентрировать оставшийся видимый элемент по ширине панели (нормализованные WinLeft/WinWidth в 0..1)
+static void center_x(u32 comp)
 {
-    uo_prop p;
-    if (comp && uo_find_prop(uo_class(comp), "WinLeft", &p))
-        wrf32(g_mem, comp + p.offset, 100000.0f);
+    if (!comp)
+        return;
+    u32 off_l = g_off.win_left, off_w = g_off.win_width;
+    uo_prop pl, pw;
+    if (!off_l && uo_find_prop(uo_class(comp), "WinLeft", &pl))
+        off_l = pl.offset;
+    if (!off_w && uo_find_prop(uo_class(comp), "WinWidth", &pw))
+        off_w = pw.offset;
+    if (!off_l || !off_w)
+        return;
+    float w = rdf32(g_mem, comp + off_w);
+    if (w > 0.0f && w < 1.0f)
+        wrf32(g_mem, comp + off_l, (1.0f - w) * 0.5f);
 }
 
-// разрешение и глубину цвета задаёт порт (экран Switch), рендерер — только D3D
+// Разрешение и глубину цвета задаёт порт (экран Switch), рендерер — только D3D; btnApplyVideoChanges применяет
+// только setres (яркость и детализация применяются сразу в TabOptions_OnChange), поэтому вся правая колонка
+// убирается, а оставшаяся левая (яркость, детализация текстур и объектов) центрируется по ширине панели.
 static void patch_video(u32 panel)
 {
-    static const char *const names[] = {"lblResolution", "cbResolution", "lblColorDepth", "cbColorDepth",
-                                        "lblRenderer", "cbRenderer"};
-    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++)
-        move_away(member(panel, names[i]));
+    static const char *const hide_names[] = {"lblResolution", "cbResolution", "lblColorDepth", "cbColorDepth",
+                                             "lblRenderer", "cbRenderer", "btnApplyVideoChanges"};
+    static const char *const keep_names[] = {"lblBrightness", "sldBrightness", "lblTextureDetail", "cbTextureDetail",
+                                             "lblObjectDetail", "cbObjectDetail"};
+    for (size_t i = 0; i < sizeof hide_names / sizeof hide_names[0]; i++)
+        move_away(member(panel, hide_names[i]));
+    uo_set_bool(panel, "btnApplyVideoChangesVisible", 0);
+    for (size_t i = 0; i < sizeof keep_names / sizeof keep_names[0]; i++)
+        center_x(member(panel, keep_names[i]));
 }
 
-static void patch(u32 comp)
+static void patch(u32 comp, u32 k)
 {
-    if (g_cls_game && uo_is_a_class(comp, g_cls_game))
-        patch_game(comp);
-    else if (g_cls_video && uo_is_a_class(comp, g_cls_video))
+    if (k & C_OPT_GAME)
+        patch_game(comp, 1);
+    else if (k & C_OPT_VIDEO)
         patch_video(comp);
 }
 
 // ---------------------------------------------------------------- элементы страницы
-static unsigned g_bb_w, g_bb_h;
 static item g_items[MAX_ITEMS];
 static int g_n;
 static u32 g_tabs;  // видимый GUITabControl страницы
 static int g_back_i;
+static u32 g_last_edit;  // последнее текстовое поле, для которого открывали экранную клавиатуру
 
 static void add(u32 c, int kind)
 {
@@ -277,8 +376,8 @@ static void collect(u32 comp, int depth)
         if (!c || !flag(c, &g_off.visible))
             continue;
         u32 k = kind_of(c);
-        if (k & C_MULTI)
-            patch(c);
+        if (k & (C_OPT_GAME | C_OPT_VIDEO))
+            patch(c, k);
         if (!flag(c, &g_off.visible))
             continue;
         if (k & C_COMBO) {
@@ -287,8 +386,12 @@ static void collect(u32 comp, int depth)
         }
         if ((k & C_TABS) && !g_tabs)
             g_tabs = c;
-        if (flag(c, &g_off.accepts))
-            add(c, k & C_SLIDER ? GM_SLIDER : GM_BUTTON);
+        if (flag(c, &g_off.accepts)) {
+            int kind = (k & C_SLIDER) ? GM_SLIDER
+                     : ((k & C_EDIT) && uo_get_bool(c, "bReadOnly") != 1) ? GM_EDIT
+                     : GM_BUTTON;
+            add(c, kind);
+        }
         if (depth < 6 && (k & C_MULTI))
             collect(c, depth + 1);
     }
@@ -380,6 +483,199 @@ static void focus(int i)
     pthread_mutex_unlock(&g_lock);
 }
 
+// ---------------------------------------------------------------- экранная клавиатура и оверлей меню
+// Ввод текста в GUIEditBox (на Switch — системная клавиатура swkbdShow; в стандартных меню Shrek 2
+// редактируемых GUIEditBox нет, но хук сработает при фокусе на любом нережимном GUIEditBox [проверить на Switch]).
+static void open_swkbd(u32 edit)
+{
+    char init[256] = "";
+    uo_prop tp;
+    if (uo_find_prop(uo_class(edit), "TextStr", &tp)) {
+        u32 data = rd32(g_mem, edit + tp.offset), num = rd32(g_mem, edit + tp.offset + 4);
+        if (data && num)
+            hle_w2utf8(data, init, sizeof init);
+    }
+    u32 max_len = uo_get_u32(edit, "MaxWidth");
+    if (!max_len || max_len > 255)
+        max_len = 64;
+    if (getenv("SNX_LOG_MENU"))
+        fprintf(stderr, "[menu] edit focus %s (\"%s\", max %u)\n", uo_name(edit), init, max_len);
+#ifdef __SWITCH__
+    SwkbdConfig kbd;
+    if (R_SUCCEEDED(swkbdCreate(&kbd, 0))) {
+        char out[256] = "";
+        swkbdConfigMakePresetDefault(&kbd);
+        swkbdConfigSetInitialText(&kbd, init);
+        swkbdConfigSetStringLenMax(&kbd, max_len);
+        Result rc = swkbdShow(&kbd, out, sizeof out);
+        swkbdClose(&kbd);
+        if (R_SUCCEEDED(rc)) {
+            uo_set_str(edit, "TextStr", out);
+            uo_prop cp;
+            if (uo_find_prop(uo_class(edit), "CaretPos", &cp)) {
+                u32 n = 0;
+                for (const u8 *s = (const u8 *)out; *s; s++)
+                    if ((*s & 0xC0u) != 0x80u)
+                        n++;
+                wr32(g_mem, edit + cp.offset, n);
+            }
+        }
+    }
+#endif
+}
+
+static float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+static float draw_text_shadow(float x, float y, float h, u32 rgba, const char *s)
+{
+    ov_text(x + 1.0f, y + 1.0f, h, OV_RGBA(15, 12, 8, 210), s);
+    return ov_text(x, y, h, rgba, s);
+}
+
+// Значки Switch поверх кнопок btnKey* вкладки Tab_OptionsGame: Bounds переводятся из заднего буфера в окно,
+// чтобы значки и текст всегда рисовались с квадратными пикселями 1:1 (и в 16:9, и в 4:3)
+static void draw_game_key_icons(float dx, float dy, float dw, float dh)
+{
+    static const ov_button potion_btns[] = {OV_DPAD, OV_X, OV_A, OV_B, OV_Y, OV_R};
+    const u32 txt_col = OV_RGBA(255, 245, 220, 255);
+    if (!g_bb_w || !g_bb_h || dw <= 0.0f || dh <= 0.0f)
+        return;
+    float sx = dw / (float)g_bb_w, sy = dh / (float)g_bb_h;
+    for (int i = 0; i < 6; i++) {
+        if (!g_game_btn_ok[i])
+            continue;
+        const game_rect *rb = &g_game_btns[i];
+        float rx0 = dx + rb->x0 * sx, ry0 = dy + rb->y0 * sy;
+        float rx1 = dx + rb->x1 * sx, ry1 = dy + rb->y1 * sy;
+        float rw = rx1 - rx0, rh = ry1 - ry0;
+        if (rw < 8.0f || rh < 8.0f)
+            continue;
+        float ih = clampf(rh * 0.72f, 14.0f, 52.0f);
+        float th = ih * 0.72f, gap = ih * 0.28f;
+        float total = 0.0f;
+        if (i == 0 || i == 1) {
+            ov_button b = i == 0 ? OV_LSTICK : OV_RSTICK;
+            const char *lbl = g_rows[i].keys[g_rus];
+            total = ov_icon_width(ih, b) + gap + ov_text_width(th, lbl);
+            if (total > rw - 8.0f && total > 1.0f) {
+                float s = (rw - 8.0f) / total;
+                ih *= s;
+                th *= s;
+                gap *= s;
+                total = ov_icon_width(ih, b) + gap + ov_text_width(th, lbl);
+            }
+            float x = rx0 + (rw - total) * 0.5f, cy = (ry0 + ry1) * 0.5f;
+            x += ov_icon(x, cy - ih * 0.5f, ih, b) + gap;
+            draw_text_shadow(x, cy - th * 0.54f, th, txt_col, lbl);
+        } else if (i == 3) {
+            float pgap = ih * 0.22f, plus_w = ov_text_width(th, "+");
+            total = ov_icon_width(ih, OV_ZL) + pgap + plus_w + pgap;
+            for (size_t k = 0; k < sizeof potion_btns / sizeof potion_btns[0]; k++)
+                total += ov_icon_width(ih, potion_btns[k]) + (k ? pgap : 0.0f);
+            if (total > rw - 8.0f && total > 1.0f) {
+                float s = (rw - 8.0f) / total;
+                ih *= s;
+                th *= s;
+                pgap *= s;
+                plus_w = ov_text_width(th, "+");
+                total = ov_icon_width(ih, OV_ZL) + pgap + plus_w + pgap;
+                for (size_t k = 0; k < sizeof potion_btns / sizeof potion_btns[0]; k++)
+                    total += ov_icon_width(ih, potion_btns[k]) + (k ? pgap : 0.0f);
+            }
+            float x = rx0 + (rw - total) * 0.5f, cy = (ry0 + ry1) * 0.5f;
+            x += ov_icon(x, cy - ih * 0.5f, ih, OV_ZL) + pgap;
+            x += draw_text_shadow(x, cy - th * 0.54f, th, txt_col, "+") + pgap;
+            for (size_t k = 0; k < sizeof potion_btns / sizeof potion_btns[0]; k++)
+                x += ov_icon(x, cy - ih * 0.5f, ih, potion_btns[k]) + pgap;
+        } else {
+            ov_button b = i == 2 ? OV_X : i == 4 ? OV_B : OV_A;
+            float iw = ov_icon_width(ih, b);
+            float x = rx0 + (rw - iw) * 0.5f, cy = (ry0 + ry1) * 0.5f;
+            ov_icon(x, cy - ih * 0.5f, ih, b);
+        }
+    }
+}
+
+// Контекстная строка подсказок Switch внизу справа окна win_w x win_h: значки и подписи без подложки, как в
+// системном интерфейсе Switch (серая полупрозрачная плашка выделялась на чёрных полосах меню, особенно на OLED);
+// читаемость поверх картинки игры — за счёт мягкой тени под текстом.
+static void draw_legend(int win_w, int win_h, int focus_kind, int has_tabs)
+{
+    typedef struct {
+        ov_button b0, b1;
+        int nbtns;
+        const char *label;
+    } hint;
+    hint hs[4];
+    int nh = 0;
+    if (has_tabs)
+        hs[nh++] = (hint){OV_L, OV_R, 2, g_rus ? "Вкладки" : "Tabs"};
+    if (focus_kind == GM_SLIDER || focus_kind == GM_COMBO)
+        hs[nh++] = (hint){OV_DPAD, OV_DPAD, 1, g_rus ? "Изменить" : "Adjust"};
+    if (focus_kind == GM_EDIT)
+        hs[nh++] = (hint){OV_A, OV_A, 1, g_rus ? "Ввод" : "Edit"};
+    else if (focus_kind != GM_SLIDER)
+        hs[nh++] = (hint){OV_A, OV_A, 1, g_rus ? "Выбрать" : "Select"};
+    hs[nh++] = (hint){OV_B, OV_B, 1, g_rus ? "Назад" : "Back"};
+
+    float ih = clampf((float)win_h * 0.032f, 16.0f, 44.0f);
+    float margin_x = (float)win_w * 0.022f, margin_y = (float)win_h * 0.022f;
+    float max_w = (float)win_w - 2.0f * margin_x;
+
+    float th = ih * 0.82f, pad_x = 0.0f, pad_y = 0.0f;
+    float gap_i = ih * 0.22f, gap_lbl = ih * 0.32f, gap_item = ih * 0.85f;
+    float content_w = 0.0f;
+    for (int i = 0; i < nh; i++) {
+        if (i)
+            content_w += gap_item;
+        content_w += ov_icon_width(ih, hs[i].b0);
+        if (hs[i].nbtns == 2)
+            content_w += gap_i + ov_icon_width(ih, hs[i].b1);
+        content_w += gap_lbl + ov_text_width(th, hs[i].label);
+    }
+    float bw = content_w + 2.0f * pad_x;
+    if (bw > max_w && bw > 1.0f) {
+        float s = max_w / bw;
+        ih *= s;
+        th *= s;
+        pad_x *= s;
+        pad_y *= s;
+        gap_i *= s;
+        gap_lbl *= s;
+        gap_item *= s;
+        content_w *= s;
+        bw = max_w;
+    }
+    float bh = ih + 2.0f * pad_y;
+    float bx = (float)win_w - margin_x - bw;
+    float by = (float)win_h - margin_y - bh;
+    float sh = th * 0.07f > 1.0f ? th * 0.07f : 1.0f;  // сдвиг тени
+
+    float x = bx + pad_x, cy = by + bh * 0.5f;
+    for (int i = 0; i < nh; i++) {
+        if (i)
+            x += gap_item;
+        x += ov_icon(x, cy - ih * 0.5f, ih, hs[i].b0);
+        if (hs[i].nbtns == 2) {
+            x += gap_i;
+            x += ov_icon(x, cy - ih * 0.5f, ih, hs[i].b1);
+        }
+        x += gap_lbl;
+        float ty = cy - th * 0.54f;
+        ov_text(x + sh, ty + sh, th, OV_RGBA(0, 0, 0, 160), hs[i].label);
+        x += ov_text(x, ty, th, OV_RGBA(245, 245, 245, 255), hs[i].label);
+    }
+}
+
+void game_menu_draw_overlay(int win_w, int win_h, float dx, float dy, float dw, float dh)
+{
+    if (!g_draw_open || win_w <= 0 || win_h <= 0)
+        return;
+    if (g_game_vis)
+        draw_game_key_icons(dx, dy, dw, dh);
+    draw_legend(win_w, win_h, g_draw_focus_kind, g_draw_has_tabs);
+}
+
 // ---------------------------------------------------------------- кадр
 void game_menu_frame(unsigned bb_w, unsigned bb_h)
 {
@@ -388,9 +684,24 @@ void game_menu_frame(unsigned bb_w, unsigned bb_h)
     if (!uo_init())
         return;
     g_frames++;
+    // При любой сборке мусора (смена карты, новая игра) UClass динамически загруженных страниц настроек
+    // (Tab_OptionsGame, Tab_OptionsVideo, Tab_InGameOptionsVideo) могут выгрузиться и перегрузиться по
+    // новым адресам — сбрасываем кеш классов целиком и проверяем живость контроллера.
+    u32 gc_ep = __atomic_load_n(&rt_gc_epoch, __ATOMIC_RELAXED);
+    if (gc_ep != g_cls_epoch) {
+        g_cls_epoch = gc_ep;
+        memset(g_cls, 0, sizeof g_cls);
+        if (g_ctrl && uo_at(rd32(g_mem, g_ctrl + 4)) != g_ctrl) {
+            g_ctrl = 0;
+            memset(&g_off, 0, sizeof g_off);
+        }
+    }
     // контроллер ищется один раз (живёт всю игру); раз в 10 с — проверка, что он всё ещё на месте
-    if (g_ctrl && g_frames % 600 == 0 && uo_at(rd32(g_mem, g_ctrl + 4)) != g_ctrl)
+    if (g_ctrl && g_frames % 600 == 0 && uo_at(rd32(g_mem, g_ctrl + 4)) != g_ctrl) {
         g_ctrl = 0;
+        memset(&g_off, 0, sizeof g_off);
+        memset(g_cls, 0, sizeof g_cls);
+    }
     if (!g_ctrl && g_frames % 120 == 1 && (g_ctrl = find_controller()))
         fprintf(stderr, "[menu] GUI controller %s at %08x\n", uo_name(g_ctrl), g_ctrl);
     u32 page = 0;
@@ -400,22 +711,32 @@ void game_menu_frame(unsigned bb_w, unsigned bb_h)
             g_off.active_page = p.offset;
         page = g_off.active_page ? rd32(g_mem, g_ctrl + g_off.active_page) : 0;
     }
-    if (page && !g_cls_game && g_cls_tries++ % 60 == 0) {
-        g_cls_game = uo_find_class("Tab_OptionsGame");
-        g_cls_video = uo_find_class("Tab_OptionsVideo");
-    }
     g_n = 0;
     g_tabs = 0;
     g_back_i = -1;
+    g_game_vis = 0;
     g_bb_w = bb_w;
     g_bb_h = bb_h;
     if (page && !g_off.ok && !init_offsets(page))
         page = 0;
-    if (page)
+    if (page) {
+        u32 pk = kind_of(page);
+        if (pk & C_OPT_PAGE) {
+            // Заранее правим скрытые вкладки GameTab/VideoTab (пока перелистывается страница или открыта другая
+            // вкладка), чтобы на первом кадре показа вкладки не мелькали «W/S/A/D», «Reset» и «640x480».
+            u32 gt = member(page, "GameTab"), vt = member(page, "VideoTab");
+            if (gt)
+                patch_game(gt, 0);
+            if (vt)
+                patch_video(vt);
+        } else if (pk & (C_OPT_GAME | C_OPT_VIDEO)) {
+            patch(page, pk);
+        }
         collect(page, 0);
+    }
     int fi = page ? focused_item(page) : -1;
 
-    int nav[9], nav_n, tab, cursor, point = 0;
+    int nav[9], nav_n, tab, cursor, req_edit, point = 0;
     float px = 0, py = 0;
     pthread_mutex_lock(&g_lock);
     nav_n = g_req_nav_n;
@@ -425,6 +746,8 @@ void game_menu_frame(unsigned bb_w, unsigned bb_h)
     g_req_tab = 0;
     cursor = g_req_cursor;
     g_req_cursor = -1;
+    req_edit = g_req_edit;
+    g_req_edit = 0;
     if (g_point_req != g_point_done) {
         point = 1;
         px = g_point_x;
@@ -452,11 +775,25 @@ void game_menu_frame(unsigned bb_w, unsigned bb_h)
             set_mouse(px, py);
             set_flag(g_ctrl, &g_off.hide_cursor, 1);
         }
+        if (fi >= 0 && g_items[fi].kind == GM_EDIT) {
+            u32 edit = g_items[fi].comp;
+            if (edit != g_last_edit || req_edit) {
+                g_last_edit = edit;
+                open_swkbd(edit);
+            }
+        } else {
+            g_last_edit = 0;
+        }
+    } else {
+        g_last_edit = 0;
     }
+    g_draw_open = page != 0;
+    g_draw_focus_kind = fi >= 0 ? g_items[fi].kind : GM_NONE;
+    g_draw_has_tabs = g_tabs != 0;
     last_page = page;
     pthread_mutex_lock(&g_lock);
     g_open = page != 0;
-    g_focus_kind = fi >= 0 ? g_items[fi].kind : GM_NONE;
+    g_focus_kind = g_draw_focus_kind;
     g_has_back = g_back_i >= 0;
     if (g_has_back)
         g_back = g_items[g_back_i].r;
@@ -469,6 +806,14 @@ void game_menu_frame(unsigned bb_w, unsigned bb_h)
 
 // ---------------------------------------------------------------- для хоста
 void game_menu_set_language(const char *lang) { g_rus = lang && !strncasecmp(lang, "rus", 3); }
+int game_menu_is_rus(void) { return g_rus; }
+
+void game_menu_edit_activate(void)
+{
+    pthread_mutex_lock(&g_lock);
+    g_req_edit = 1;
+    pthread_mutex_unlock(&g_lock);
+}
 
 int game_menu_open(int *focus_kind)
 {

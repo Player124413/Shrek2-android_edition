@@ -10,12 +10,16 @@ endif()
 set(SNX_GEN_DIR "${snx_gen_default}" CACHE PATH "Каталог с выводом recomp")
 option(SNX_TRACE "Кольцевой буфер входов в функции (отладка)" OFF)
 # Регистры гостя закреплены за x19–x27 (runtime/gen_rt.h, abi.h): глобальные регистровые переменные есть только в
-# GCC — clang Apple их не умеет, поэтому мак (и дифф-тесты) — без этого, с регистрами через CPU.
+# GCC на ARM64 — clang Apple их не умеет, поэтому мак (и дифф-тесты) — без этого, с регистрами через CPU.
 if(NINTENDO_SWITCH)
-  option(SNX_PIN "Регистры гостя в регистрах хоста (Switch, GCC)" ON)
-  if(SNX_PIN)
-    add_compile_definitions(SNX_PIN)
-  endif()
+  option(SNX_PIN "Регистры гостя в регистрах хоста (ARM64, GCC)" ON)
+elseif(UNIX AND NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$" AND CMAKE_C_COMPILER_ID STREQUAL "GNU")
+  option(SNX_PIN "Регистры гостя в регистрах хоста (ARM64, GCC)" OFF)
+endif()
+if(SNX_PIN)
+  add_compile_definitions(SNX_PIN)
+endif()
+if(NINTENDO_SWITCH)
   # Сборка по профилю GCC (AGENTS.md, «PGO»): gen — со счётчиками (snx_boot --pgo-dump S пишет *.gcda в
   # sdmc:/switch/shrek2/pgo), use — по профилю из SNX_PGO_DIR (tools/pgo_fetch.py). Имена файлов профиля — путь
   # объектника от каталога сборки, поэтому годится профиль из другого каталога (build/switch-pgo -> build/switch).
@@ -40,7 +44,11 @@ if(NINTENDO_SWITCH)
   endif()
 endif()
 set(SNX_GEN_FLAGS $<$<BOOL:${SNX_TRACE}>:-DSNX_TRACE> -Wno-unused-label -Wno-parentheses-equality -Wno-unused-variable
-    -Wno-unused-but-set-variable -Wno-unused-function -fno-strict-aliasing)
+    -Wno-unused-but-set-variable -Wno-unused-function -fno-strict-aliasing -fno-math-errno -fno-trapping-math)
+if(SNX_PIN)
+  # CPU *c закреплён в x28 (runtime/gen_rt.h): -ffixed-x28 гарантирует сохранность x28 во всех функциях гостя
+  list(APPEND SNX_GEN_FLAGS -ffixed-x28)
+endif()
 
 # snx_gen_module(<stem>) -> цель snx_gen_<stem>, если каталог существует
 function(snx_gen_module stem)

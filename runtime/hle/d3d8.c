@@ -286,5 +286,5 @@ void hle_d3d8_Direct3DCreate8(CPU *c)
     if (ARG(0) != 220)
         fprintf(stderr, "[d3d8] Direct3DCreate8: SDK version %u\n", ARG(0));
     init_vtables();
-    RET(1, com_create(g_vt_d3d8, NULL, NULL));
+    RET(1, com_create_st(g_vt_d3d8, NULL, NULL));
 }

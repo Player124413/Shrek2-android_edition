@@ -7,6 +7,7 @@
 #include <stdlib.h>
 
 #include "runtime/crt_math.h"
+#include "runtime/rt.h"
 
 #define ARG(i) (c->esp + 4 + 4 * (u32)(i)) // гостевой адрес i-го 4-байтового слова аргументов
 #define F64(i) rdf64(g_mem, ARG(i))
@@ -215,4 +216,354 @@ void ovr_crt_srand(CPU *c)
 {
     t_holdrand = U32(0);
     c->esp += 4;
+}
+
+// --- qsort -----------------------------------------------------------------------
+// msvcr70.dll!0x1300317f: cdecl void qsort(void *base, size_t num, size_t width, int (*comp)(const void *, const void *)).
+// В рендере (Engine.dll!0x121a3f90) сортируются 16-байтные записи примитивов компаратором Engine.dll!0x121a46a0
+// (5 инструкций: *(s32*)b - *(s32*)a); в оригинале каждое сравнение идёт через x86 qsort + RT_ICALL -> ~3,1 % Core 1.
+// Быстрый путь: при width == 16 и совпадении 13 байт компаратора сортируем нативно без вызовов гостя (introsort).
+// Общий путь: нативный introsort с однократным поиском функции компаратора (rt_lookup_k) и вызовом через rt_invoke.
+// SNX_QSORT_CHECK=1: сверка порядка ключей / отсортированности с оригиналом msvcr70!qsort.
+extern void (*const ovr_orig_ovr_crt_qsort)(CPU *c);
+
+static inline int qsort_check(void)
+{
+    static int v = -1;
+    if (v < 0)
+        v = getenv("SNX_QSORT_CHECK") != NULL;
+    return v;
+}
+
+// Engine.dll!0x121a46a0 (en и rus): mov eax,[esp+8]; mov ecx,[esp+4]; mov eax,[eax]; sub eax,[ecx]; ret
+static const u8 k_cmp_desc_i32[13] = {0x8B, 0x44, 0x24, 0x08, 0x8B, 0x4C, 0x24, 0x04, 0x8B, 0x00, 0x2B, 0x01, 0xC3};
+
+typedef struct {
+    u32 w[4];
+} qelem16;
+
+static inline int q16_less(u32 ka, u32 kb)
+{
+    // Знак (s32)(kb - ka) < 0: соответствует sub eax,[ecx] компаратора (убывание ключа)
+    return (s32)(kb - ka) < 0;
+}
+
+static inline qelem16 q16_ld(const u8 *p)
+{
+    qelem16 e;
+    memcpy(&e, p, sizeof e);
+    return e;
+}
+
+static inline void q16_st(u8 *p, qelem16 e) { memcpy(p, &e, sizeof e); }
+
+static inline void q16_swap(u8 *a, u8 *b)
+{
+    qelem16 t = q16_ld(a);
+    q16_st(a, q16_ld(b));
+    q16_st(b, t);
+}
+
+static void q16_ins(u8 *arr, u32 lo, u32 hi)
+{
+    for (u32 i = lo + 1u; i < hi; i++) {
+        qelem16 cur = q16_ld(arr + i * 16u);
+        u32 j = i;
+        while (j > lo) {
+            qelem16 prev = q16_ld(arr + (j - 1u) * 16u);
+            if (!q16_less(cur.w[0], prev.w[0]))
+                break;
+            q16_st(arr + j * 16u, prev);
+            j--;
+        }
+        q16_st(arr + j * 16u, cur);
+    }
+}
+
+static void q16_sift(u8 *arr, u32 base, u32 n, u32 root)
+{
+    for (;;) {
+        u32 child = root * 2u + 1u;
+        if (child >= n)
+            break;
+        u32 rkey = rd32(arr, (base + root) * 16u);
+        u32 ckey = rd32(arr, (base + child) * 16u);
+        u32 best = root, bkey = rkey;
+        if (q16_less(bkey, ckey)) {
+            best = child;
+            bkey = ckey;
+        }
+        if (child + 1u < n) {
+            u32 r2key = rd32(arr, (base + child + 1u) * 16u);
+            if (q16_less(bkey, r2key))
+                best = child + 1u;
+        }
+        if (best == root)
+            break;
+        q16_swap(arr + (base + root) * 16u, arr + (base + best) * 16u);
+        root = best;
+    }
+}
+
+static void q16_heapsort(u8 *arr, u32 lo, u32 hi)
+{
+    u32 n = hi - lo;
+    if (n < 2u)
+        return;
+    for (u32 i = n / 2u; i-- > 0;)
+        q16_sift(arr, lo, n, i);
+    for (u32 end = n - 1u; end > 0; end--) {
+        q16_swap(arr + lo * 16u, arr + (lo + end) * 16u);
+        q16_sift(arr, lo, end, 0u);
+    }
+}
+
+static void q16_sort(u8 *arr, u32 lo, u32 hi, u32 depth)
+{
+    while (hi - lo > 16u) {
+        if (depth == 0) {
+            q16_heapsort(arr, lo, hi);
+            return;
+        }
+        depth--;
+        // Медиана из трёх: arr[lo], arr[mid], arr[hi - 1]
+        u32 mid = lo + ((hi - lo) >> 1);
+        u32 last = hi - 1u;
+        if (q16_less(rd32(arr, mid * 16u), rd32(arr, lo * 16u)))
+            q16_swap(arr + lo * 16u, arr + mid * 16u);
+        if (q16_less(rd32(arr, last * 16u), rd32(arr, mid * 16u))) {
+            q16_swap(arr + mid * 16u, arr + last * 16u);
+            if (q16_less(rd32(arr, mid * 16u), rd32(arr, lo * 16u)))
+                q16_swap(arr + lo * 16u, arr + mid * 16u);
+        }
+        // Опорный элемент кладём в last - 1: arr[lo] <= pivot <= arr[last] — оба конца служат стражами
+        u32 piv = last - 1u;
+        q16_swap(arr + mid * 16u, arr + piv * 16u);
+        u32 pivot = rd32(arr, piv * 16u);
+        u32 i = lo, j = piv;
+        for (;;) {
+            while (++i < piv && q16_less(rd32(arr, i * 16u), pivot))
+                ;
+            while (j > lo && q16_less(pivot, rd32(arr, --j * 16u)))
+                ;
+            if (i >= j)
+                break;
+            q16_swap(arr + i * 16u, arr + j * 16u);
+        }
+        q16_swap(arr + i * 16u, arr + piv * 16u);
+        if (i - lo < hi - (i + 1u)) {
+            q16_sort(arr, lo, i, depth);
+            lo = i + 1u;
+        } else {
+            q16_sort(arr, i + 1u, hi, depth);
+            hi = i;
+        }
+    }
+    q16_ins(arr, lo, hi);
+}
+
+typedef struct {
+    CPU *c;
+    u32 base, width, comp;
+    guest_fn fn;
+    int native;
+} qgen_ctx;
+
+static int qgen_cmp(const qgen_ctx *q, u32 ia, u32 ib)
+{
+    CPU *c = q->c;
+    u32 sp = c->esp;
+    c->esp = sp - 12u;
+    wr32(g_mem, c->esp, 0u);  // фиктивный адрес возврата: ret снимает 4 байта
+    wr32(g_mem, c->esp + 4u, q->base + ia * q->width);
+    wr32(g_mem, c->esp + 8u, q->base + ib * q->width);
+    if (q->fn)
+        rt_invoke(c, q->fn, q->native);
+    else
+        rt_call(c, q->comp);
+    c->esp = sp;
+    return (s32)c->eax;
+}
+
+static void qgen_swap(const qgen_ctx *q, u32 ia, u32 ib)
+{
+    if (ia == ib)
+        return;
+    u8 *a = g_mem + q->base + ia * q->width;
+    u8 *b = g_mem + q->base + ib * q->width;
+    u32 rem = q->width;
+    u8 tmp[256];
+    while (rem > 0) {
+        u32 chunk = rem < sizeof tmp ? rem : (u32)sizeof tmp;
+        memcpy(tmp, a, chunk);
+        memcpy(a, b, chunk);
+        memcpy(b, tmp, chunk);
+        a += chunk;
+        b += chunk;
+        rem -= chunk;
+    }
+}
+
+static void qgen_ins(const qgen_ctx *q, u32 lo, u32 hi)
+{
+    for (u32 i = lo + 1u; i < hi; i++)
+        for (u32 j = i; j > lo && qgen_cmp(q, j, j - 1u) < 0; j--)
+            qgen_swap(q, j, j - 1u);
+}
+
+static void qgen_sift(const qgen_ctx *q, u32 base, u32 n, u32 root)
+{
+    for (;;) {
+        u32 child = root * 2u + 1u;
+        if (child >= n)
+            break;
+        u32 best = root;
+        if (qgen_cmp(q, base + best, base + child) < 0)
+            best = child;
+        if (child + 1u < n && qgen_cmp(q, base + best, base + child + 1u) < 0)
+            best = child + 1u;
+        if (best == root)
+            break;
+        qgen_swap(q, base + root, base + best);
+        root = best;
+    }
+}
+
+static void qgen_heapsort(const qgen_ctx *q, u32 lo, u32 hi)
+{
+    u32 n = hi - lo;
+    if (n < 2u)
+        return;
+    for (u32 i = n / 2u; i-- > 0;)
+        qgen_sift(q, lo, n, i);
+    for (u32 end = n - 1u; end > 0; end--) {
+        qgen_swap(q, lo, lo + end);
+        qgen_sift(q, lo, end, 0u);
+    }
+}
+
+static void qgen_sort(const qgen_ctx *q, u32 lo, u32 hi, u32 depth)
+{
+    while (hi - lo > 8u) {
+        if (depth == 0) {
+            qgen_heapsort(q, lo, hi);
+            return;
+        }
+        depth--;
+        u32 mid = lo + ((hi - lo) >> 1);
+        u32 last = hi - 1u;
+        if (qgen_cmp(q, mid, lo) < 0)
+            qgen_swap(q, lo, mid);
+        if (qgen_cmp(q, last, mid) < 0) {
+            qgen_swap(q, mid, last);
+            if (qgen_cmp(q, mid, lo) < 0)
+                qgen_swap(q, lo, mid);
+        }
+        // Опорный элемент кладём в last - 1, чтобы его индекс не менялся во время разбиения
+        u32 piv = last - 1u;
+        qgen_swap(q, mid, piv);
+        u32 i = lo, j = piv;
+        for (;;) {
+            while (++i < piv && qgen_cmp(q, i, piv) < 0)
+                ;
+            while (j > lo && qgen_cmp(q, piv, --j) < 0)
+                ;
+            if (i >= j)
+                break;
+            qgen_swap(q, i, j);
+        }
+        qgen_swap(q, i, piv);
+        if (i - lo < hi - (i + 1u)) {
+            qgen_sort(q, lo, i, depth);
+            lo = i + 1u;
+        } else {
+            qgen_sort(q, i + 1u, hi, depth);
+            hi = i;
+        }
+    }
+    qgen_ins(q, lo, hi);
+}
+
+static u32 qsort_depth(u32 n)
+{
+    u32 d = 0;
+    for (u32 x = n; x > 1u; x >>= 1)
+        d += 2u;
+    return d;
+}
+
+void ovr_crt_qsort(CPU *c)
+{
+    u32 base = U32(0), num = U32(1), width = U32(2), comp = U32(3);
+    if (num < 2u || width == 0u) {
+        c->esp += 4u;
+        return;
+    }
+    u64 bytes = (u64)num * (u64)width;
+    if (base >= RT_WINDOW || bytes > (u64)RT_WINDOW - base) {
+        if (ovr_orig_ovr_crt_qsort) {
+            RT_ENTER_GEN(c, ovr_orig_ovr_crt_qsort);
+            return;
+        }
+        c->esp += 4u;
+        return;
+    }
+    int native = 0;
+    guest_fn fn = rt_lookup_k(comp, &native);
+    int fast16 = fn && !native && width == 16u && comp <= RT_WINDOW - sizeof k_cmp_desc_i32 &&
+                 memcmp(g_mem + comp, k_cmp_desc_i32, sizeof k_cmp_desc_i32) == 0;
+    int chk = qsort_check() && ovr_orig_ovr_crt_qsort != NULL;
+    u8 *saved = NULL, *ours = NULL;
+    if (chk) {
+        saved = malloc((size_t)bytes);
+        ours = malloc((size_t)bytes);
+        if (saved && ours)
+            memcpy(saved, g_mem + base, (size_t)bytes);
+        else
+            chk = 0;
+    }
+    u32 ebx = c->ebx, esi = c->esi, edi = c->edi, ebp = c->ebp, sp = c->esp;
+    if (fast16) {
+        q16_sort(g_mem + base, 0u, num, qsort_depth(num));
+    } else {
+        qgen_ctx q = {c, base, width, comp, fn, native};
+        qgen_sort(&q, 0u, num, qsort_depth(num));
+    }
+    c->ebx = ebx;
+    c->esi = esi;
+    c->edi = edi;
+    c->ebp = ebp;
+    c->esp = sp;
+    if (chk) {
+        memcpy(ours, g_mem + base, (size_t)bytes);
+        memcpy(g_mem + base, saved, (size_t)bytes);
+        RT_ENTER_GEN(c, ovr_orig_ovr_crt_qsort);
+        if (fast16) {
+            for (u32 i = 0; i < num; i++) {
+                u32 ka = rd32(ours, i * 16u), kb = rd32(g_mem, base + i * 16u);
+                if (ka != kb) {
+                    fprintf(stderr, "[crt] SNX_QSORT_CHECK: fast16 key[%u] %08x != orig %08x (n=%u)\n", i, ka, kb, num);
+                    break;
+                }
+            }
+        } else {
+            // Проверим упорядоченность нашего результата компаратором гостя (qsort нестабилен при равных ключах)
+            memcpy(g_mem + base, ours, (size_t)bytes);
+            u32 sp2 = c->esp;
+            c->esp = sp;
+            qgen_ctx q = {c, base, width, comp, fn, native};
+            for (u32 i = 0; i + 1u < num; i++)
+                if (qgen_cmp(&q, i, i + 1u) > 0) {
+                    fprintf(stderr, "[crt] SNX_QSORT_CHECK: unsorted at %u (n=%u, w=%u)\n", i, num, width);
+                    break;
+                }
+            c->esp = sp2;
+        }
+        free(saved);
+        free(ours);
+        return;
+    }
+    free(saved);
+    free(ours);
+    c->esp += 4u;  // cdecl: аргументы снимает вызывающий
 }

@@ -7,3 +7,7 @@ void input_event(const void *sdl_event);
 void input_init(const char *user_dir);
 // главный поток, каждый проход цикла: стики геймпада -> клавиши и мышь
 void input_tick(void);
+// Вибрация геймпада (SDL_GameControllerRumble; безопасно из любого потока, учитывает Rumble в Snx.ini)
+void input_rumble(unsigned short low_freq, unsigned short high_freq, unsigned int duration_ms);
+int input_rumble_enabled(void);
+void input_set_rumble_enabled(int on);

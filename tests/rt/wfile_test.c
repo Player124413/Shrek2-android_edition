@@ -333,6 +333,181 @@ int main(int argc, char **argv)
         if (round && !(cm && !atoi(cm)) && g_hitch.reads != reads0 && fails++ < 10)  // образ готов — с диска ничего
             printf("package round %d: %llu disk reads with a ready image\n", round, g_hitch.reads - reads0);
     }
+    // регрессия ошибки отложенного открытия: wb_flush провалился -> WriteFile должен вернуть 0 без записи за пределы wbuf
+    {
+        char fpath[1100];
+        snprintf(fpath, sizeof fpath, "%s/System/FailLazy.sav", argv[1]);
+        FILE *fp = fopen(fpath, "wb");
+        if (fp) {
+            fputs("seed", fp);
+            fclose(fp);
+        }
+        vfs_changed();
+        strcpy((char *)g_mem + NAME, "C:\\Shrek2\\System\\FailLazy.sav");
+        u32 aw[7] = {NAME, 0x40000000u /* GENERIC_WRITE */, 0, 0, 2 /* CREATE_ALWAYS */, 0x80, 0};
+        u32 h = call(hle_kernel32_CreateFileA, 7, aw);
+        if (h == 0xFFFFFFFFu) {
+            printf("fail-lazy: deferred open handle failed\n");
+            fails++;
+        } else {
+            // пишем со смещением > 0 в wbuf (lazy == 1), затем подменяем файл каталогом — f_open провалится
+            seek(h, 4096);
+            u32 w1[5] = {h, IO, 1024, OUT, 0};
+            if (!call(hle_kernel32_WriteFile, 5, w1) || rd32(g_mem, OUT) != 1024)
+                printf("fail-lazy: initial buffered write failed\n"), fails++;
+            unlink(fpath);
+            mkdir(fpath, 0755);
+            // возврат назад (pos < wpos): раньше wb_flush возвращал 0, не сбрасывал wlen, а at уходил в переполнение
+            seek(h, 0);
+            wr32(g_mem, OUT, 0xCAFEu);
+            u32 w2[5] = {h, IO, 32, OUT, 0};
+            if (call(hle_kernel32_WriteFile, 5, w2) != 0 || rd32(g_mem, OUT) != 0)
+                printf("fail-lazy: write after seek-back must fail cleanly (out=%u)\n", rd32(g_mem, OUT)), fails++;
+            // повторная запись в сломанный дескриптор (> WBUF и < WBUF) также должна вернуть 0
+            u32 w3[5] = {h, IO, (5u << 20), OUT, 0};
+            if (call(hle_kernel32_WriteFile, 5, w3) != 0 || rd32(g_mem, OUT) != 0)
+                printf("fail-lazy: large write after failed open must fail\n"), fails++;
+            u32 ac[1] = {h};
+            call(hle_kernel32_CloseHandle, 1, ac);
+            hle_file_flush_all();
+            rmdir(fpath);
+            vfs_changed();
+            ops += 3;
+        }
+        // второй сценарий: провал wb_flush при записи > WBUF в отложенный файл
+        snprintf(fpath, sizeof fpath, "%s/System/FailLazy2.sav", argv[1]);
+        fp = fopen(fpath, "wb");
+        if (fp) {
+            fputs("seed2", fp);
+            fclose(fp);
+        }
+        vfs_changed();
+        strcpy((char *)g_mem + NAME, "C:\\Shrek2\\System\\FailLazy2.sav");
+        h = call(hle_kernel32_CreateFileA, 7, aw);
+        if (h != 0xFFFFFFFFu) {
+            u32 w1[5] = {h, IO, 512, OUT, 0};
+            call(hle_kernel32_WriteFile, 5, w1);
+            unlink(fpath);
+            mkdir(fpath, 0755);
+            u32 wbig[5] = {h, IO, (5u << 20), OUT, 0};
+            if (call(hle_kernel32_WriteFile, 5, wbig) != 0 || rd32(g_mem, OUT) != 0)
+                printf("fail-lazy2: >WBUF write after failed open must fail\n"), fails++;
+            u32 ac[1] = {h};
+            call(hle_kernel32_CloseHandle, 1, ac);
+            hle_file_flush_all();
+            rmdir(fpath);
+            vfs_changed();
+            ops += 2;
+        }
+        // валидный сценарий: запись с позиции >= 4 МБ, затем возврат назад (pos < wpos) и запись > WBUF
+        strcpy((char *)g_mem + NAME, "C:\\Shrek2\\System\\Save.tmp");
+        h = open_file(2 /* CREATE_ALWAYS */);
+        if (h != 0xFFFFFFFFu) {
+            model_len = 0;
+            memset(model, 0, 5u << 20);
+            write_at(h, 5u << 20, 4096);
+            write_at(h, 0, 64);
+            write_at(h, 1024, (5u << 20) + 123);
+            check_size(h);
+            check_read(h, 0, model_len, "seekback+large");
+            u32 ac[1] = {h};
+            call(hle_kernel32_CloseHandle, 1, ac);
+            hle_file_flush_all();
+            ops += 5;
+        }
+    }
+    // кеширование read-only файла локализации (.int) в оверлее + инвалидация при записи и удалении
+    {
+        char ovp[1100];
+        snprintf(ovp, sizeof ovp, "%s/System/TestDialog.int", argv[1]);
+        u32 len1 = 300u << 10;
+        for (u32 i = 0; i < len1; i++)
+            model[i] = (u8)rnd(256);
+        model_len = len1;
+        FILE *fp = fopen(ovp, "wb");
+        if (fp) {
+            fwrite(model, 1, len1, fp);
+            fclose(fp);
+        }
+        vfs_changed();
+        strcpy((char *)g_mem + NAME, "C:\\Shrek2\\System\\TestDialog.int");
+        const char *cm = getenv("SNX_FILE_CACHE_MB");
+        int cache_on = !(cm && !atoi(cm));
+        // 1) первый проход открывает read-only и запускает фоновую подкачку fimage
+        u32 ar[7] = {NAME, 0x80000000u /* GENERIC_READ */, 1, 0, 3 /* OPEN_EXISTING */, 0x80, 0};
+        u32 h = call(hle_kernel32_CreateFileA, 7, ar);
+        if (h == 0xFFFFFFFFu) {
+            printf("overlay .int: initial open failed\n");
+            fails++;
+        } else {
+            check_size(h);
+            check_read(h, 0, len1, "overlay .int first");
+            u32 ac[1] = {h};
+            call(hle_kernel32_CloseHandle, 1, ac);
+            usleep(600000);  // затишье: fimg_worker дочитывает 300 КБ в RAM
+            unsigned long long reads0 = g_hitch.reads;
+            h = call(hle_kernel32_CreateFileA, 7, ar);
+            if (h == 0xFFFFFFFFu) {
+                printf("overlay .int: cached open failed\n");
+                fails++;
+            } else {
+                check_size(h);
+                check_read(h, 0, len1, "overlay .int cached");
+                check_read(h, 4096, 8192, "overlay .int cached mid");
+                u32 ac2[1] = {h};
+                call(hle_kernel32_CloseHandle, 1, ac2);
+                if (cache_on && g_hitch.reads != reads0 && fails++ < 10)
+                    printf("overlay .int: %llu disk reads with a ready image\n", g_hitch.reads - reads0);
+            }
+            // 2) перезапись через отложенный путь (GENERIC_WRITE + CREATE_ALWAYS) обязана инвалидировать fimage
+            u32 aw[7] = {NAME, 0x40000000u /* GENERIC_WRITE */, 0, 0, 2 /* CREATE_ALWAYS */, 0x80, 0};
+            u32 hw = call(hle_kernel32_CreateFileA, 7, aw);
+            if (hw == 0xFFFFFFFFu) {
+                printf("overlay .int: rewrite open failed\n");
+                fails++;
+            } else {
+                model_len = 0;
+                write_at(hw, 0, 4096);
+                write_at(hw, 4096, 12345);
+                u32 acw[1] = {hw};
+                call(hle_kernel32_CloseHandle, 1, acw);
+                u32 hr = call(hle_kernel32_CreateFileA, 7, ar);
+                if (hr == 0xFFFFFFFFu) {
+                    printf("overlay .int: reopen after rewrite failed\n");
+                    fails++;
+                } else {
+                    check_size(hr);
+                    check_read(hr, 0, model_len, "overlay .int after rewrite");
+                    u32 acr[1] = {hr};
+                    call(hle_kernel32_CloseHandle, 1, acr);
+                }
+            }
+            // 3) перезапись через GENERIC_READ|WRITE и последующее удаление + новое содержимое
+            u32 hrw = open_file(2 /* CREATE_ALWAYS */);
+            if (hrw != 0xFFFFFFFFu) {
+                model_len = 0;
+                write_at(hrw, 0, 7777);
+                u32 acrw[1] = {hrw};
+                call(hle_kernel32_CloseHandle, 1, acrw);
+                hle_file_flush_all();
+                u32 hr2 = call(hle_kernel32_CreateFileA, 7, ar);
+                if (hr2 != 0xFFFFFFFFu) {
+                    check_size(hr2);
+                    check_read(hr2, 0, model_len, "overlay .int after rw");
+                    u32 acr2[1] = {hr2};
+                    call(hle_kernel32_CloseHandle, 1, acr2);
+                } else
+                    fails++;
+            } else
+                fails++;
+            u32 ad[1] = {NAME};
+            if (!call(hle_kernel32_DeleteFileA, 1, ad) && fails++ < 10)
+                printf("overlay .int: delete failed\n");
+            if (call(hle_kernel32_CreateFileA, 7, ar) != 0xFFFFFFFFu && fails++ < 10)
+                printf("overlay .int: still openable after delete\n");
+            ops += 8;
+        }
+    }
     // тип записи — из листинга каталога (vfs.c, без stat): каталог открыть нельзя (open(O_RDONLY) каталога на
     // POSIX прошёл бы), имя без учёта регистра. GetLastError без потока гостя не хранится.
     strcpy((char *)g_mem + NAME, "C:\\Shrek2\\textures");

@@ -1,6 +1,6 @@
 # Сборка и запуск
 
-Все команды выполняются из корня репозитория. Проверенная платформа разработки — macOS arm64. Linux и Windows как хосты пока не поддерживаются CMake-конфигурацией.
+Все команды выполняются из корня репозитория. Проверенная платформа разработки — macOS arm64. Поддержка сборки на Linux добавлена в CMake (`PkgConfig`, OpenGL 4.1 core, `SNX_PIN` доступен на Linux ARM64 GCC; сборка и запуск на реальном Linux — `[проверить]`). Windows как хост пока не поддерживается.
 
 ## Зависимости macOS
 
@@ -15,17 +15,44 @@ python3 -m venv tools/.venv
 tools/.venv/bin/python -m pip install -r tools/requirements.txt
 ```
 
-CMake ищет библиотеки в стандартном каталоге Homebrew для Apple Silicon: `/opt/homebrew`. Большие загрузки Homebrew могут занять время. Python-зависимости устанавливаются через pip в `tools/.venv`.
+CMake ищет библиотеки в `$HOMEBREW_PREFIX`, `/opt/homebrew`, `/usr/local` и через `PkgConfig` (при наличии). Большие загрузки Homebrew могут занять время. Python-зависимости устанавливаются через pip в `tools/.venv`.
+
+## Зависимости Linux (`[проверить]`)
+
+На Ubuntu/Debian требуются компилятор C/C++, CMake, Ninja, `pkg-config`, Python 3.11+ и dev-пакеты библиотек:
+
+```sh
+sudo apt install build-essential cmake ninja-build pkg-config \
+    libsdl2-dev libgl-dev libopenal-dev libvorbis-dev libogg-dev \
+    libavcodec-dev libavutil-dev libfreetype-dev
+```
+
+Сборка без игры (на Linux ARM64 с GCC можно дополнительно включить `-DSNX_PIN=ON`):
+
+```sh
+cmake -S . -B build/linux -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build/linux
+ctest --test-dir build/linux --output-on-failure
+```
 
 ## Проверка без игры
 
 ```sh
 tools/build.sh mac
 ctest --test-dir build/mac --output-on-failure
+tools/.venv/bin/python -I tests/test_recomp.py
 build/mac/host/hello/snx_hello --frames 60
 ```
 
-CTest проверяет операции памяти x86, преобразования x87 в целые, `rand/srand` и файловый слой с включённым и выключенным кешем пакетов. Данные этих тестов синтетические. GL-пример открывает окно и проверяет DXT1; он требует графического сеанса и запускается отдельно от CI.
+CTest запускает 10 синтетических тестов рантайма и HLE: `rep_test`, `fist_test`, `crand_test`, `vmem_test`, `heap_test`, `d3d8_ps_test`, `wfile_test`, `wfile_no_cache_test`, `bink_test`, `config_test`. `tests/test_recomp.py` проверяет модули рекомпилятора без файлов игры. GL-пример открывает окно и проверяет DXT1; он требует графического сеанса и запускается отдельно от CI.
+
+Сборка и прогон CTest под санитайзерами (ASan + UBSan):
+
+```sh
+cmake -S . -B build/mac-san -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo "-DSNX_SANITIZE=address;undefined"
+cmake --build build/mac-san --target rep_test fist_test crand_test wfile_test vmem_test heap_test d3d8_ps_test bink_test config_test
+ctest --test-dir build/mac-san --output-on-failure
+```
 
 Цели `snx_boot` и `difftest_*` появляются только после генерации соответствующих модулей. Если в CMake уже настроен другой каталог сборки, он не подхватывается автоматически: `tools/build.sh mac` использует `build/mac`.
 
@@ -52,6 +79,14 @@ game/
 
 ## Перевод модулей и запуск на macOS
 
+Перед генерацией можно проверить совместимость каталога игры (наличие 12 модулей, отсутствие защиты SafeDisc, совпадение всех 56 сигнатур/экспортов `overrides.py` и каталогов ассетов):
+
+```sh
+tools/.venv/bin/python -I recomp/main.py check --game game/System
+```
+
+Перевод и запуск (генерация по умолчанию параллельна на всех ядрах; `-j N` / `--jobs N` задаёт число процессов, `--jobs 1` — последовательно):
+
 ```sh
 tools/.venv/bin/python -I recomp/main.py gen --game game/System --out build/gen
 tools/build.sh mac snx_boot
@@ -66,13 +101,14 @@ build/mac/host/boot/snx_boot --game game --user build/userdata
 build/mac/host/boot/snx_boot --game game --user build/userdata-check --dlls-only
 ```
 
-Короткий запуск первого уровня:
+Короткий запуск первого уровня или пакетный прогон карт (`tools/test_maps.py`):
 
 ```sh
 build/mac/host/boot/snx_boot --game game --user build/userdata-check --seconds 90 -- 1_Shreks_Swamp.unr
+tools/.venv/bin/python -I tools/test_maps.py --boot build/mac/host/boot/snx_boot --game game --user build/test-maps --seconds 20
 ```
 
-Первый запуск создаёт настройки из файлов игры. Игра видит виртуальный `C:\Shrek2`, а записи попадают в `build/userdata` (или путь из `--user`). Оригиналы не меняются. `--headless` отключает SDL, но сам по себе не выбирает NullRenderDevice: отдельный конфиг описан в [AGENTS.md](../AGENTS.md), раздел «Сборка, проверки, отладка».
+Первый запуск создаёт настройки из файлов игры. Игра видит виртуальный `C:\Shrek2`, а записи попадают в `build/userdata` (или путь из `--user`). Оригиналы не меняются. `--headless` отключает SDL, но сам по себе не выбирает NullRenderDevice: используйте `tools/test_maps.py --headless` или отдельный конфиг из [AGENTS.md](../AGENTS.md). Разбор лога падения Switch — `tools/probe/crash.py`.
 
 ## Nintendo Switch
 

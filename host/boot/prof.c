@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "platform/platform.h"
 #include "runtime/hle/gl_cs.h"
 #include "runtime/hle/hle.h"
 #include "runtime/process.h"
@@ -37,6 +38,11 @@ static void write_file(uintptr_t base, uintptr_t slide)
         fprintf(stderr, "[prof] cannot write %s\n", g_prof_path);
         return;
     }
+    // На Switch стандартный буфер newlib (BUFSIZ = 1 КБ) порождает ~15 000 IPC fsFileWrite
+    // на 15 МБ дамп; 256 КБ сокращает число записей до ~60 и убирает фризы SD
+    char *vbuf = malloc(256u << 10);
+    if (vbuf)
+        setvbuf(f, vbuf, _IOFBF, 256u << 10);
     fprintf(f, "base %lx slide %lx\n", (unsigned long)base, (unsigned long)slide);
     int m = 0;
     for (int i = 0; i < g_prof_n; i++) {
@@ -48,6 +54,7 @@ static void write_file(uintptr_t base, uintptr_t slide)
         fputc('\n', f);
     }
     fclose(f);
+    free(vbuf);
     fprintf(stderr, "[prof] %d samples -> %s\n", g_prof_n, g_prof_path);
 }
 
@@ -278,6 +285,9 @@ static void sampler(void *arg)
         if (sample(&g_targets[0]) || sample(&g_targets[1]))
             break;
     }
+    // Перед сбросом профиля на диск понизить приоритет потока sampler (на Switch 0x20 -> 0x34),
+    // чтобы запись 15 МБ не вытесняла игру/фоновые потоки на ядре 0 и не душила fs sysmodule
+    rt_platform_thread_background();
     prof_dump();
 }
 

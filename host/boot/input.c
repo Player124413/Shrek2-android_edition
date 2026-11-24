@@ -4,19 +4,29 @@
 // раскладку <user>/System/Snx.ini, g_snx_default).
 #include <SDL.h>
 #include <ctype.h>
+#include <errno.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <unistd.h>
+#ifdef __SWITCH__
+#include <switch.h>
+#endif
 
+#include "host/boot/config.h"
 #include "host/boot/input.h"
 #include "host/boot/touch.h"
 #include "runtime/hle/d3d8.h"
 #include "runtime/hle/dinput8.h"
+#include "runtime/hle/overlay.h"
 #include "runtime/hle/user32.h"
 #include "runtime/game/menu.h"
+#include "runtime/rt.h"
+
+extern void (*hle_rumble_hook)(u16 low, u16 high, u32 ms);  // runtime/hle/misc.c
 
 enum {
     WM_CLOSE = 0x10, WM_KEYDOWN = 0x100, WM_KEYUP = 0x101, WM_CHAR = 0x102, WM_SYSKEYDOWN = 0x104,
@@ -158,7 +168,8 @@ static struct {
 } g_pads[MAX_PADS] = {[0 ... MAX_PADS - 1] = {.id = -1}};
 enum { PB_ZL = SDL_CONTROLLER_BUTTON_MAX, PB_ZR, PB_N };  // курки — тоже кнопки
 enum {  // цели, кроме клавиш
-    T_LMB = 0x1000, T_RMB, T_MMB, T_WHEEL_UP, T_WHEEL_DOWN, T_FPS, T_JOY, T_NAV, T_SELECT, T_BACK, T_TAB_PREV, T_TAB_NEXT
+    T_LMB = 0x1000, T_RMB, T_MMB, T_WHEEL_UP, T_WHEEL_DOWN, T_FPS, T_JOY, T_NAV, T_SELECT, T_BACK, T_TAB_PREV,
+    T_TAB_NEXT, T_QUICKMENU
 };
 static const char *const g_pb_name[PB_N] = {
     [SDL_CONTROLLER_BUTTON_A] = "A", [SDL_CONTROLLER_BUTTON_B] = "B", [SDL_CONTROLLER_BUTTON_X] = "X",
@@ -187,16 +198,18 @@ static const struct {
     {"Right", 0x27}, {"Down", 0x28}, {"Insert", 0x2D}, {"Delete", 0x2E}, {"Semicolon", 0xBA}, {"Equals", 0xBB},
     {"Comma", 0xBC}, {"Minus", 0xBD}, {"Period", 0xBE}, {"Slash", 0xBF}, {"Tilde", 0xC0}, {"LeftBracket", 0xDB},
     {"Backslash", 0xDC}, {"RightBracket", 0xDD}, {"SingleQuote", 0xDE}, {"ToggleFPS", T_FPS},
+    {"QuickMenu", T_QUICKMENU},
 };
 
 #define SNX_INI_VERSION 3
 static const char g_snx_default[] =
-    "; Настройки порта shrekNX. Правятся здесь, действуют со следующего запуска.\n"
+    "; Настройки порта shrekNX. Меняются здесь или прямо в игре через Quick Menu (ZL+Plus).\n"
     "[Port]\n"
     "Version=3          ; формат файла (файл старого формата переименовывается в Snx.ini.old)\n"
     "\n"
     "[Overlay]\n"
-    "ShowFPS=False      ; счётчик кадров в углу (переключается и на ходу: ZL+Minus)\n"
+    "ShowFPS=False       ; счётчик кадров в углу (переключается и на ходу: ZL+Minus)\n"
+    "MenuAspect4x3=False ; страницы меню в 4:3 на широком экране (переключается в Quick Menu)\n"
     "\n"
     "; Геймпад. В игре он виден ей как джойстик: кнопки A B X Y L R ZL ZR Minus Plus LStick RStick - Joy1..Joy12,\n"
     "; крестовина - Joy13..Joy16 (вверх, вправо, вниз, влево), левый стик - JoyX/JoyY, правый - JoyU/JoyV.\n"
@@ -205,7 +218,7 @@ static const char g_snx_default[] =
     "; Кнопки: A B X Y L R ZL ZR Plus Minus LStick RStick DPadUp DPadDown DPadLeft DPadRight.\n"
     "; Клавиши - имена из User.ini игры: A..Z 0..9 F1..F12 NumPad0..NumPad9 Enter Escape Space Tab Up Down Left\n"
     ";   Right Home End PageUp PageDown LeftBracket RightBracket ... и LeftMouse RightMouse MiddleMouse\n"
-    ";   MouseWheelUp MouseWheelDown, ToggleFPS.\n"
+    ";   MouseWheelUp MouseWheelDown, ToggleFPS, QuickMenu.\n"
     "; В меню игры: стики - курсор, крестовина - к соседней кнопке меню, A - выбрать, B и Plus - назад.\n"
     "[Pad]\n"
     "Layer=ZL           ; кнопка второго слоя (None - без слоя)\n"
@@ -217,6 +230,7 @@ static const char g_snx_default[] =
     "CameraSpeed=72     ; поворот камеры правым стиком (умножается ещё на скорость мыши из меню игры)\n"
     "InvertCameraY=False\n"
     "DeadZone=0.15      ; мёртвая зона стиков (доля хода)\n"
+    "Rumble=True        ; вибрация геймпада\n"
     "; зелья 1-9 (как цифры на клавиатуре): с ZL крестовина по часовой стрелке от верха - 1..4,\n"
     "; кнопки по часовой стрелке от X - 5..8, R - 9\n"
     "ZL+DPadUp=1\n"
@@ -228,8 +242,10 @@ static const char g_snx_default[] =
     "ZL+B=7\n"
     "ZL+Y=8\n"
     "ZL+R=9\n"
-    "ZL+Minus=ToggleFPS\n";
+    "ZL+Minus=ToggleFPS\n"
+    "ZL+Plus=QuickMenu\n";
 
+static char g_snx_path[1100];
 static u32 g_map[2][PB_N];  // [слой][кнопка] -> виртуальная клавиша или T_*; 0 — джойстик (в слое — ничего)
 static u32 g_held[PB_N];    // что нажала кнопка: отпускается то же, даже если сменились слой или режим
 static int g_layer_btn = -1, g_layer, g_menu;
@@ -242,6 +258,153 @@ static int g_invert_y;
 // CameraSpeed 72 ≈ 1200 отсчётов/с при полном наклоне; ещё × «Чувствительность камеры» лаунчера (SNX_LOOK_SENS).
 static int g_cam_mouse = 1;
 static float g_look_sens = 1.0f;
+static int g_rumble = 1;
+
+// ---------------------------------------------------------------- геймпады и вибрация (SDL_GameControllerRumble)
+static pthread_mutex_t g_pad_lock = PTHREAD_MUTEX_INITIALIZER;
+static u16 g_rmb_low, g_rmb_high;
+static u32 g_rmb_ms, g_rmb_seq, g_rmb_done;
+
+void input_rumble(unsigned short low_freq, unsigned short high_freq, unsigned int duration_ms)
+{
+    pthread_mutex_lock(&g_pad_lock);
+    if (!g_rumble && (low_freq || high_freq)) {
+        pthread_mutex_unlock(&g_pad_lock);
+        return;
+    }
+    g_rmb_low = (u16)low_freq;
+    g_rmb_high = (u16)high_freq;
+    g_rmb_ms = (u32)duration_ms;
+    g_rmb_seq++;
+    pthread_mutex_unlock(&g_pad_lock);
+}
+
+int input_rumble_enabled(void)
+{
+    pthread_mutex_lock(&g_pad_lock);
+    int on = g_rumble;
+    pthread_mutex_unlock(&g_pad_lock);
+    return on;
+}
+
+void input_set_rumble_enabled(int on)
+{
+    pthread_mutex_lock(&g_pad_lock);
+    g_rumble = on != 0;
+    if (!g_rumble) {
+        g_rmb_low = g_rmb_high = 0;
+        g_rmb_ms = 0;
+        g_rmb_seq++;
+    }
+    pthread_mutex_unlock(&g_pad_lock);
+}
+
+#ifdef __SWITCH__
+// Вибрация Switch напрямую через hid libnx. SDL 2.28 devkitPro на консоли сообщает «rumble no» для всех слотов, а
+// SDL_GameControllerRumble отвечает успехом без вибрации (проверено на Switch в портативе). Устройства вибрации
+// берутся у портатива (две половинки Joy-Con) и у игрока 1 (Pro Controller, пара или одиночный Joy-Con) и
+// перезапрашиваются при смене стиля контроллера; длительность отсчитывает rumble_tick.
+typedef struct {
+    u32 style;
+    int n;
+    HidVibrationDeviceHandle h[2];
+} nx_vib;
+static nx_vib g_vib[2];  // [0] портатив, [1] игрок 1
+static u64 g_vib_stop_ns;
+static int g_vib_on;
+
+static int nx_vib_prepare(nx_vib *v, HidNpadIdType id)
+{
+    u32 st = hidGetNpadStyleSet(id);
+    if (st == v->style)
+        return v->n;
+    v->style = st;
+    v->n = 0;
+    HidNpadStyleTag tag;
+    int n;
+    if (st & HidNpadStyleTag_NpadHandheld)
+        tag = HidNpadStyleTag_NpadHandheld, n = 2;
+    else if (st & HidNpadStyleTag_NpadFullKey)
+        tag = HidNpadStyleTag_NpadFullKey, n = 1;
+    else if (st & HidNpadStyleTag_NpadJoyDual)
+        tag = HidNpadStyleTag_NpadJoyDual, n = 2;
+    else if (st & HidNpadStyleTag_NpadJoyLeft)
+        tag = HidNpadStyleTag_NpadJoyLeft, n = 1;
+    else if (st & HidNpadStyleTag_NpadJoyRight)
+        tag = HidNpadStyleTag_NpadJoyRight, n = 1;
+    else
+        return 0;
+    if (R_SUCCEEDED(hidInitializeVibrationDevices(v->h, n, id, tag)))
+        v->n = n;
+    return v->n;
+}
+
+// Сила моторов 0..1 -> всем подключённым; возвращает число моторов, принявших значение
+static int nx_vib_send(float amp_low, float amp_high)
+{
+    // частоты — штатные для «удара» Joy-Con (160 и 320 Гц)
+    HidVibrationValue v = {.amp_low = amp_low, .freq_low = 160.0f, .amp_high = amp_high, .freq_high = 320.0f};
+    HidVibrationValue vals[2] = {v, v};
+    static const HidNpadIdType ids[2] = {HidNpadIdType_Handheld, HidNpadIdType_No1};
+    int sent = 0;
+    for (int i = 0; i < 2; i++) {
+        int n = nx_vib_prepare(&g_vib[i], ids[i]);
+        if (n && R_SUCCEEDED(hidSendVibrationValues(g_vib[i].h, vals, n)))
+            sent += n;
+    }
+    return sent;
+}
+#endif
+
+// Вызывается в главном потоке из input_tick(). Мак, Linux и Android — SDL_GameControllerRumble (исполняется в потоке
+// событий SDL), Switch — hid libnx.
+static void rumble_tick(void)
+{
+    u16 low = 0, high = 0;
+    u32 ms = 0;
+    int pending = 0;
+    pthread_mutex_lock(&g_pad_lock);
+    if (g_rmb_seq != g_rmb_done) {
+        low = g_rmb_low;
+        high = g_rmb_high;
+        ms = g_rmb_ms;
+        g_rmb_done = g_rmb_seq;
+        pending = 1;
+    }
+#ifdef __SWITCH__
+    pthread_mutex_unlock(&g_pad_lock);
+    u64 now = rt_ticks_ns();
+    if (pending) {
+        static int logged;  // первые импульсы — в лог: видно, приняли ли их моторы
+        int ok = nx_vib_send(low / 65535.0f, high / 65535.0f);
+        g_vib_on = (low || high) && ms;
+        g_vib_stop_ns = now + (u64)ms * 1000000u;
+        if ((low || high) && logged < 3) {
+            logged++;
+            fprintf(stderr, "[pad] rumble %04x/%04x %u ms: %d motors (hid)\n", low, high, ms, ok);
+        }
+    } else if (g_vib_on && now >= g_vib_stop_ns) {
+        g_vib_on = 0;
+        nx_vib_send(0.0f, 0.0f);
+    }
+    return;
+#endif
+    if (pending) {
+        static int logged;  // первые импульсы — в лог: видно, дошёл ли запрос до SDL и принял ли его драйвер
+        int n = 0, ok = 0;
+        for (int i = 0; i < MAX_PADS; i++)
+            if (g_pads[i].gc) {
+                n++;
+                ok += SDL_GameControllerRumble(g_pads[i].gc, low, high, ms) == 0;
+            }
+        if ((low || high) && logged < 3) {
+            logged++;
+            fprintf(stderr, "[pad] rumble %04x/%04x %u ms: %d of %d pads%s%s\n", low, high, ms, ok, n,
+                    ok < n ? ", " : "", ok < n ? SDL_GetError() : "");
+        }
+    }
+    pthread_mutex_unlock(&g_pad_lock);
+}
 
 static int pad_button_of(const char *n)
 {
@@ -278,11 +441,51 @@ static char *trim(char *s)
 
 static int is_true(const char *v) { return !strcasecmp(v, "True") || !strcmp(v, "1"); }
 
+// Атомарная запись текста по умолчанию в Snx.ini (<path>.tmp + rename)
+static int write_snx_default(void)
+{
+    if (!g_snx_path[0])
+        return -1;
+    char tmp[1200];
+    int n = snprintf(tmp, sizeof tmp, "%s.tmp", g_snx_path);
+    if (n < 0 || (size_t)n >= sizeof tmp)
+        return -1;
+    FILE *f = fopen(tmp, "wb");
+    if (!f)
+        return -1;
+    size_t len = sizeof g_snx_default - 1;
+    int ok = fwrite(g_snx_default, 1, len, f) == len && fflush(f) == 0;
+#ifndef __SWITCH__
+    if (ok)
+        (void)fsync(fileno(f));
+#endif
+    if (fclose(f) != 0 || !ok) {
+        remove(tmp);
+        return -1;
+    }
+    if (rename(tmp, g_snx_path) != 0) {
+#ifdef __SWITCH__
+        if (errno == EEXIST && remove(g_snx_path) == 0 && rename(tmp, g_snx_path) == 0)
+            return 0;
+#endif
+        remove(tmp);
+        return -1;
+    }
+    return 0;
+}
+
+static void qm_draw(int w, int h);
+static void qm_sync_snapshot(void);
+
 // 1 — разобран; 0 — файл старого формата (нет Version=SNX_INI_VERSION)
 static int load_settings(const char *text, const char *src)
 {
     memset(g_map, 0, sizeof g_map);
     g_layer_btn = -1;
+    g_rumble = 1;
+    d3d8_set_menu_aspect(0);  // умолчание для Snx.ini v2 без ключа MenuAspect4x3
+    // Умолчание для существующих Snx.ini версии 2 без строки ZL+Plus=QuickMenu (перекрывается строкой из файла)
+    g_map[1][SDL_CONTROLLER_BUTTON_START] = T_QUICKMENU;
     int pad = 0, version = 0;  // pad: секция [Pad]
     for (const char *p = text; *p;) {
         const char *e = strchr(p, '\n');
@@ -305,6 +508,8 @@ static int load_settings(const char *text, const char *src)
         if (!pad) {
             if (!strcasecmp(k, "ShowFPS"))
                 d3d8_set_fps_overlay(is_true(v));
+            else if (!strcasecmp(k, "MenuAspect4x3"))
+                d3d8_set_menu_aspect(is_true(v));
             else if (!strcasecmp(k, "Version"))
                 version = atoi(v);
             continue;
@@ -326,6 +531,10 @@ static int load_settings(const char *text, const char *src)
             g_cam_mouse = strcasecmp(v, "Joystick") != 0;
             continue;
         }
+        if (!strcasecmp(k, "Rumble")) {
+            g_rumble = is_true(v);
+            continue;
+        }
         char *plus = strchr(k, '+');
         int b = pad_button_of(plus ? plus + 1 : k);
         u32 t = *v ? key_of(v) : 0;
@@ -341,30 +550,32 @@ static int load_settings(const char *text, const char *src)
 
 static void input_load(const char *user_dir)
 {
-    char path[1100], old[1100];
-    snprintf(path, sizeof path, "%s/System/Snx.ini", user_dir);
-    FILE *f = fopen(path, "rb");
+    char old[1100];
+    snprintf(g_snx_path, sizeof g_snx_path, "%s/System/Snx.ini", user_dir);
+    ov_set_draw_hook(qm_draw);
+    hle_rumble_hook = input_rumble;
+    FILE *f = fopen(g_snx_path, "rb");
     if (f) {
         char *text = calloc(1, 64 << 10);
         int ok = 0;
         if (text) {
             text[fread(text, 1, (64 << 10) - 1, f)] = 0;
-            ok = load_settings(text, path);
+            ok = load_settings(text, g_snx_path);
         }
         free(text);
         fclose(f);
-        if (ok)
+        if (ok) {
+            qm_sync_snapshot();
             return;
-        snprintf(old, sizeof old, "%s.old", path);  // старый формат (клавиши вместо джойстика) — в сторону
+        }
+        snprintf(old, sizeof old, "%s.old", g_snx_path);  // старый формат (клавиши вместо джойстика) — в сторону
         remove(old);
-        rename(path, old);
-        fprintf(stderr, "[input] %s: old format, saved as %s\n", path, old);
+        rename(g_snx_path, old);
+        fprintf(stderr, "[input] %s: old format, saved as %s\n", g_snx_path, old);
     }
     load_settings(g_snx_default, "default");
-    if ((f = fopen(path, "wb"))) {
-        fputs(g_snx_default, f);
-        fclose(f);
-    }
+    qm_sync_snapshot();
+    write_snx_default();
 }
 
 void input_init(const char *user_dir)
@@ -489,7 +700,7 @@ static void nav(int dir, int down)
 }
 
 // A: щелчок по элементу в фокусе (курсор GUI уже на нём); ползунок щелчком не трогаем — щелчок ставит
-// значение под курсором (середину)
+// значение под курсором (середину); для текстового поля открываем экранную клавиатуру на Switch.
 static void select_(int down)
 {
     int kind = GM_NONE;
@@ -497,10 +708,16 @@ static void select_(int down)
     game_menu_open(&kind);
     if (down && kind == GM_SLIDER)
         return;
+    if (down && kind == GM_EDIT)
+        game_menu_edit_activate();
     if (down || pressed)
         mouse_button(0, down, cursor_lparam());
     pressed = down;
 }
+
+static void qm_toggle(void);
+static void qm_adjust(int dir);
+static int qm_is_open(void);
 
 static void send_target(int b, u32 t, int down)
 {
@@ -510,6 +727,7 @@ static void send_target(int b, u32 t, int down)
     case T_WHEEL_UP: if (down) wheel(1); break;
     case T_WHEEL_DOWN: if (down) wheel(-1); break;
     case T_FPS: if (down) d3d8_set_fps_overlay(!d3d8_fps_overlay()); break;
+    case T_QUICKMENU: if (down) qm_toggle(); break;
     case T_NAV: nav(b - SDL_CONTROLLER_BUTTON_DPAD_UP, down); break;
     case T_SELECT: select_(down); break;
     case T_BACK: back(down); break;
@@ -545,6 +763,11 @@ static int is_dpad(int b) { return b >= SDL_CONTROLLER_BUTTON_DPAD_UP && b <= SD
 
 static u32 target_of(int b)
 {
+    // Вызов Quick Menu (например, ZL+Plus) работает и в игре, и поверх открытого меню игры
+    if (g_layer && g_map[1][b] == T_QUICKMENU)
+        return T_QUICKMENU;
+    if (!g_layer && g_map[0][b] == T_QUICKMENU)
+        return T_QUICKMENU;
     if (g_menu) {
         switch (b) {
         case SDL_CONTROLLER_BUTTON_A: return T_SELECT;
@@ -563,12 +786,34 @@ static u32 target_of(int b)
     return g_map[0][b] ? g_map[0][b] : g_pb_joy[b] || is_dpad(b) ? T_JOY : 0;
 }
 
+static int g_qm_dir = -1;  // повтор крестовины в Quick Menu
+static u32 g_qm_next;
+
 static void pad_button(int b, int down)
 {
     if (b < 0 || b >= PB_N)
         return;
     if (b == g_layer_btn)
         g_layer = down;
+    if (qm_is_open()) {
+        // Пока открыто Quick Menu, ввод геймпада перехватывается и не уходит в игру/меню игры
+        if (down) {
+            if (b == SDL_CONTROLLER_BUTTON_B || b == SDL_CONTROLLER_BUTTON_START ||
+                (g_layer && g_map[1][b] == T_QUICKMENU) || (!g_layer && g_map[0][b] == T_QUICKMENU))
+                qm_toggle();
+            else if (b == SDL_CONTROLLER_BUTTON_A)
+                qm_adjust(4);
+            else if (is_dpad(b)) {
+                int dir = b - SDL_CONTROLLER_BUTTON_DPAD_UP;
+                g_qm_dir = dir;
+                g_qm_next = SDL_GetTicks() + 350;
+                qm_adjust(dir);
+            }
+        } else if (is_dpad(b) && (b - SDL_CONTROLLER_BUTTON_DPAD_UP) == g_qm_dir) {
+            g_qm_dir = -1;
+        }
+        return;
+    }
     if (down) {
         if (g_held[b])
             return;
@@ -623,6 +868,284 @@ static float pad_axis(int a)
         if (g_pads[i].id >= 0 && fabsf(g_pads[i].axis[a]) > fabsf(best))
             best = g_pads[i].axis[a];
     return best;
+}
+
+// ---------------------------------------------------------------- Quick Menu порта (поверх игры через overlay.c)
+enum { QM_FPS, QM_MENU_ASPECT, QM_INVERT_Y, QM_CAM_SPEED, QM_MOVE_SPEED, QM_DEADZONE, QM_RUMBLE, QM_COUNT };
+
+static pthread_mutex_t g_qm_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    int open, sel;
+    int invert_y, rumble;
+    float cam_speed, move_speed, dead;
+} g_qm;
+
+static int qm_is_open(void)
+{
+    pthread_mutex_lock(&g_qm_lock);
+    int open = g_qm.open;
+    pthread_mutex_unlock(&g_qm_lock);
+    return open;
+}
+
+static void qm_sync_snapshot(void)
+{
+    int rmb = input_rumble_enabled();
+    pthread_mutex_lock(&g_qm_lock);
+    g_qm.invert_y = g_invert_y;
+    g_qm.cam_speed = g_cam_speed;
+    g_qm.move_speed = g_move_speed;
+    g_qm.dead = g_dead;
+    g_qm.rumble = rmb;
+    pthread_mutex_unlock(&g_qm_lock);
+}
+
+static void qm_save_key(const char *sec, const char *k, const char *val)
+{
+    if (!g_snx_path[0])
+        return;
+    if (boot_ini_set(g_snx_path, sec, k, val) < 0) {
+        // При первом запуске каталога <user>/System могло не быть в момент input_init — создаём файл сейчас
+        if (write_snx_default() == 0)
+            boot_ini_set(g_snx_path, sec, k, val);
+    }
+}
+
+static void qm_save_one(int item)
+{
+    char buf[32];
+    switch (item) {
+    case QM_FPS:
+        qm_save_key("Overlay", "ShowFPS", d3d8_fps_overlay() ? "True" : "False");
+        break;
+    case QM_MENU_ASPECT:
+        qm_save_key("Overlay", "MenuAspect4x3", d3d8_menu_aspect() ? "True" : "False");
+        break;
+    case QM_INVERT_Y:
+        qm_save_key("Pad", "InvertCameraY", g_invert_y ? "True" : "False");
+        break;
+    case QM_CAM_SPEED:
+        snprintf(buf, sizeof buf, "%.0f", g_cam_speed);
+        qm_save_key("Pad", "CameraSpeed", buf);
+        break;
+    case QM_MOVE_SPEED:
+        snprintf(buf, sizeof buf, "%.0f", g_move_speed);
+        qm_save_key("Pad", "MoveSpeed", buf);
+        break;
+    case QM_DEADZONE:
+        snprintf(buf, sizeof buf, "%.2f", g_dead);
+        qm_save_key("Pad", "DeadZone", buf);
+        break;
+    case QM_RUMBLE:
+        qm_save_key("Pad", "Rumble", input_rumble_enabled() ? "True" : "False");
+        break;
+    default: break;
+    }
+}
+
+static void qm_toggle(void)
+{
+    int now_open;
+    pthread_mutex_lock(&g_qm_lock);
+    now_open = !g_qm.open;
+    g_qm.open = now_open;
+    pthread_mutex_unlock(&g_qm_lock);
+    g_qm_dir = -1;
+    if (now_open) {
+        release_all();
+        g_nav_dir = -1;
+        qm_sync_snapshot();
+    } else if (!g_menu) {
+        g_joy_frozen = 0;
+    }
+}
+
+// dir: 0 вверх, 1 вниз, 2 влево, 3 вправо, 4 A (переключить)
+static void qm_adjust(int dir)
+{
+    int sel, changed = 0;
+    pthread_mutex_lock(&g_qm_lock);
+    if (dir == 0)
+        g_qm.sel = (g_qm.sel + QM_COUNT - 1) % QM_COUNT;
+    else if (dir == 1)
+        g_qm.sel = (g_qm.sel + 1) % QM_COUNT;
+    sel = g_qm.sel;
+    pthread_mutex_unlock(&g_qm_lock);
+    if (dir < 2)
+        return;
+    switch (sel) {
+    case QM_FPS:
+        d3d8_set_fps_overlay(!d3d8_fps_overlay());
+        changed = 1;
+        break;
+    case QM_MENU_ASPECT:
+        d3d8_set_menu_aspect(!d3d8_menu_aspect());
+        changed = 1;
+        break;
+    case QM_INVERT_Y:
+        g_invert_y = !g_invert_y;
+        changed = 1;
+        break;
+    case QM_CAM_SPEED:
+        if (dir == 2 || dir == 3) {
+            float v = g_cam_speed + (dir == 3 ? 4.0f : -4.0f);
+            v = v < 20.0f ? 20.0f : v > 160.0f ? 160.0f : v;
+            if (v != g_cam_speed) {
+                g_cam_speed = v;
+                changed = 1;
+            }
+        }
+        break;
+    case QM_MOVE_SPEED:
+        if (dir == 2 || dir == 3) {
+            float v = g_move_speed + (dir == 3 ? 50.0f : -50.0f);
+            v = v < 600.0f ? 600.0f : v > 1800.0f ? 1800.0f : v;
+            if (v != g_move_speed) {
+                g_move_speed = v;
+                changed = 1;
+            }
+        }
+        break;
+    case QM_DEADZONE:
+        if (dir == 2 || dir == 3) {
+            float v = roundf((g_dead + (dir == 3 ? 0.05f : -0.05f)) * 20.0f) / 20.0f;
+            v = v < 0.05f ? 0.05f : v > 0.50f ? 0.50f : v;
+            if (fabsf(v - g_dead) > 1e-4f) {
+                g_dead = v;
+                changed = 1;
+            }
+        }
+        break;
+    case QM_RUMBLE: {
+        int on = !input_rumble_enabled();
+        input_set_rumble_enabled(on);
+        if (on)
+            input_rumble(0x5000u, 0x8000u, 120u);
+        changed = 1;
+        break;
+    }
+    default: break;
+    }
+    if (changed) {
+        qm_sync_snapshot();
+        qm_save_one(sel);
+    }
+}
+
+static float qm_clamp(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+// Рисуется в потоке гостя из ov_flush поверх кадра (и поверх меню игры, если оно открыто)
+static void qm_draw(int w, int h)
+{
+    if (w <= 0 || h <= 0)
+        return;
+    int open, sel, invert_y, rumble;
+    float cam_speed, move_speed, dead;
+    pthread_mutex_lock(&g_qm_lock);
+    open = g_qm.open;
+    sel = g_qm.sel;
+    invert_y = g_qm.invert_y;
+    cam_speed = g_qm.cam_speed;
+    move_speed = g_qm.move_speed;
+    dead = g_qm.dead;
+    rumble = g_qm.rumble;
+    pthread_mutex_unlock(&g_qm_lock);
+    if (!open)
+        return;
+
+    int fps = d3d8_fps_overlay();
+    int menu_aspect = d3d8_menu_aspect();
+    int rus = game_menu_is_rus();
+    static const char *const labels[QM_COUNT][2] = {
+        [QM_FPS] = {"Show FPS", "Счётчик кадров"},
+        [QM_MENU_ASPECT] = {"Menu Aspect 4:3", "Меню 4:3"},
+        [QM_INVERT_Y] = {"Invert Camera Y", "Инверсия камеры Y"},
+        [QM_CAM_SPEED] = {"Camera Speed", "Скорость камеры"},
+        [QM_MOVE_SPEED] = {"Move Speed", "Скорость бега"},
+        [QM_DEADZONE] = {"Stick Deadzone", "Мёртвая зона"},
+        [QM_RUMBLE] = {"Rumble", "Вибрация"},
+    };
+
+    float sc = qm_clamp((float)h / 720.0f, 0.65f, 1.55f);
+    float pad_x = 24.0f * sc, pad_y = 18.0f * sc;
+    float hdr_h = 44.0f * sc, row_h = 38.0f * sc, ftr_h = 38.0f * sc;
+    float title_h = 24.0f * sc, text_h = 20.0f * sc, icon_h = 19.0f * sc;
+    float cw = qm_clamp((float)w * 0.48f, 360.0f * sc, 620.0f * sc);
+    if (cw > (float)w - 28.0f)
+        cw = (float)w - 28.0f;
+    float ch = pad_y * 2.0f + hdr_h + QM_COUNT * row_h + ftr_h;
+    if (ch > (float)h - 24.0f) {
+        float k = ((float)h - 24.0f) / ch;
+        pad_x *= k;
+        pad_y *= k;
+        hdr_h *= k;
+        row_h *= k;
+        ftr_h *= k;
+        title_h *= k;
+        text_h *= k;
+        icon_h *= k;
+        ch = (float)h - 24.0f;
+    }
+    float cx = ((float)w - cw) * 0.5f, cy = ((float)h - ch) * 0.5f;
+
+    ov_rect(0.0f, 0.0f, (float)w, (float)h, OV_RGBA(0, 0, 0, 120));
+    ov_rect(cx - 2.0f, cy - 2.0f, cw + 4.0f, ch + 4.0f, OV_RGBA(130, 195, 85, 220));
+    ov_rect(cx, cy, cw, ch, OV_RGBA(18, 22, 28, 238));
+
+    const char *title = rus ? "shrekNX - Быстрое меню" : "shrekNX - Quick Menu";
+    ov_text(cx + pad_x, cy + pad_y + (hdr_h - title_h) * 0.35f, title_h, OV_RGBA(180, 235, 130, 255), title);
+    ov_rect(cx + pad_x, cy + pad_y + hdr_h - 4.0f * sc, cw - 2.0f * pad_x, 1.5f, OV_RGBA(130, 195, 85, 120));
+
+    float y0 = cy + pad_y + hdr_h;
+    for (int i = 0; i < QM_COUNT; i++) {
+        float ry = y0 + (float)i * row_h;
+        if (i == sel)
+            ov_rect(cx + pad_x * 0.5f, ry + 2.0f, cw - pad_x, row_h - 4.0f, OV_RGBA(95, 160, 60, 135));
+        u32 col_lbl = i == sel ? OV_RGBA(255, 255, 255, 255) : OV_RGBA(215, 220, 228, 255);
+        ov_text(cx + pad_x, ry + (row_h - text_h) * 0.5f, text_h, col_lbl, labels[i][rus]);
+
+        char val[32];
+        u32 col_val = i == sel ? OV_RGBA(255, 240, 150, 255) : OV_RGBA(185, 200, 215, 255);
+        int is_bool = (i == QM_FPS || i == QM_MENU_ASPECT || i == QM_INVERT_Y || i == QM_RUMBLE);
+        if (is_bool) {
+            int on = i == QM_FPS ? fps : i == QM_MENU_ASPECT ? menu_aspect : i == QM_INVERT_Y ? invert_y : rumble;
+            snprintf(val, sizeof val, "%s", on ? (rus ? "Вкл" : "On") : (rus ? "Выкл" : "Off"));
+            col_val = on ? OV_RGBA(150, 235, 110, 255) : OV_RGBA(175, 180, 190, 255);
+        } else if (i == QM_CAM_SPEED) {
+            snprintf(val, sizeof val, "< %.0f >", cam_speed);
+        } else if (i == QM_MOVE_SPEED) {
+            snprintf(val, sizeof val, "< %.0f >", move_speed);
+        } else {
+            snprintf(val, sizeof val, "< %.0f%% >", dead * 100.0f);
+        }
+        float vw = ov_text_width(text_h, val);
+        ov_text(cx + cw - pad_x - vw, ry + (row_h - text_h) * 0.5f, text_h, col_val, val);
+    }
+
+    float fy = y0 + QM_COUNT * row_h;
+    ov_rect(cx + pad_x, fy + 2.0f, cw - 2.0f * pad_x, 1.0f, OV_RGBA(255, 255, 255, 45));
+    float fcy = fy + ftr_h * 0.55f, fx = cx + pad_x;
+    float fth = text_h * 0.80f, fgap = icon_h * 0.30f, fitem = icon_h * 0.90f;
+    const char *h_dpad = rus ? "Изменить" : "Adjust";
+    const char *h_a = rus ? "Перекл." : "Toggle";
+    const char *h_b = rus ? "Закрыть" : "Close";
+    float fw = ov_icon_width(icon_h, OV_DPAD) + fgap + ov_text_width(fth, h_dpad) + fitem +
+               ov_icon_width(icon_h, OV_A) + fgap + ov_text_width(fth, h_a) + fitem +
+               ov_icon_width(icon_h, OV_B) + fgap + ov_text_width(fth, h_b);
+    if (fw > cw - 2.0f * pad_x && fw > 1.0f) {
+        float k = (cw - 2.0f * pad_x) / fw;
+        icon_h *= k;
+        fth *= k;
+        fgap *= k;
+        fitem *= k;
+    }
+    u32 col_ftr = OV_RGBA(210, 215, 225, 255);
+    fx += ov_icon(fx, fcy - icon_h * 0.5f, icon_h, OV_DPAD) + fgap;
+    fx += ov_text(fx, fcy - fth * 0.54f, fth, col_ftr, h_dpad) + fitem;
+    fx += ov_icon(fx, fcy - icon_h * 0.5f, icon_h, OV_A) + fgap;
+    fx += ov_text(fx, fcy - fth * 0.54f, fth, col_ftr, h_a) + fitem;
+    fx += ov_icon(fx, fcy - icon_h * 0.5f, icon_h, OV_B) + fgap;
+    ov_text(fx, fcy - fth * 0.54f, fth, col_ftr, h_b);
 }
 
 // стик с круглой мёртвой зоной: (x, y) -> длина 0..1 с тем же направлением; curve — квадратичный отклик
@@ -852,6 +1375,7 @@ void input_tick(void)
     scripted_keys();
     touch_tick();
     diag_tick();
+    rumble_tick();
     static u64 last;
     static float fx, fy;  // дробные остатки смещения мыши
     u64 now = SDL_GetPerformanceCounter();
@@ -874,6 +1398,15 @@ void input_tick(void)
         int on = pad_axis(SDL_CONTROLLER_AXIS_TRIGGERLEFT + i) > (g_trig[i] ? 0.3f : 0.5f);
         if (on != g_trig[i])
             pad_button(PB_ZL + i, g_trig[i] = on);
+    }
+    if (qm_is_open()) {
+        static const float zero[6];
+        dinput8_joy(zero, g_menu ? (g_joy_frozen & 0xFFF) : 0, -1);
+        if (g_qm_dir >= 0 && (s32)(SDL_GetTicks() - g_qm_next) >= 0) {
+            g_qm_next = SDL_GetTicks() + 120;
+            qm_adjust(g_qm_dir);
+        }
+        return;
     }
     float lx, ly, rx, ry;
     stick(axis_of(SDL_CONTROLLER_AXIS_LEFTX), axis_of(SDL_CONTROLLER_AXIS_LEFTY), 0, &lx, &ly);
@@ -957,9 +1490,30 @@ void input_event(const void *p)
     case SDL_TEXTINPUT:
         if (!hwnd)
             break;
-        for (const unsigned char *s = (const unsigned char *)e->text.text; *s; s++)
-            if (*s < 0x80)  // TODO: UTF-8 -> UTF-16 для не-ASCII
-                user32_post(hwnd, WM_CHAR, *s, 1);
+        // Декодирование UTF-8 -> UTF-16 (BMP) для WM_CHAR (работает кириллица с клавиатуры на macOS)
+        for (const u8 *s = (const u8 *)e->text.text; *s;) {
+            u32 cp = 0;
+            if (*s < 0x80u) {
+                cp = *s++;
+            } else if ((*s & 0xE0u) == 0xC0u && (s[1] & 0xC0u) == 0x80u) {
+                cp = ((u32)(s[0] & 0x1Fu) << 6) | (u32)(s[1] & 0x3Fu);
+                s += 2;
+                if (cp < 0x80u)
+                    cp = 0;
+            } else if ((*s & 0xF0u) == 0xE0u && (s[1] & 0xC0u) == 0x80u && (s[2] & 0xC0u) == 0x80u) {
+                cp = ((u32)(s[0] & 0x0Fu) << 12) | ((u32)(s[1] & 0x3Fu) << 6) | (u32)(s[2] & 0x3Fu);
+                s += 3;
+                if (cp < 0x800u || (cp >= 0xD800u && cp <= 0xDFFFu))
+                    cp = 0;
+            } else if ((*s & 0xF8u) == 0xF0u && (s[1] & 0xC0u) == 0x80u && (s[2] & 0xC0u) == 0x80u &&
+                       (s[3] & 0xC0u) == 0x80u) {
+                s += 4;  // вне BMP: 16-битный WM_CHAR пропускает суррогатные пары
+            } else {
+                s++;
+            }
+            if (cp > 0 && cp <= 0xFFFFu)
+                user32_post(hwnd, WM_CHAR, cp, 1);
+        }
         break;
     case SDL_FINGERDOWN:  // сенсорный экран (Switch в руках): в меню — курсор и щелчок, в игре — ничего
     case SDL_FINGERUP:
@@ -970,7 +1524,7 @@ void input_event(const void *p)
             fprintf(stderr, "[touch] finger %.2f,%.2f -> %d,%d (%d) menu=%d focus=%x\n", (double)e->tfinger.x,
                     (double)e->tfinger.y, x, y, ok, g_menu, user32_focus());
         }
-        if (!g_menu)
+        if (!g_menu || qm_is_open())
             break;
         if (e->type == SDL_FINGERDOWN)
             touch(e->tfinger.x, e->tfinger.y);

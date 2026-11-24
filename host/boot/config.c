@@ -1,10 +1,12 @@
 // Настройки порта поверх game.ini игры (см. config.h).
 #include "host/boot/config.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <unistd.h>
 
 #include "runtime/abi.h"
 #include "runtime/game/menu.h"
@@ -31,13 +33,37 @@ static char *read_all(const char *path, size_t *len)
     return p;
 }
 
+// Атомарная запись через временный файл <path>.tmp и rename() поверх целевого — защита game.ini / User.ini / .int /
+// Snx.ini от повреждения при внезапном выключении консоли.
 static int write_all(const char *path, const char *a, size_t na, const char *b, size_t nb, const char *c, size_t nc)
 {
-    FILE *f = fopen(path, "wb");
+    char tmp[1200];
+    int n = snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    if (n < 0 || (size_t)n >= sizeof tmp)
+        return -1;
+    FILE *f = fopen(tmp, "wb");
     if (!f)
         return -1;
-    int ok = fwrite(a, 1, na, f) == na && fwrite(b, 1, nb, f) == nb && fwrite(c, 1, nc, f) == nc;
-    return fclose(f) == 0 && ok ? 1 : -1;
+    int ok = (!na || fwrite(a, 1, na, f) == na) && (!nb || fwrite(b, 1, nb, f) == nb) &&
+             (!nc || fwrite(c, 1, nc, f) == nc) && fflush(f) == 0;
+#ifndef __SWITCH__
+    if (ok)
+        (void)fsync(fileno(f));
+#endif
+    if (fclose(f) != 0 || !ok) {
+        remove(tmp);
+        return -1;
+    }
+    if (rename(tmp, path) != 0) {
+#ifdef __SWITCH__
+        // На Switch fsdev (sdmc:) rename() возвращает EEXIST, если целевой файл уже есть [проверить на Switch]
+        if (errno == EEXIST && remove(path) == 0 && rename(tmp, path) == 0)
+            return 1;
+#endif
+        remove(tmp);
+        return -1;
+    }
+    return 1;
 }
 
 // длина строки без перевода; *next — начало следующей

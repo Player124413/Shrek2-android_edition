@@ -3,15 +3,12 @@
 #include "platform/gl.h"
 
 #include <EGL/egl.h>
-#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 
 gles_caps_t gles_caps;
-static char g_cache_dir[1024];
 
 typedef void (*draw_bv_fn)(GLenum, GLsizei, GLenum, const void *, GLint);
 static draw_bv_fn g_draw_bv;
@@ -63,10 +60,6 @@ void gles_init(void)
         gles_caps.s3tc = 0;
     e = getenv("SNX_GLES_INVALIDATE");
     gles_caps.invalidate = !(e && *e == '0');
-    // кэш собранных программ: рядом с игрой (рабочий каталог — папка игры); SNX_SHADER_CACHE=0 — без кэша
-    e = getenv("SNX_SHADER_CACHE");
-    if (!g_cache_dir[0] && !(e && !strcmp(e, "0")))
-        gles_set_shader_cache_dir(e && *e ? e : "System/SnxShaders");
     fprintf(stderr,
             "[gles] ES %d.%d (%s): base vertex %d, clip distance %d, s3tc %d, border clamp %d, program binary %d, "
             "16-bit DXT %d\n",
@@ -636,118 +629,4 @@ void snx_glRenderbufferStorage(GLenum target, GLenum internal, GLsizei w, GLsize
     if (internal == GL_DEPTH_COMPONENT32)
         internal = GL_DEPTH_COMPONENT24;
     glRenderbufferStorage(target, internal, w, h);
-}
-
-// ---------------------------------------------------------------- кеш собранных программ
-// Шейдеры мобильных драйверов собираются десятки миллисекунд: программы прошлых запусков (их ключи —
-// System/SnxPrograms.bin слоя D3D8) иначе собирались бы заново при каждом запуске. Файл на программу:
-// <каталог>/<FNV-64 от драйвера и исходников>.bin = "SNXB", формат, длина, двоичный образ.
-
-static void mkdirs(const char *path)
-{
-    char tmp[1024];
-    snprintf(tmp, sizeof tmp, "%s", path);
-    for (char *p = tmp + 1; *p; p++)
-        if (*p == '/') {
-            *p = 0;
-            mkdir(tmp, 0755);
-            *p = '/';
-        }
-    mkdir(tmp, 0755);
-}
-
-void gles_set_shader_cache_dir(const char *dir)
-{
-    g_cache_dir[0] = 0;
-    if (!dir || !*dir)
-        return;
-    snprintf(g_cache_dir, sizeof g_cache_dir, "%s", dir);
-    mkdirs(g_cache_dir);
-}
-
-static uint64_t fnv64(uint64_t h, const char *s)
-{
-    for (; s && *s; s++)
-        h = (h ^ (unsigned char)*s) * 1099511628211ull;
-    return h;
-}
-
-static void cache_path(char *out, size_t cap, const char *vs, const char *fs)
-{
-    uint64_t h = 1469598103934665603ull;
-    h = fnv64(h, gles_caps.renderer);
-    h = fnv64(h, (const char *)glGetString(GL_VERSION));
-    h = fnv64(h, vs);
-    h = fnv64(h, "\x01");
-    h = fnv64(h, fs);
-    snprintf(out, cap, "%s/%016llx.bin", g_cache_dir, (unsigned long long)h);
-}
-
-static int cache_on(void) { return g_cache_dir[0] && gles_caps.program_binary; }
-
-void gles_program_hint(unsigned prog)
-{
-    if (cache_on())
-        glProgramParameteri(prog, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
-}
-
-unsigned gles_program_load(const char *vs, const char *fs)
-{
-    if (!cache_on())
-        return 0;
-    char path[1100];
-    cache_path(path, sizeof path, vs, fs);
-    FILE *f = fopen(path, "rb");
-    if (!f)
-        return 0;
-    uint32_t hdr[3];
-    unsigned char *bin = NULL;
-    GLuint prog = 0;
-    if (fread(hdr, 4, 3, f) == 3 && hdr[0] == 0x42584E53u && hdr[2] > 0 && hdr[2] < (64u << 20) &&
-        (bin = malloc(hdr[2])) && fread(bin, 1, hdr[2], f) == hdr[2]) {
-        prog = glCreateProgram();
-        glProgramBinary(prog, (GLenum)hdr[1], bin, (GLsizei)hdr[2]);
-        GLint ok = 0;
-        glGetProgramiv(prog, GL_LINK_STATUS, &ok);
-        if (!ok) {  // драйвер обновился или образ испорчен: собрать заново
-            glDeleteProgram(prog);
-            prog = 0;
-        }
-    }
-    free(bin);
-    fclose(f);
-    if (!prog)
-        remove(path);
-    return prog;
-}
-
-void gles_program_store(unsigned prog, const char *vs, const char *fs)
-{
-    if (!cache_on() || !prog)
-        return;
-    GLint len = 0;
-    glGetProgramiv(prog, GL_PROGRAM_BINARY_LENGTH, &len);
-    if (len <= 0)
-        return;
-    unsigned char *bin = malloc((size_t)len);
-    GLenum fmt = 0;
-    GLsizei got = 0;
-    if (!bin)
-        return;
-    glGetProgramBinary(prog, len, &got, &fmt, bin);
-    if (got > 0) {
-        char path[1100], tmp[1110];
-        cache_path(path, sizeof path, vs, fs);
-        snprintf(tmp, sizeof tmp, "%s.tmp", path);
-        FILE *f = fopen(tmp, "wb");
-        uint32_t hdr[3] = {0x42584E53u, (uint32_t)fmt, (uint32_t)got};
-        int ok = f && fwrite(hdr, 4, 3, f) == 3 && fwrite(bin, 1, (size_t)got, f) == (size_t)got;
-        if (f)
-            ok &= fclose(f) == 0;
-        if (ok)
-            rename(tmp, path);
-        else
-            remove(tmp);
-    }
-    free(bin);
 }

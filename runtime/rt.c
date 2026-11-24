@@ -2,13 +2,20 @@
 #include "runtime/rt.h"
 #include "runtime/process.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <time.h>
 
-#if defined(__APPLE__) || defined(__ANDROID__)
+#if defined(__APPLE__) || defined(__linux__)
 #include <sys/mman.h>
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE 0
+#endif
 #endif
 
 u8 *g_mem;
@@ -48,14 +55,16 @@ static void cnt_init(void);
 int rt_mem_init(void)
 {
     cnt_init();
-#if defined(__APPLE__) || defined(__ANDROID__)
+#if defined(__APPLE__) || defined(__linux__)
     // 4 ГБ виртуального адреса: любой u32-адрес попадает в резерв, мусорный указатель даёт SIGSEGV,
     // а не порчу хостовой памяти. Рабочее окно [64 КБ, RT_WINDOW) — чтение/запись, страница 0 закрыта.
-    void *p = mmap(NULL, 0x100000000ull, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+    void *p = mmap(NULL, 0x100000000ull, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED)
         return -1;
-    if (mprotect((u8 *)p + 0x10000, RT_WINDOW - 0x10000, PROT_READ | PROT_WRITE) != 0)
+    if (mprotect((u8 *)p + 0x10000, RT_WINDOW - 0x10000, PROT_READ | PROT_WRITE) != 0) {
+        munmap(p, 0x100000000ull);
         return -1;
+    }
     g_mem = p;
     return 0;
 #else
@@ -183,11 +192,12 @@ void rt_invoke(CPU *c, guest_fn fn, int native)
 
 #ifdef SNX_PIN
 // Трамплин рантайм -> код гостя с закреплёнными регистрами (runtime/abi.h). Регистры как в runtime/gen_rt.h: eax x19,
-// ecx x20, edx x21, ebx x22, esp x23, ebp x24, esi x25, edi x26, m (g_mem) x27; в CPU eax..edi — смещения 0..28.
-// x19–x28 у хоста сохраняемые: свои значения рантайма — в кадре трамплина, x28 — c на время вызова.
+// ecx x20, edx x21, ebx x22, esp x23, ebp x24, esi x25, edi x26, m (g_mem) x27, CPU *c (g_pin_c) x28; в CPU
+// eax..edi — смещения 0..28. x19–x28 у хоста сохраняемые: свои значения рантайма — в кадре трамплина.
 _Static_assert(offsetof(CPU, eax) == 0 && offsetof(CPU, esp) == 16 && offsetof(CPU, edi) == 28, "CPU layout");
-__asm__(".text\n"
+__asm__(".section .text.rt_pin_enter,\"ax\",%progbits\n"
         ".global rt_pin_enter\n"
+        ".hidden rt_pin_enter\n"
         ".type rt_pin_enter, %function\n"
         ".p2align 2\n"
         "rt_pin_enter:\n"
@@ -217,7 +227,8 @@ __asm__(".text\n"
         "    ldp x27, x28, [sp, #80]\n"
         "    ldp x29, x30, [sp], #96\n"
         "    ret\n"
-        ".size rt_pin_enter, .-rt_pin_enter\n");
+        ".size rt_pin_enter, .-rt_pin_enter\n"
+        ".previous\n");
 #endif
 
 int rt_check_abi;
@@ -391,10 +402,14 @@ void rt_call(CPU *c, u32 target)
     check_abi(c, target, ret, saved);
 }
 
-void rt_ic_base(CPU *c) { rt_trap(c, 0, "call to unknown guest address"); }
+#ifndef SNX_PIN
+__attribute__((cold)) void rt_ic_base(CPU *c) { rt_trap(c, 0, "call to unknown guest address"); }
+#endif
 
 // промахи мест вызова (abi.h): без общего кеша каждый раз шли бы в хеш-таблицу всех функций
-u64 rt_ic2[RT_IC2_SIZE];
+_Alignas(64) u64 rt_ic2[RT_IC2_SIZE];
+// теневая таблица прямого отображения для диспетчера UnrealScript GNatives (4096 слотов)
+_Alignas(64) u64 rt_gnatives_cache[RT_GNATIVE_SIZE];
 
 void rt_call_ic(CPU *c, u32 target, u64 *ic)
 {
@@ -403,20 +418,30 @@ void rt_call_ic(CPU *c, u32 target, u64 *ic)
     if ((u32)v != target || !target) {
         int native = 0;
         guest_fn fn = rt_check_abi ? NULL : rt_lookup_k(target, &native);  // с проверкой ABI — всегда через rt_call
-        intptr_t off = fn ? (intptr_t)(uintptr_t)fn - (intptr_t)(uintptr_t)rt_ic_base : 0;
-        if (!fn || off != (s32)off) {
+        if (!fn) {
             rt_call(c, target);
             return;
         }
 #ifdef SNX_PIN
-        off |= native;  // бит 0 (функции выровнены): функция хоста — место вызова обернёт её SPILL/RELOAD (gen_rt.h)
+        // Нативная функция хоста (COM/HLE/оверрайд) кешируется через pinned-ABI обёртку (runtime/icall_pin.c):
+        // место вызова зовёт её напрямую без бита native и без ухода в rt_icall_slow.
+        guest_fn cached = native ? rt_pin_wrap_native(fn) : fn;
+#else
+        guest_fn cached = fn;
 #endif
+        intptr_t off = cached ? (intptr_t)(uintptr_t)cached - (intptr_t)(uintptr_t)rt_ic_base : 0;
+        if (!cached || off != (s32)off) {
+            rt_call(c, target);
+            return;
+        }
         v = (u64)(u32)(s32)off << 32 | target;
-        __atomic_store_n(e, v, __ATOMIC_RELAXED);
+        __atomic_store_n(e, v, __ATOMIC_RELEASE);
+        __atomic_store_n(ic, v, __ATOMIC_RELEASE);
+        rt_invoke(c, fn, native);
+        return;
     }
     __atomic_store_n(ic, v, __ATOMIC_RELAXED);
-    s32 off = (s32)(u32)(v >> 32);
-    rt_invoke(c, (guest_fn)((uintptr_t)rt_ic_base + (uintptr_t)(intptr_t)(off & ~1)), off & 1);
+    rt_invoke(c, (guest_fn)((uintptr_t)rt_ic_base + (intptr_t)((s64)v >> 32)), 0);
 }
 
 // ---------------------------------------------------------------- ошибки
@@ -482,6 +507,8 @@ void rt_cpuid(u32 leaf, u32 r[4])
 
 // часто зовётся гостем (rdtsc — замеры статистики UE2): без системных вызовов
 u64 rt_file_ns;
+u32 rt_gc_epoch = 1;
+int rt_menu_aspect_4x3;
 
 u64 rt_ticks_ns(void)
 {
@@ -496,6 +523,73 @@ u64 rt_ticks_ns(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
 #endif
+}
+
+// Паузируемые монотонные часы гостя: защищают UE2 от гигантских дельт времени после HOME/сна.
+// Инвариант под g_clock_lock: g_clock_guest + g_clock_off == g_clock_raw, g_clock_guest не убывает.
+#define RT_GUEST_MAX_STEP_NS 500000000ull  // 500 мс: защита от скачка при сне ОС без предварительной паузы
+static pthread_mutex_t g_clock_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_clock_init;
+static int g_clock_paused;
+static u64 g_clock_raw;    // последнее учтённое rt_ticks_ns()
+static u64 g_clock_guest;  // текущее гостевое время, нс
+static u64 g_clock_off;    // накопленное вычтенное время пауз и срезанных скачков
+
+static void clock_init_locked(u64 raw)
+{
+    if (g_clock_init)
+        return;
+    g_clock_init = 1;
+    g_clock_raw = raw;
+    g_clock_guest = raw;
+    g_clock_off = 0;
+}
+
+static void clock_advance_locked(u64 raw)
+{
+    clock_init_locked(raw);
+    if (raw <= g_clock_raw)
+        return;
+    u64 dt = raw - g_clock_raw;
+    g_clock_raw = raw;
+    if (g_clock_paused) {
+        g_clock_off += dt;
+        return;
+    }
+    if (dt > RT_GUEST_MAX_STEP_NS) {
+        g_clock_off += dt - RT_GUEST_MAX_STEP_NS;
+        dt = RT_GUEST_MAX_STEP_NS;
+    }
+    g_clock_guest += dt;
+}
+
+u64 rt_guest_ticks_ns(void)
+{
+    pthread_mutex_lock(&g_clock_lock);
+    clock_advance_locked(rt_ticks_ns());
+    u64 r = g_clock_guest;
+    pthread_mutex_unlock(&g_clock_lock);
+    return r;
+}
+
+void rt_clock_pause(int on)
+{
+    pthread_mutex_lock(&g_clock_lock);
+    clock_advance_locked(rt_ticks_ns());
+    g_clock_paused = on ? 1 : 0;
+    pthread_mutex_unlock(&g_clock_lock);
+}
+
+void rt_clock_sync(void)
+{
+    pthread_mutex_lock(&g_clock_lock);
+    u64 raw = rt_ticks_ns();
+    clock_init_locked(raw);
+    if (raw > g_clock_raw) {
+        g_clock_off += raw - g_clock_raw;
+        g_clock_raw = raw;
+    }
+    pthread_mutex_unlock(&g_clock_lock);
 }
 
 u64 (*rt_rdtsc_hook)(void);

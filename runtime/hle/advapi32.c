@@ -77,11 +77,15 @@ static int key_path(u32 parent, const char *sub, char *out, size_t cap)
     return 1;
 }
 
-static void reg_file(char *out, size_t cap)
+static int reg_file_read(char *out, size_t cap)
 {
-    char host[1100];
-    vfs_for_write("registry.txt", host, sizeof host, 0);
-    snprintf(out, cap, "%s", host);
+    // Чтение без vfs_for_write, чтобы не сбрасывать кеш каталогов VFS (vfs_changed) при запросах реестра.
+    return vfs_find("registry.txt", out, cap);
+}
+
+static int reg_file_write(char *out, size_t cap)
+{
+    return vfs_for_write("registry.txt", out, cap, 0);
 }
 
 static void reg_load(void)
@@ -90,22 +94,24 @@ static void reg_load(void)
         return;
     g_reg_loaded = 1;
     char path[1100];
-    reg_file(path, sizeof path);
+    if (!reg_file_read(path, sizeof path))
+        return;
     FILE *f = fopen(path, "r");
     if (!f)
         return;
     char line[2048];
     while (fgets(line, sizeof line, f) && g_nvals < MAX_VALUES) {
         reg_value *v = &g_vals[g_nvals];
-        char hex[1100];
+        char hex[1100] = "";
         if (sscanf(line, "%255[^\t]\t%127[^\t]\t%u\t%1099s", v->key, v->name, &v->type, hex) < 3)
             continue;
         if (!strcmp(v->name, "@"))
             v->name[0] = 0;
         v->size = 0;
         for (const char *p = hex; p[0] && p[1] && v->size < sizeof v->data; p += 2) {
-            unsigned b;
-            sscanf(p, "%2x", &b);
+            unsigned b = 0;
+            if (sscanf(p, "%2x", &b) != 1)
+                break;
             v->data[v->size++] = (u8)b;
         }
         g_nvals++;
@@ -115,9 +121,13 @@ static void reg_load(void)
 
 static void reg_save(void)
 {
-    char path[1100];
-    reg_file(path, sizeof path);
-    FILE *f = fopen(path, "w");
+    char path[1100], tmp[1120];
+    if (!reg_file_write(path, sizeof path))
+        return;
+    int n = snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    if (n < 0 || (size_t)n >= sizeof tmp)
+        return;
+    FILE *f = fopen(tmp, "wb");
     if (!f)
         return;
     for (int i = 0; i < g_nvals; i++) {
@@ -127,7 +137,23 @@ static void reg_save(void)
             fprintf(f, "%02x", v->data[k]);
         fprintf(f, "\n");
     }
-    fclose(f);
+    int err = ferror(f) != 0;
+    if (fclose(f) != 0)
+        err = 1;
+    if (err) {
+        remove(tmp);
+        return;
+    }
+    // Атомарная замена на POSIX; если ФС (например, Switch fsdev) не даёт переименовать поверх существующего
+    // файла, удаляем старый и повторяем rename.
+    if (rename(tmp, path) != 0) {
+        remove(path);
+        if (rename(tmp, path) != 0) {
+            remove(tmp);
+            return;
+        }
+    }
+    vfs_changed();
 }
 
 static int key_exists(const char *path)
@@ -250,7 +276,7 @@ void hle_advapi32_RegSetValueExA(CPU *c)
 }
 
 // ================================================================ winmm
-void hle_winmm_timeGetTime(CPU *c) { HLE_ENTER("timeGetTime", 0); RET(0, (u32)(rt_ticks_ns() / 1000000u)); }
+void hle_winmm_timeGetTime(CPU *c) { HLE_ENTER("timeGetTime", 0); RET(0, (u32)(rt_guest_ticks_ns() / 1000000u)); }
 void hle_winmm_timeBeginPeriod(CPU *c) { HLE_ENTER("timeBeginPeriod", 1); RET(1, 0); }
 void hle_winmm_timeEndPeriod(CPU *c) { HLE_ENTER("timeEndPeriod", 1); RET(1, 0); }
 

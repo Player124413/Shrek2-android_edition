@@ -17,6 +17,9 @@ void d3d8_movie_frame(u32 dest, u32 pitch, u32 x, u32 y, u32 w, u32 h);
 // Счётчик кадров поверх картинки (Snx.ini [Overlay] ShowFPS, на ходу — кнопкой)
 void d3d8_set_fps_overlay(int on);
 int d3d8_fps_overlay(void);
+// Режим 4:3-pillarbox для страниц меню на широком экране (выключен по умолчанию; согласован с 3D-камерой и вводом)
+void d3d8_set_menu_aspect(int on);
+int d3d8_menu_aspect(void);
 // Заставка загрузки до создания устройства: картинка BGRX w x h, строки снизу вверх с шагом stride
 void d3d8_splash(const u8 *bgrx, int w, int h, u32 stride);
 

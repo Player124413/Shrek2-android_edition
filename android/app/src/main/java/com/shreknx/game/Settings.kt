@@ -118,7 +118,6 @@ class Settings(private val ctx: Context) {
         env("SNX_LOOK_SENS", "%.2f".format(java.util.Locale.ROOT, lookSensitivity))  // и камера правым стиком
         env("SNX_PAD_CAMERA", if (padCamera == 1) "joystick" else "mouse")
         if (cheats) env("SNX_CHEATS", "1")
-        env("SNX_SHADER_CACHE", File(ctx.cacheDir, "shaders").absolutePath)
         // копия game.exe и .dll во внутренней памяти (runtime/loader.c): их не удалит очистка или антивирус
         env("SNX_MODULE_DIR", moduleDir(ctx).apply { mkdirs() }.absolutePath)
         val tahoma = File(gameDir, "System/tahoma.ttf")

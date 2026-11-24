@@ -32,6 +32,73 @@ void ovr_launch_file_write(CPU *c)
     c->esp += 12;  // thiscall, два аргумента: ret 8
 }
 
+// ---------------------------------------------------------------- чтение файла (game.exe)
+// FArchiveFileReader::Serialize(V, Length) (game.exe!0x10908610): копия из буфера 1 КБ архива; когда данных в
+// буфере не хватает — виртуальный Precache (game.exe!0x10908550, ReadFile) или прямое чтение ReadFile (>= 1 КБ)
+// в оригинале. При загрузке пакетов UE2 читает так каждое поле по 1–4 байта; всё, что помещается в буфер,
+// копируется здесь без вызовов гостя. SNX_AR_CHECK=1 — каждое попадание сверяется с оригиналом.
+#define FR_POS 0x4Cu
+#define FR_BUF_BASE 0x50u
+#define FR_BUF_COUNT 0x54u
+#define FR_BUF 0x58u
+#define FR_BUF_SIZE 0x400u
+
+extern void (*const ovr_orig_ovr_launch_file_read)(CPU *c);
+
+static inline int ar_check(void)  // SNX_AR_CHECK=1: сверка чтения архива с оригиналом
+{
+    static int v = -1;
+    if (v < 0)
+        v = getenv("SNX_AR_CHECK") != NULL;
+    return v;
+}
+
+void ovr_launch_file_read(CPU *c)
+{
+    u8 *m = g_mem;
+    u32 ar = c->ecx, v = rd32(m, c->esp + 4);
+    s32 len = (s32)rd32(m, c->esp + 8);
+    if (len <= 0) {
+        if (ar_check()) {
+            u32 sp = c->esp;
+            RT_ENTER_GEN(c, ovr_orig_ovr_launch_file_read);  // оригинал — код гостя
+            if (c->esp != sp + 12)
+                fprintf(stderr, "[launch] SNX_AR_CHECK: FileReader::Serialize(len=%d) esp mismatch\n", len);
+            return;
+        }
+        c->esp += 12;  // thiscall, два аргумента: ret 8
+        return;
+    }
+    if (ar > RT_WINDOW - (FR_BUF + FR_BUF_SIZE) || v > RT_WINDOW || (u64)len > (u64)RT_WINDOW - v) {
+        RT_ENTER_GEN(c, ovr_orig_ovr_launch_file_read);  // вне окна гостя — оригинал
+        return;
+    }
+    s64 pos = (s32)rd32(m, ar + FR_POS);
+    s64 base = (s32)rd32(m, ar + FR_BUF_BASE);
+    s64 cnt = (s32)rd32(m, ar + FR_BUF_COUNT);
+    s64 off = pos - base;
+    if (off < 0 || cnt < 0 || cnt > (s64)FR_BUF_SIZE || (s64)len > cnt - off) {
+        RT_ENTER_GEN(c, ovr_orig_ovr_launch_file_read);  // буфер пуст или не хватает байт — оригинал
+        return;
+    }
+    if (ar_check()) {
+        u8 want[FR_BUF_SIZE];
+        memcpy(want, m + ar + FR_BUF + (u32)off, (u32)len);
+        u32 want_pos = (u32)(pos + len), sp = c->esp;
+        RT_ENTER_GEN(c, ovr_orig_ovr_launch_file_read);  // оригинал — код гостя
+        u32 got_pos = rd32(m, ar + FR_POS);
+        if (c->esp != sp + 12 || got_pos != want_pos || memcmp(m + v, want, (u32)len) != 0)
+            fprintf(stderr, "[launch] SNX_AR_CHECK: FileReader::Serialize mismatch (pos %u vs %u, len %d)\n",
+                    want_pos, got_pos, len);
+        return;
+    }
+    memmove(m + v, m + ar + FR_BUF + (u32)off, (u32)len);
+    u32 new_pos = (u32)(pos + len);
+    wr32(m, ar + FR_POS, new_pos);
+    c->eax = new_pos;  // как в оригинале (game.exe!0x109086a9)
+    c->esp += 12;      // thiscall, два аргумента: ret 8
+}
+
 // ---------------------------------------------------------------- размер файла (game.exe)
 // FFileManagerWindows::FileSize(Filename): CreateFile на чтение, GetFileSize, CloseHandle. CreateFileWriter зовёт её
 // перед каждой записью (SaveConfig — на каждой монете бонусного уровня), а открытие на Switch — запросы к файловому

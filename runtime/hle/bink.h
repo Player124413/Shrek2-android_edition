@@ -20,7 +20,7 @@ void bink_video_free(bink_video *v);
 void bink_video_flush(bink_video *v);  // перед декодированием не следующего кадра (с ключевого)
 int bink_video_decode(bink_video *v, const u8 *packet, u32 size, int key);  // 0 — кадр готов
 // декодировать в фоне пакет, который следующим придёт в bink_video_decode (кадр за последним декодированным);
-// пакет должен жить до bink_video_decode/flush/free
+// пакет копируется (буфер frame_data можно переиспользовать сразу)
 void bink_video_prefetch(bink_video *v, const u8 *packet, u32 size, int key);
 // средние мс декодирования и ожидания фонового декодирования на кадр с прошлого вызова, кадров (сбрасывает)
 void bink_video_stats(bink_video *v, double *dec_ms, double *wait_ms, u32 *frames);

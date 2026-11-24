@@ -1,9 +1,12 @@
 // Виртуальная память гостя (VirtualAlloc и т. п.). Карта — recomp/addrmap.json: выделения без адреса идут
 // в «низкую» арену (стеки, служебное) и в арену кучи; образы модулей — отдельные области MEM_IMAGE.
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 #include "runtime/vmem.h"
 
 #include <pthread.h>
-#if defined(__APPLE__) || defined(__ANDROID__)
+#if defined(__APPLE__) || defined(__linux__)
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -59,15 +62,31 @@ void vm_zero(u32 addr, u32 size)
 {
     if (!size)
         return;
-#if defined(__APPLE__) || defined(__ANDROID__)
-    // целые страницы хоста заменяем свежим анонимным отображением: нули и возврат памяти системе
-    size_t pg = (size_t)getpagesize();
-    size_t lo = ((size_t)addr + pg - 1) & ~(pg - 1), hi = ((size_t)addr + size) & ~(pg - 1);
-    if (hi > lo && mmap(g_mem + lo, hi - lo, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) !=
-                       MAP_FAILED) {
-        memset(g_mem + addr, 0, lo - addr);
-        memset(g_mem + hi, 0, addr + size - hi);
-        return;
+#if defined(__APPLE__) || defined(__linux__)
+    // целые страницы хоста сбрасываем: нули и возврат физических страниц системе
+    long p = sysconf(_SC_PAGESIZE);
+    size_t pg = p > 0 ? (size_t)p : 4096u;
+    if (((uintptr_t)g_mem & (pg - 1)) == 0) {
+        size_t lo = ((size_t)addr + pg - 1) & ~(pg - 1);
+        size_t hi = ((size_t)addr + size) & ~(pg - 1);
+        if (hi > lo) {
+            int done = 0;
+#if defined(__linux__)
+            // на Linux MADV_DONTNEED для анонимного отображения сразу отдаёт нули и не дробит VMA
+            done = madvise(g_mem + lo, hi - lo, MADV_DONTNEED) == 0;
+            if (!done)
+                done = mmap(g_mem + lo, hi - lo, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1,
+                            0) != MAP_FAILED;
+#else
+            done = mmap(g_mem + lo, hi - lo, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) !=
+                   MAP_FAILED;
+#endif
+            if (done) {
+                memset(g_mem + addr, 0, lo - addr);
+                memset(g_mem + hi, 0, (size_t)addr + size - hi);
+                return;
+            }
+        }
     }
 #endif
     memset(g_mem + addr, 0, size);
@@ -161,6 +180,8 @@ int vm_free(u32 addr, u32 size, u32 type)
             g_kind[k] = G_FREE;
         ok = 1;
     } else if (type & VM_MEM_DECOMMIT) {
+        if (size && (u64)addr + size > end)
+            goto out;
         u32 lo = size ? addr & ~(PAGE - 1) : base, hi = size ? (addr + size + PAGE - 1) & ~(PAGE - 1) : end;
         if (hi > end)
             goto out;

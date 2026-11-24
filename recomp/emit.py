@@ -6,6 +6,8 @@
 * флаги — сливаются с jcc/setcc/cmovcc (fa/fb/fr сеттера) или материализуются в cf/zf/... по живости;
 * x87 — статическая глубина стека, ST(i) — локальные double f0..f7.
 """
+import os
+
 from discover import TERMINATORS
 from flags import (ALL, A, C, CC_READS, FUSABLE, NAMES, O, P, S, Z, flag_info, jcc_cc, liveness, plan)
 import regs
@@ -18,6 +20,82 @@ UNSIGNED = {1: "u8", 2: "u16", 4: "u32"}
 SIGNBIT = {1: 0x80, 2: 0x8000, 4: 0x80000000}
 # [рег ± d] с |d| меньше — поле структуры или слот кадра: адрес без заворота (FuncCompiler.ha); больше — адрес таблицы
 SMALL_DISP = 0x10000
+REP_INLINE_MAX = 16  # согласовано с REP_INLINE_MAX в runtime/gen_rt.h
+
+
+def fpu_single_mode():
+    """Режим 24-битной мантиссы x87 (SNX_FPU_SINGLE=1, как на ПК после создания D3D8 без FPU_PRESERVE)."""
+    return os.environ.get("SNX_FPU_SINGLE") == "1"
+
+
+def fpu_float32_mode():
+    """Нативные float f0..f7 в чистых f32-функциях (опция SNX_FPU_FLOAT32=1 для Switch/релиза).
+    По умолчанию выключена (0), чтобы не давать 24-бит vs 53-бит расхождений в difftest (same_float 1e-12)."""
+    if fpu_single_mode():
+        return False
+    return os.environ.get("SNX_FPU_FLOAT32") == "1"
+
+
+# Биты отношения (fx, fy) для слияния x87-сравнений: 1=GT (fx>fy), 2=LT (fx<fy), 4=EQ (fx==fy), 8=UN (NaN).
+# Каждая комбинация отображается в точное C-выражение по семантике IEEE-754 (без PARITY/NEON-popcnt).
+_X87_REL_EXPR = {
+    0x0: "0",
+    0x1: "(fx > fy)",
+    0x2: "(fx < fy)",
+    0x3: "(fx < fy || fx > fy)",
+    0x4: "(fx == fy)",
+    0x5: "(fx >= fy)",
+    0x6: "(fx <= fy)",
+    0x7: "(!__builtin_isunordered(fx, fy))",
+    0x8: "(__builtin_isunordered(fx, fy))",
+    0x9: "(!(fx <= fy))",
+    0xA: "(!(fx >= fy))",
+    0xB: "(fx != fy)",
+    0xC: "(!(fx < fy) && !(fx > fy))",
+    0xD: "(!(fx < fy))",
+    0xE: "(!(fx > fy))",
+    0xF: "1",
+}
+
+# Значения AH = fsw >> 8 после FCOM(fx, fy): GT=0x00, LT=0x01 (C0), EQ=0x40 (C3), UN=0x45 (C3|C2|C0).
+_X87_AH_RELS = ((1, 0x00), (2, 0x01), (4, 0x40), (8, 0x45))
+
+
+def _eval_cc(cc, cf, pf, zf, sf, of):
+    return {
+        "o": bool(of), "no": not of, "b": bool(cf), "ae": not cf,
+        "e": bool(zf), "ne": not zf, "be": bool(cf or zf), "a": not (cf or zf),
+        "s": bool(sf), "ns": not sf, "p": bool(pf), "np": not pf,
+        "l": sf != of, "ge": sf == of, "le": bool(zf or (sf != of)), "g": (not zf) and (sf == of),
+    }[cc]
+
+
+def _x87_test_cond(mask, cc):
+    """Точное C-условие для `fcom*; fnstsw ax; test ah, mask; jcc/setcc/cmovcc` (при mask & ~0x45 == 0)."""
+    if (mask & ~0x45) != 0 or cc not in CC_READS:
+        return None
+    bits = 0
+    for rel_bit, ah in _X87_AH_RELS:
+        v = ah & mask
+        zf = int(v == 0)
+        pf = int(bin(v).count("1") % 2 == 0)
+        if _eval_cc(cc, 0, pf, zf, 0, 0):
+            bits |= rel_bit
+    return _X87_REL_EXPR[bits]
+
+
+def _x87_sahf_cond(cc, allow_of=False):
+    """Точное C-условие для `fcom*; fnstsw ax; sahf; jcc` (allow_of=False) и `fcomi*; jcc` (allow_of=True)."""
+    if cc not in CC_READS or (not allow_of and (CC_READS[cc] & O)):
+        return None
+    bits = 0
+    for rel_bit, ah in _X87_AH_RELS:
+        cf = ah & 1
+        pf = (ah >> 2) & 1
+        zf = (ah >> 6) & 1
+        if _eval_cc(cc, cf, pf, zf, 0, 0):
+            bits |= rel_bit
+    return _X87_REL_EXPR[bits]
 
 
 class EmitError(Exception):
@@ -29,10 +107,12 @@ def hx(v):
 
 
 class FuncCompiler:
-    def __init__(self, mod, func, ctx):
+    def __init__(self, mod, func, ctx, fpu_single=None, fpu_float32=None):
         self.mod = mod
         self.f = func
         self.ctx = ctx  # общий контекст: резолв вызовов, сводки x87, оверрайды
+        self.fpu_single = fpu_single_mode() if fpu_single is None else bool(fpu_single)
+        self.fpu_float32 = (fpu_float32_mode() if fpu_float32 is None else bool(fpu_float32)) and not self.fpu_single
         self.entry = func.entry
         self.addrs = func.insns
         self.ins = {a: mod.insns[a] for a in self.addrs}
@@ -40,6 +120,12 @@ class FuncCompiler:
         self.errors = []
         self.uses = set()  # какие локальные нужны (флаги, fa/fb/fr, df, fsw, f0..)
         self.max_depth = 0
+        self.has_switch = False
+        self.const_regs = {}
+        self.use_f32 = False
+        self.x87_fused_cmp = {}  # addr fcom*/comi -> need_fsw (bool)
+        self.x87_skip = set()    # адреса fnstsw/test ah/sahf, полностью убранных слиянием
+        self.x87_cond = {}       # addr потребителя (jcc/setcc/cmovcc/fcmov) -> C-выражение на fx/fy
 
     # ================================================================ анализ
     def succ_of(self, ins):
@@ -75,6 +161,314 @@ class FuncCompiler:
         self.mat, self.fused, self.fused_used = plan(self.addrs, self.succ, self.finfo, self.live_in,
                                                      self.live_out, self.preds)
         self.x87_analyze()
+        self.use_f32 = self.detect_pure_f32()
+        self.plan_x87_fusion()
+
+    def detect_pure_f32(self):
+        """Чистая f32-функция: x87 работает только с float (dword/i16/i32) и базовой арифметикой без f64/f80/i64/libm."""
+        if not self.fpu_float32 or self.max_depth == 0 or self.x87_bad:
+            return False
+        if self.mod.img.name.lower() == "msvcr70.dll":
+            return False
+        f32_fmts = ("f32", "i16", "i32")
+        f32_st_fmts = ("f32", "i16", "i32", "i16t", "i32t")
+        f32_intr = ("_CIsqrt", "_ftol", "_ftol2", "_ftol2_sse")
+        for a in self.addrs:
+            ins = self.ins[a]
+            if ins.x87:
+                op = self.x87op(ins)
+                k = op.kind
+                if k == "ld_mem" or k == "cmp_mem":
+                    if op.args[0] not in f32_fmts:
+                        return False
+                elif k == "arith_mem":
+                    if op.args[1] not in f32_fmts:
+                        return False
+                elif k == "st_mem":
+                    if op.args[0] not in f32_st_fmts:
+                        return False
+                elif k == "ld_const":
+                    if op.args[0] not in ("0", "1"):
+                        return False
+                elif k == "unary":
+                    if op.args[0] not in ("chs", "abs", "sqrt"):
+                        return False
+                elif k not in ("ld_st", "st_st", "fxch", "arith_st", "cmp_st", "ftst", "comi",
+                               "fnstsw_ax", "fnstsw_mem", "fcmov", "nop", "ffree"):
+                    return False
+            elif ins.mnem == "call":
+                info = self.ctx.call_info(self.mod, ins)
+                if info.intrinsic and info.intrinsic not in f32_intr:
+                    return False
+            elif ins.mnem == "jmp" or ins.is_jcc():
+                t = ins.branch_target()
+                if t is not None and self.mod.is_tail(self.entry, ins, t):
+                    info = self.ctx.target_info(self.mod, t)
+                    if info.intrinsic and info.intrinsic not in f32_intr:
+                        return False
+                elif t is None and ins.addr not in self.mod.jump_tables:
+                    imp = self.mod.iat_import(ins)
+                    if imp is not None:
+                        info = self.ctx.import_info(self.mod, imp)
+                        if info.intrinsic and info.intrinsic not in f32_intr:
+                            return False
+        return True
+
+    def _is_fsw_writer(self, ins):
+        if not ins.x87:
+            return False
+        op = self.x87op(ins)
+        return op.kind in ("cmp_mem", "cmp_st", "ftst", "fxam", "comi") or (
+            op.kind == "bin" and op.args[0] in ("fprem", "fprem1")
+        )
+
+    def _is_fsw_reader(self, ins):
+        if not ins.x87:
+            return False
+        return self.x87op(ins).kind in ("fnstsw_ax", "fnstsw_mem")
+
+    def _step_linear(self, a):
+        """Следующая инструкция линейного участка (один преемник в функции с единственным предшественником)."""
+        ins = self.ins[a]
+        if ins.mnem in ("call", "jmp", "ret") or ins.mnem in TERMINATORS or ins.is_jcc() or ins.is_loop():
+            return None
+        nx = self.succ[a]
+        if len(nx) != 1 or nx[0] not in self.ins:
+            return None
+        if len(self.preds.get(nx[0], ())) != 1:
+            return None
+        return nx[0]
+
+    def _cond_cc_of(self, ins):
+        cc = jcc_cc(ins)
+        if cc is not None:
+            return cc
+        if ins.x87:
+            op = self.x87op(ins)
+            if op.kind == "fcmov":
+                return op.args[0]
+        return None
+
+    def _liveness_1bit(self, rw_fn, exit_live):
+        """Обратная 1-битная живость по CFG функции -> live_out: addr -> bool."""
+        lin = {a: False for a in self.addrs}
+        lout = {a: False for a in self.addrs}
+        work = list(self.addrs)
+        inw = set(work)
+        while work:
+            a = work.pop()
+            inw.discard(a)
+            seq = self.succ[a]
+            out = exit_live if not seq else False
+            for s in seq:
+                if s not in lin:
+                    if exit_live:
+                        out = True
+                elif lin[s]:
+                    out = True
+            rd, kill = rw_fn(self.ins[a])
+            ni = rd or (out and not kill)
+            lout[a] = out
+            if ni != lin[a]:
+                lin[a] = ni
+                for p in self.preds.get(a, ()):
+                    if p not in inw:
+                        inw.add(p)
+                        work.append(p)
+        return lout
+
+    def _ax_rw(self, ins):
+        """Консервативное (reads_ax, kills_all_16bits_of_ax) для безопасного удаления fnstsw ax (пишет только ax)."""
+        m = ins.mnem
+        ops = ins.ops
+        if m == "call":
+            return True, False
+        if ins.x87 and self.x87op(ins).kind == "fnstsw_ax":
+            return False, True
+        if m in ("xor", "sub") and len(ops) == 2 and ops[0].kind == "r" and ops[1].kind == "r":
+            if ops[0].reg in ("eax", "ax") and ops[0].reg == ops[1].reg:
+                return False, True
+        r, _ = regs.effects(ins)
+        rd = bool(r & regs.EAX)
+        if m in ("mov", "movzx", "movsx", "lea", "pop") and ops and ops[0].kind == "r" and ops[0].reg in ("eax", "ax"):
+            return rd, True
+        if m == "rdtsc":
+            return False, True
+        return rd, False
+
+    def plan_x87_fusion(self):
+        """Слияние цепочек `fcom*/ftst -> fnstsw ax -> (test ah, imm | sahf) -> jcc/setcc/cmovcc` и `fcomi* -> jcc`
+        в прямые C-сравнения `fx/fy` (убирает FCOM + PARITY/NEON-popcnt; fnstsw ax опускается, только если eax мёртв)."""
+        self.x87_fused_cmp = {}
+        self.x87_skip = set()
+        self.x87_cond = {}
+        if self.x87_bad or self.max_depth == 0:
+            return
+        cmps = []
+        for a in self.addrs:
+            ins = self.ins[a]
+            if ins.x87:
+                k = self.x87op(ins).kind
+                if k in ("cmp_mem", "cmp_st", "ftst", "comi"):
+                    cmps.append((a, k))
+        if not cmps:
+            return
+        fsw_out = self._liveness_1bit(lambda i: (self._is_fsw_reader(i), self._is_fsw_writer(i)), False)
+        ax_out = self._liveness_1bit(self._ax_rw, True)
+
+        def collect_linear_consumers(start_a, mask_written, allow_of):
+            """Собрать все потребители флагов из mask_written, достижимые от start_a по линейной цепочке."""
+            pending = self.live_out[start_a] & mask_written
+            if not pending:
+                return None
+            cur = start_a
+            cons = []
+            for _ in range(16):
+                if not pending:
+                    break
+                live_succs = [x for x in self.succ[cur] if self.live_in.get(x, 0) & pending]
+                if not live_succs:
+                    pending = 0
+                    break
+                if len(live_succs) != 1:
+                    return None  # флаги уходят в несколько веток
+                cont = live_succs[0]
+                if len(self.preds.get(cont, ())) != 1 or cont not in self.finfo:
+                    return None
+                ins_j = self.ins[cont]
+                if self._is_fsw_writer(ins_j):
+                    return None
+                jr, jw, jkind = self.finfo[cont]
+                if jr & pending:
+                    if jkind != "cond" or (jr & ~mask_written) != 0:
+                        return None
+                    cc = self._cond_cc_of(ins_j)
+                    expr = _x87_sahf_cond(cc, allow_of=allow_of)
+                    if expr is None:
+                        return None
+                    cons.append((cont, expr))
+                if jw:
+                    pending &= ~jw
+                pending &= self.live_out[cont]
+                cur = cont
+            if pending or not cons:
+                return None
+            return cons
+
+        for a, kind in cmps:
+            if kind == "comi":
+                cons = collect_linear_consumers(a, ALL, allow_of=True)
+                if cons:
+                    self.x87_fused_cmp[a] = False
+                    self.mat.pop(a, None)
+                    for ca, expr in cons:
+                        self.x87_cond[ca] = expr
+                        self.fused.pop(ca, None)
+                continue
+
+            # 1) Найти fnstsw ax в том же базовом блоке
+            cur = a
+            a_fn = None
+            for _ in range(8):
+                nx = self._step_linear(cur)
+                if nx is None:
+                    break
+                ni = self.ins[nx]
+                if ni.x87 and self.x87op(ni).kind == "fnstsw_ax":
+                    a_fn = nx
+                    break
+                if self._is_fsw_writer(ni) or self._is_fsw_reader(ni):
+                    break
+                cur = nx
+            if a_fn is None:
+                continue
+
+            # 2) Найти test ah, imm8 или sahf после fnstsw ax в том же базовом блоке
+            cur = a_fn
+            a_tst = None
+            tst_mask = None
+            mid_reads_eax = False
+            for _ in range(8):
+                nx = self._step_linear(cur)
+                if nx is None:
+                    break
+                ni = self.ins[nx]
+                if (ni.mnem == "test" and len(ni.ops) == 2 and ni.ops[0].kind == "r" and ni.ops[0].reg == "ah"
+                        and ni.ops[1].kind == "i" and ((ni.ops[1].imm & 0xFF) & ~0x45) == 0):
+                    a_tst = nx
+                    tst_mask = ni.ops[1].imm & 0xFF
+                    break
+                if ni.mnem == "sahf":
+                    a_tst = nx
+                    tst_mask = None
+                    break
+                if self._is_fsw_writer(ni) or self._is_fsw_reader(ni):
+                    break
+                er, ew = regs.effects(ni)
+                if ew & regs.EAX:
+                    break
+                if er & regs.EAX:
+                    mid_reads_eax = True
+                cur = nx
+            if a_tst is None:
+                continue
+
+            # 3) Проверить потребителей флагов после test ah / sahf
+            if tst_mask is not None:
+                if a_tst in self.mat:
+                    continue
+                # Идём по той же линейной цепочке, по которой flags.plan() привязал fused-потребителей
+                cons = []
+                fcons = {c for c, s in self.fused.items() if s == a_tst}
+                if not fcons:
+                    continue
+                cur = a_tst
+                ok = True
+                remaining = set(fcons)
+                for _ in range(64):
+                    if not remaining:
+                        break
+                    seq = self.succ[cur]
+                    cont = None
+                    for x in seq:
+                        if len(self.preds.get(x, ())) == 1 and x in self.finfo:
+                            cont = x
+                            break
+                    if cont is None:
+                        ok = False
+                        break
+                    ins_j = self.ins[cont]
+                    if self._is_fsw_writer(ins_j):
+                        ok = False
+                        break
+                    if cont in remaining:
+                        cc = self._cond_cc_of(ins_j)
+                        expr = _x87_test_cond(tst_mask, cc)
+                        if expr is None:
+                            ok = False
+                            break
+                        cons.append((cont, expr))
+                        remaining.discard(cont)
+                    cur = cont
+                if not ok or remaining:
+                    continue
+            else:
+                cons = collect_linear_consumers(a_tst, C | P | A | Z | S, allow_of=False)
+                if not cons:
+                    continue
+
+            # 4) Применить слияние; fnstsw ax опускаем, только если ax гарантированно мёртв после a_tst
+            drop_fnstsw = (not mid_reads_eax) and (not ax_out[a_tst])
+            need_fsw = (not drop_fnstsw) or fsw_out[a_fn]
+            self.x87_fused_cmp[a] = need_fsw
+            if drop_fnstsw:
+                self.x87_skip.add(a_fn)
+            self.x87_skip.add(a_tst)
+            self.fused_used.discard(a_tst)
+            self.mat.pop(a_tst, None)
+            for ca, expr in cons:
+                self.x87_cond[ca] = expr
+                self.fused.pop(ca, None)
 
     # ---------------------------------------------------------------- x87
     def x87_effect(self, ins, depth):
@@ -366,6 +760,9 @@ class FuncCompiler:
 
     def cond(self, a, cc):
         """C-выражение условия cc для потребителя a."""
+        xc = self.x87_cond.get(a)
+        if xc is not None:
+            return xc
         s = self.fused.get(a)
         if s is not None:
             sins = self.ins[s]
@@ -426,6 +823,8 @@ class FuncCompiler:
         self.analyze()
         self.regs_analyze()
         self.setjmps = 0
+        self.has_switch = False
+        self.const_regs = {}
         body = []
         order = self.addrs
         pos = {a: i for i, a in enumerate(order)}
@@ -450,10 +849,14 @@ class FuncCompiler:
             labels.add(self.entry)
             body.append(f"    goto L_{self.entry:08x};")
         self.labels = labels
+        prev_fall = False
         for i, a in enumerate(order):
             ins = self.ins[a]
             if a in labels:
                 body.append(f"L_{a:08x}:; BLK({hx(a)});")
+                self.const_regs.clear()
+            elif not prev_fall:
+                self.const_regs.clear()
             self.cur = a
             self.depth = self.depth_in.get(a, 0)
             try:
@@ -461,17 +864,61 @@ class FuncCompiler:
             except EmitError as e:
                 self.errors.append(f"{a:08x}: {ins.text}: {e}")
                 lines = [f'rt_unimpl(c, {hx(a)}, "{ins.text}"); return;']
+            self.update_const_regs(ins)
             body.append(f"/* {a:08x}: {ins.text} */")
             body.extend("    " + ln for ln in lines)
             # fallthrough
             nxt = ins.next
             falls = self.falls_through(ins)
+            prev_fall = falls and nxt in self.ins and i + 1 < len(order) and order[i + 1] == nxt
             if falls:
                 if nxt not in self.ins:
                     body.append(f'    SPILL(); rt_trap(c, {hx(nxt)}, "fell off decoded code"); return;')
                 elif i + 1 >= len(order) or order[i + 1] != nxt:
                     body.append(f"    goto L_{nxt:08x};")
         return self.wrap(body)
+
+    def update_const_regs(self, ins):
+        """Узкое отслеживание констант в 32-битных регистрах внутри базового блока: нужно, чтобы
+        rep movs/stos под SNX_PIN (где ecx — глобальный регистр x20) получали литеральную длину."""
+        m = ins.mnem
+        ops = ins.ops
+        if m in ("call", "jmp", "ret") or m in TERMINATORS:
+            self.const_regs.clear()
+            return
+        if ins.string_op:
+            w = regs.effects(ins)[1]
+            for r in REG32:
+                if w & regs.BIT[r]:
+                    self.const_regs.pop(r, None)
+            if ins.rep and ins.string_op in ("movs", "stos"):
+                self.const_regs["ecx"] = 0
+            return
+        if m == "mov" and len(ops) == 2 and ops[0].kind == "r" and ops[0].reg in regs.BIT:
+            d, s = ops[0].reg, ops[1]
+            if s.kind == "i":
+                self.const_regs[d] = s.imm & 0xFFFFFFFF
+                return
+            if s.kind == "r" and s.reg in self.const_regs:
+                self.const_regs[d] = self.const_regs[s.reg]
+                return
+        elif m in ("xor", "sub") and len(ops) == 2 and ops[0].kind == "r" and ops[1].kind == "r":
+            if ops[0].reg == ops[1].reg and ops[0].reg in regs.BIT:
+                self.const_regs[ops[0].reg] = 0
+                return
+        elif (m == "shr" and len(ops) == 2 and ops[0].kind == "r" and ops[0].reg in self.const_regs
+              and ops[1].kind == "i"):
+            self.const_regs[ops[0].reg] >>= ops[1].imm & 31
+            return
+        elif (m == "and" and len(ops) == 2 and ops[0].kind == "r" and ops[0].reg in self.const_regs
+              and ops[1].kind == "i"):
+            self.const_regs[ops[0].reg] &= ops[1].imm & 0xFFFFFFFF
+            return
+        w = regs.effects(ins)[1]
+        if w:
+            for r in REG32:
+                if w & regs.BIT[r]:
+                    self.const_regs.pop(r, None)
 
     def falls_through(self, ins):
         m = ins.mnem
@@ -488,8 +935,9 @@ class FuncCompiler:
         # адрес продолжения catch с собственной функцией (на него ссылается mov eax, offset в блоке catch):
         # из _JumpToContinuation (jmp eax) — не вложенный вызов, а longjmp в кадр функции с catch
         e = self.entry
-        return "\n".join([code, f"void {self.ctx.fname(e)}(CPU *c)", "{", "    P_(SPILL();)", f"    rt_eh_continue(c, {hx(e)});",
-                          f"    fc_{e:08x}(c);", "}"])
+        return "\n".join([code, f"void {self.ctx.fname(e)}(SNX_C_PARAM)", "{", "    P_(CPU *restrict c = g_pin_c;)",
+                          "    P_(SPILL();)", f"    rt_eh_continue(c, {hx(e)});",
+                          f"    fc_{e:08x}(SNX_C_ARG);", "}"])
 
     def wrap_body(self, body):
         # restrict: CPU лежит в памяти хоста, память гостя (m) с ним не пересекается — компилятор может не
@@ -500,8 +948,10 @@ class FuncCompiler:
         # esp — 64-битный: push/pop/call/ret/add/sub esp, imm меняют его без заворота через 2^32 (стек гостя через
         # 0 не переходит), и m + esp компилятор считает раз на серию push — каждый слот — смещением инструкции.
         # Любая другая запись в esp — (u32)(...) (wr), чтение в 32-битные переменные усекает само.
-        # G_(...): с закреплёнными регистрами (SNX_PIN, runtime/gen_rt.h) регистры гостя и m — общие, копий нет
-        decl = ["G_(u8 *const m = g_mem;)",
+        # G_(...): с закреплёнными регистрами (SNX_PIN, runtime/gen_rt.h) регистры гостя и m — общие, копий нет;
+        # P_(...): под SNX_PIN указатель CPU *c закреплён в x28 (g_pin_c) и не передаётся через x0.
+        decl = ["P_(CPU *restrict c = g_pin_c;)",
+                "G_(u8 *const m = g_mem;)",
                 "G_(u32 eax = c->eax, ecx = c->ecx, edx = c->edx, ebx = c->ebx, ebp = c->ebp, esi = c->esi, edi = c->edi;)",
                 "G_(u64 esp = c->esp;)"]
         if self.uses & {"fa", "fb", "fr"} or self.fused_used:
@@ -514,13 +964,17 @@ class FuncCompiler:
         if "fsw" in self.uses:
             decl.append("u32 fsw = 0;")
         nf = max(self.max_depth, 0)
+        ft = "float" if self.use_f32 else "double"
         if nf:
-            decl.append("double " + ", ".join(f"f{i} = 0" for i in range(min(nf, 8))) + ";")
+            decl.append(f"{ft} " + ", ".join(f"f{i} = 0" for i in range(min(nf, 8))) + ";")
+        if "fxy" in self.uses:
+            decl.append(f"{ft} fx = 0, fy = 0;")
         if self.setjmps:
             decl.append("rt_jmp " + ", ".join(f"sj{i}" for i in range(self.setjmps)) + ";")
         decl.append(f"ENTER({hx(self.entry)});")
         if not (self.eh_in or self.eh_out):
-            out = [f"void {name}(CPU *restrict c)", "{"]
+            attr = "SNX_NO_JT " if self.has_switch else ""
+            out = [f"{attr}void {name}(SNX_C_PARAM)", "{"]
             out += ["    " + d for d in decl]
             out += body
             out.append("}")
@@ -528,17 +982,21 @@ class FuncCompiler:
         # функция с продолжениями catch: тело — со входом «с продолжения» (регистры — из c после
         # _JumpToContinuation), обёртка держит хостовый кадр для longjmp из rt_call
         cases = [f"case {hx(v)}: goto L_{v:08x};" for v in self.eh_in]
-        cases += [f"case {hx(v)}: G_(SPILL();) fc_{v:08x}(c); return;" for v in self.eh_out]
+        cases += [f"case {hx(v)}: G_(SPILL();) fc_{v:08x}(SNX_C_ARG); return;" for v in self.eh_out]
+        if len(cases) >= 4:
+            self.has_switch = True
         bname = f"fb_{self.entry:08x}"
-        out = [f"static void {bname}(CPU *restrict c, u32 eh_cont)", "{"]
+        attr = "SNX_NO_JT " if self.has_switch else ""
+        out = [f"{attr}static void {bname}(SNX_C_PARAM_COMMA u32 eh_cont)", "{"]
         out += ["    " + d for d in decl]
         # вход с продолжения (после longjmp): закреплённые регистры вернулись к значениям на setjmp — из CPU
         out.append(f"    if (eh_cont) {{ P_(RELOAD();) switch (eh_cont) {{ {' '.join(cases)} }} "
                    f'SPILL(); rt_trap(c, eh_cont, "unknown catch continuation"); return; }}')
         out += body
         out.append("}")
-        out += [f"void {name}(CPU *c)", "{", "    rt_eh_frame eh;", "    P_(SPILL();)", "    rt_eh_enter(c, &eh);",
-                f"    {bname}(c, RT_SETJMP(&eh.j) ? eh.target : 0);", "    rt_eh_leave(&eh);", "}"]
+        out += [f"void {name}(SNX_C_PARAM)", "{", "    P_(CPU *restrict c = g_pin_c;)", "    rt_eh_frame eh;",
+                "    P_(SPILL();)", "    rt_eh_enter(c, &eh);",
+                f"    {bname}(SNX_C_ARG_COMMA RT_SETJMP(&eh.j) ? eh.target : 0);", "    rt_eh_leave(&eh);", "}"]
         return "\n".join(out)
 
     # ------------------------------------------------------------- SPILL/RELOAD
@@ -610,7 +1068,7 @@ class FuncCompiler:
         dirty = self.dirty(regs.ALL if regs.CHECK else touched)
         if info.addr is None:
             return " ".join(p for p in (self.host_sp(dirty), f"{sym}(c);", self.rl(out)) if p)
-        parts = [self.g_(self.sp(dirty)), f"{sym}(c);"]
+        parts = [self.g_(self.sp(dirty)), f"{sym}(SNX_C_ARG);"]
         if regs.CHECK:
             # проверка сводки: регистры вне out цель обязана вернуть такими же (rt_regchk_fail в runtime/rt.c)
             chk = " | ".join(f"(c->{r} != {r} ? {regs.BIT[r]:#x}u : 0u)" for r in REG32
@@ -622,6 +1080,8 @@ class FuncCompiler:
 
     # ------------------------------------------------------------- dispatch
     def emit_insn(self, ins):
+        if ins.addr in self.x87_skip:
+            return []
         if ins.x87:
             return self.emit_x87(ins)
         m = ins.mnem
@@ -1366,7 +1826,7 @@ class FuncCompiler:
         # jmp на интринсик: выполнить его и вернуться за вызывающего (его ret снял бы адрес возврата)
         body = " ".join(self.emit_intrinsic(ins, name))
         pops, pushes = X87_INTRINSICS[name]
-        st = " c->st_ret = f0;" if self.depth - pops + pushes >= 1 else ""
+        st = (" c->st_ret = (double)f0;" if self.use_f32 else " c->st_ret = f0;") if self.depth - pops + pushes >= 1 else ""
         written = regs.INTRINSIC_WRITES.get(name, 0)  # интринсик пишет eax/edx в этом же операторе
         return f"{body} esp += 4u;{st} {self.g_(self.sp(self.dirty() | written))} return;"
 
@@ -1382,7 +1842,7 @@ class FuncCompiler:
         # хвостовой вызов: вызывающий прочитает out этой функции — пишем все грязные, не только touched цели
         if info.addr is None:  # функция хоста: с закреплёнными регистрами вызывающий ждёт их в регистрах
             return f"{self.host_sp(self.dirty())} {sym}(c); P_(RELOAD();) return;"
-        return f"{self.g_(self.sp(self.dirty()))} {sym}(c); return;"
+        return f"{self.g_(self.sp(self.dirty()))} {sym}(SNX_C_ARG); return;"
 
     def i_jmp(self, ins):
         t = ins.branch_target()
@@ -1399,6 +1859,7 @@ class FuncCompiler:
         jt = self.mod.jump_tables.get(ins.addr)
         o = ins.ops[0]
         if jt:
+            self.has_switch = True
             cases = " ".join(f"case {hx(x)}: {self.goto(x)}" for x in dict.fromkeys(jt.targets))
             return [f"{{ u32 t = {self.rd(o, 4)}; switch (t) {{ {cases} default: G_(SPILL();) RT_ICALL(c, t); return; }} }}"]
         return [f"{{ u32 t = {self.rd(o, 4)}; G_(SPILL();) RT_ICALL(c, t); return; }}"]
@@ -1415,16 +1876,30 @@ class FuncCompiler:
             n = self.setjmps
             self.setjmps += 1
             lines.append(f"esp -= 4; st32(m + esp, {ret}); SPILL(); rt_setjmp_register(c, &sj{n}); "
-                         f"if (!RT_SETJMP(&sj{n})) {{ {info.sym}(c); P_(SPILL();) }} RELOAD();")
+                         f"if (!RT_SETJMP(&sj{n})) {{ {info.sym}(SNX_C_ARG); P_(SPILL();) }} RELOAD();")
         elif info.sym is not None:
             lines.append(f"esp -= 4; st32(m + esp, {ret}); " + self.call_stmt(info, self.ctx.inline_sym(info.sym)))
         else:
             o = ins.ops[0]
-            lines.append(f"{{ u32 t = {self.rd(o, 4)}; esp -= 4; st32(m + esp, {ret}); {self.g_(self.sp(self.dirty()))} "
-                         "RT_ICALL(c, t); G_(RELOAD();) }")
+            gn = getattr(self.ctx, "gnatives_base", None)
+            if (gn is not None and o.kind == "m" and o.size == 4 and o.seg in (None, "ds")
+                    and o.base is None and o.index is not None and o.scale == 4):
+                disp = o.disp & 0xFFFFFFFF
+                if gn <= disp < gn + 0x4000 and (disp - gn) % 4 == 0:
+                    base_idx = (disp - gn) >> 2
+                    idx_r = self.r32(o.index)
+                    gi = idx_r if base_idx == 0 else f"(u32)({idx_r} + {base_idx}u)"
+                    lines.append(f"{{ u32 gi_ = {gi}; u32 t = {self.rd(o, 4)}; esp -= 4; st32(m + esp, {ret}); "
+                                 f"{self.g_(self.sp(self.dirty()))} RT_GNATIVE_CALL(c, gi_, t); G_(RELOAD();) }}")
+                else:
+                    lines.append(f"{{ u32 t = {self.rd(o, 4)}; esp -= 4; st32(m + esp, {ret}); {self.g_(self.sp(self.dirty()))} "
+                                 "RT_ICALL(c, t); G_(RELOAD();) }")
+            else:
+                lines.append(f"{{ u32 t = {self.rd(o, 4)}; esp -= 4; st32(m + esp, {ret}); {self.g_(self.sp(self.dirty()))} "
+                             "RT_ICALL(c, t); G_(RELOAD();) }")
         rd = self.call_depth.get(ins.addr, 0)
         if rd:
-            lines.append(f"f{self.depth} = c->st_ret;")
+            lines.append(f"f{self.depth} = (float)c->st_ret;" if self.use_f32 else f"f{self.depth} = c->st_ret;")
             self.max_depth = max(self.max_depth, self.depth + 1)
         if ins.next not in self.succ[ins.addr]:
             lines.append(f'rt_trap(c, {hx(ins.addr)}, "noreturn call returned"); return;')
@@ -1434,7 +1909,7 @@ class FuncCompiler:
         n = ins.ops[0].imm if ins.ops else 0
         lines = [f"esp += {4 + n}u;"]
         if self.depth_in.get(ins.addr, 0) >= 1:
-            lines.append(f"c->st_ret = {self.st(0)};")
+            lines.append(f"c->st_ret = (double){self.st(0)};" if self.use_f32 else f"c->st_ret = {self.st(0)};")
         lines.append(f"{self.g_(self.sp(self.dirty()))} return;")
         return lines
 
@@ -1462,7 +1937,7 @@ class FuncCompiler:
         return ["{ u32 r[4]; rt_cpuid(eax, r); eax = r[0]; ebx = r[1]; ecx = r[2]; edx = r[3]; }"]
 
     def i_rdtsc(self, ins):
-        return ["{ u64 t = rt_rdtsc(); eax = (u32)t; edx = (u32)(t >> 32); }"]
+        return ["{ u64 t = RT_RDTSC(); eax = (u32)t; edx = (u32)(t >> 32); }"]
 
     # ---- строковые операции
     def i_string(self, ins):
@@ -1474,20 +1949,37 @@ class FuncCompiler:
             n = ins.ops[1].size
         if op == "cmps":
             n = ins.ops[0].size
-        self.uses.add("df")
         step = f"(df ? -{n} : {n})"
         acc = {4: "eax", 2: "(eax & 0xFFFFu)", 1: "(eax & 0xFFu)"}[n]
         rdf = {1: "(u32)m[{}]", 2: "(u32)rd16(m, {})", 4: "rd32(m, {})"}[n]
         wrf = {1: "m[{}] = (u8)({});", 2: "wr16(m, {}, (u16)({}));", 4: "wr32(m, {}, {});"}[n]
         if op == "movs":
             if ins.rep:
+                nc = self.const_regs.get("ecx")
+                if nc == 0:
+                    return ["ecx = 0;"]
+                self.uses.add("df")
+                if nc is not None and nc <= REP_INLINE_MAX:
+                    nb = (nc * n) & 0xFFFFFFFF
+                    d = f"(df ? 0u - {nb}u : {nb}u)"
+                    return [f"REP_MOVS(m, esi, edi, {nc}u, {n}, df); esi += {d}; edi += {d}; ecx = 0;"]
                 d = f"(df ? 0u - ecx * {n}u : ecx * {n}u)"
                 return [f"REP_MOVS(m, esi, edi, ecx, {n}, df); esi += {d}; edi += {d}; ecx = 0;"]
+            self.uses.add("df")
             return [wrf.format("edi", rdf.format("esi")) + f" esi += {step}; edi += {step};"]
         if op == "stos":
             if ins.rep:
+                nc = self.const_regs.get("ecx")
+                if nc == 0:
+                    return ["ecx = 0;"]
+                self.uses.add("df")
+                if nc is not None and nc <= REP_INLINE_MAX:
+                    nb = (nc * n) & 0xFFFFFFFF
+                    return [f"REP_STOS(m, edi, {nc}u, {acc}, {n}, df); edi += (df ? 0u - {nb}u : {nb}u); ecx = 0;"]
                 return [f"REP_STOS(m, edi, ecx, {acc}, {n}, df); edi += (df ? 0u - ecx * {n}u : ecx * {n}u); ecx = 0;"]
+            self.uses.add("df")
             return [wrf.format("edi", acc) + f" edi += {step};"]
+        self.uses.add("df")
         if op == "lods":
             if ins.rep:
                 raise EmitError("rep lods")
@@ -1526,6 +2018,10 @@ class FuncCompiler:
         return f"f{d}"
 
     def fmem_read(self, fmt, hp):
+        if self.use_f32:
+            return {
+                "f32": f"ldf32({hp})", "i16": f"(float)(s16)ld16({hp})", "i32": f"(float)(s32)ld32({hp})",
+            }[fmt]
         return {
             "f32": f"(double)ldf32({hp})", "f64": f"ldf64({hp})", "f80": f"rt_f80_to_f64({hp})",
             "i16": f"(double)(s16)ld16({hp})", "i32": f"(double)(s32)ld32({hp})",
@@ -1538,35 +2034,40 @@ class FuncCompiler:
         op = self.x87op(ins)
         k = op.kind
         a = op.args
+        ft = "float" if self.use_f32 else "double"
         if k == "ld_mem":
             fmt, mem = a
             return [f"{self.push_slot()} = {self.fmem_read(fmt, self.ha(mem))};"]
         if k == "ld_st":
             return [f"{self.push_slot()} = {self.st(a[0])};"]
         if k == "ld_const":
-            v = {"1": "1.0", "0": "0.0", "pi": "3.14159265358979323846", "l2t": "3.32192809488736234787",
-                 "l2e": "1.44269504088896340736", "lg2": "0.30102999566398119521",
-                 "ln2": "0.69314718055994530942"}[a[0]]
+            if self.use_f32:
+                v = {"1": "1.0f", "0": "0.0f"}[a[0]]
+            else:
+                v = {"1": "1.0", "0": "0.0", "pi": "3.14159265358979323846", "l2t": "3.32192809488736234787",
+                     "l2e": "1.44269504088896340736", "lg2": "0.30102999566398119521",
+                     "ln2": "0.69314718055994530942"}[a[0]]
             return [f"{self.push_slot()} = {v};"]
         if k == "st_mem":
             fmt, mem, pop = a
             hp = self.ha(mem)
             v = self.st(0)
+            dv = f"(double){v}" if self.use_f32 else v
             if fmt == "f32":
-                return [f"stf32({hp}, (float){v});"]
+                return [f"stf32({hp}, {v});" if self.use_f32 else f"stf32({hp}, (float){v});"]
             if fmt == "f64":
                 return [f"stf64({hp}, {v});"]
             if fmt == "f80":
                 return [f"rt_f64_to_f80({hp}, {v});"]
             if fmt in ("i16", "i32", "i64"):
                 bits = int(fmt[1:])
-                w = {16: f"st16({hp}, (u16)FIST(c, {v}, 16));", 32: f"st32({hp}, (u32)FIST(c, {v}, 32));",
-                     64: f"st64({hp}, (u64)FIST(c, {v}, 64));"}[bits]
+                w = {16: f"st16({hp}, (u16)FIST(c, {dv}, 16));", 32: f"st32({hp}, (u32)FIST(c, {dv}, 32));",
+                     64: f"st64({hp}, (u64)FIST(c, {dv}, 64));"}[bits]
                 return [w]
             if fmt.endswith("t"):  # fisttp — усечение
                 bits = int(fmt[1:-1])
-                return [{16: f"st16({hp}, (u16)FTRUNC({v}, 16));", 32: f"st32({hp}, (u32)FTRUNC({v}, 32));",
-                         64: f"st64({hp}, (u64)FTRUNC({v}, 64));"}[bits]]
+                return [{16: f"st16({hp}, (u16)FTRUNC({dv}, 16));", 32: f"st32({hp}, (u32)FTRUNC({dv}, 32));",
+                         64: f"st64({hp}, (u64)FTRUNC({dv}, 64));"}[bits]]
         if k == "st_st":
             i, pop = a
             if i == 0:
@@ -1576,7 +2077,7 @@ class FuncCompiler:
             i = a[0]
             if i == 0:
                 return []
-            return [f"{{ double t = {self.st(0)}; {self.st(0)} = {self.st(i)}; {self.st(i)} = t; }}"]
+            return [f"{{ {ft} t = {self.st(0)}; {self.st(0)} = {self.st(i)}; {self.st(i)} = t; }}"]
         if k == "arith_mem":
             opn, fmt, mem = a
             return [self.farith(opn, self.st(0), self.st(0), self.fmem_read(fmt, self.ha(mem)))]
@@ -1584,24 +2085,44 @@ class FuncCompiler:
             opn, dst, src, pop = a
             return [self.farith(opn, self.st(dst), self.st(dst), self.st(src))]
         if k in ("cmp_mem", "cmp_st"):
-            self.uses.add("fsw")
             if k == "cmp_mem":
                 fmt, mem, pop = a
                 b = self.fmem_read(fmt, self.ha(mem))
             else:
                 i, pops, unord = a
                 b = self.st(i)
-            return [f"{{ double x = {self.st(0)}, y = {b}; fsw = FCOM(x, y); }}"]
-        if k == "ftst":
+            fcom = "FCOMF" if self.use_f32 else "FCOM"
+            if ins.addr in self.x87_fused_cmp:
+                self.uses.add("fxy")
+                need_fsw = self.x87_fused_cmp[ins.addr]
+                if need_fsw:
+                    self.uses.add("fsw")
+                    return [f"fx = {self.st(0)}; fy = {b}; fsw = {fcom}(fx, fy);"]
+                return [f"fx = {self.st(0)}; fy = {b};"]
             self.uses.add("fsw")
-            return [f"fsw = FCOM({self.st(0)}, 0.0);"]
+            return [f"{{ {ft} x = {self.st(0)}, y = {b}; fsw = {fcom}(x, y); }}"]
+        if k == "ftst":
+            zero = "0.0f" if self.use_f32 else "0.0"
+            fcom = "FCOMF" if self.use_f32 else "FCOM"
+            if ins.addr in self.x87_fused_cmp:
+                self.uses.add("fxy")
+                need_fsw = self.x87_fused_cmp[ins.addr]
+                if need_fsw:
+                    self.uses.add("fsw")
+                    return [f"fx = {self.st(0)}; fy = {zero}; fsw = {fcom}(fx, fy);"]
+                return [f"fx = {self.st(0)}; fy = {zero};"]
+            self.uses.add("fsw")
+            return [f"fsw = {fcom}({self.st(0)}, {zero});"]
         if k == "fxam":
             self.uses.add("fsw")
             return [f"fsw = rt_fxam({self.st(0)});"]
         if k == "comi":
             i, pop = a
+            if ins.addr in self.x87_fused_cmp:
+                self.uses.add("fxy")
+                return [f"fx = {self.st(0)}; fy = {self.st(i)};"]
             mask = self.mat.get(ins.addr, 0)
-            lines = [f"double x = {self.st(0)}, y = {self.st(i)}; int un = (x != x) || (y != y);"]
+            lines = [f"{ft} x = {self.st(0)}, y = {self.st(i)}; int un = (x != x) || (y != y);"]
             for bit, e in ((Z, "(un || x == y)"), (P, "un"), (C, "(un || x < y)"), (O, "0"), (S, "0"), (A, "0")):
                 if mask & bit:
                     lines.append(f"{NAMES[bit]} = {e};")
@@ -1622,7 +2143,11 @@ class FuncCompiler:
         if k == "unary":
             f = a[0]
             v = self.st(0)
-            e = {"chs": f"-{v}", "abs": f"fabs({v})", "sqrt": f"sqrt({v})", "sin": f"X87_TRIG({v}, sin({v}))", "cos": f"X87_TRIG({v}, cos({v}))",
+            if self.use_f32:
+                e = {"chs": f"-{v}", "abs": f"fabsf({v})", "sqrt": f"sqrtf({v})"}[f]
+                return [f"{v} = {e};"]
+            sq = f"(double)(float)sqrt({v})" if self.fpu_single else f"sqrt({v})"
+            e = {"chs": f"-{v}", "abs": f"fabs({v})", "sqrt": sq, "sin": f"X87_TRIG({v}, sin({v}))", "cos": f"X87_TRIG({v}, cos({v}))",
                  "rndint": f"rt_frndint(c, {v})", "f2xm1": f"(exp2({v}) - 1.0)"}[f]
             return [f"{v} = {e};"]
         if k == "binpop":
@@ -1658,18 +2183,26 @@ class FuncCompiler:
     def farith(self, opn, dst, x, y):
         e = {"add": f"{x} + {y}", "mul": f"{x} * {y}", "sub": f"{x} - {y}", "subr": f"{y} - {x}",
              "div": f"{x} / {y}", "divr": f"{y} / {x}"}[opn]
+        if self.fpu_single:
+            return f"{dst} = (double)(float)({e});"
         return f"{dst} = {e};"
 
     def emit_intrinsic(self, ins, name):
         d = self.depth
         s0 = self.st(0)
         if name in ("_ftol", "_ftol2", "_ftol2_sse"):
-            return [f"{{ s64 v = FTRUNC({s0}, 64); eax = (u32)v; edx = (u32)((u64)v >> 32); }}"]
+            dv = f"(double){s0}" if self.use_f32 else s0
+            return [f"{{ s64 v = FTRUNC({dv}, 64); eax = (u32)v; edx = (u32)((u64)v >> 32); }}"]
         s1 = self.st(1) if d >= 2 else None
         two = {"_CIpow": f"{s1} = crt_pow({s1}, {s0});", "_CIfmod": f"{s1} = crt_fmod({s1}, {s0});",
                "_CIatan2": f"{s1} = crt_atan2({s1}, {s0});"}
         if name in two:
             return [two[name]]
+        if name == "_CIsqrt":
+            if self.use_f32:
+                return [f"{s0} = sqrtf({s0});"]
+            if self.fpu_single:
+                return [f"{s0} = (double)(float)sqrt({s0});"]
         fn = {"_CIsin": "sin", "_CIcos": "cos", "_CItan": "tan", "_CIasin": "asin", "_CIacos": "acos",
               "_CIatan": "atan", "_CIsinh": "sinh", "_CIcosh": "cosh", "_CItanh": "tanh", "_CIexp": "crt_exp",
               "_CIlog": "log", "_CIlog10": "log10", "_CIsqrt": "sqrt"}[name]

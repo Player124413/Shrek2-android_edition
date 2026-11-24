@@ -5,12 +5,13 @@ import subprocess
 import sys
 
 
-LOCAL_ROOTS = {"game", "shrek2rus", "original", "build", "shots", "gen", "generated"}
+LOCAL_ROOTS = {"game", "shrek2rus", "original", "build", "shots", "shot-ref", "userdata", "gen", "generated"}
 LOCAL_SUFFIXES = {
     ".exe", ".dll", ".nro", ".nso", ".elf", ".nacp", ".o", ".a", ".dylib",
     ".zip", ".iso", ".img", ".ccd", ".cue", ".sub", ".7z", ".rar",
-    ".u", ".unr", ".utx", ".usx", ".ukx", ".uax", ".rus_uax", ".bik", ".ogg", ".usa",
+    ".u", ".unr", ".utx", ".usx", ".ukx", ".uax", ".rus_uax", ".bik", ".ogg", ".usa", ".sav",
     ".gcda", ".gcno", ".log", ".dmp", ".pem", ".key",
+    ".png", ".bmp", ".jpg", ".jpeg",
 }
 
 
@@ -23,10 +24,11 @@ def path_problem(name):
     if (p.parts[0] in LOCAL_ROOTS or ".venv" in p.parts or "__pycache__" in p.parts
             or p.parts[:2] in (("tools", "llvm"), ("tools", "ghidra"))):
         return "локальный каталог"
-    if p.suffix in LOCAL_SUFFIXES or p.name == ".ds_store" or p.name.startswith(".env"):
+    if (p.suffix in LOCAL_SUFFIXES or p.name == ".ds_store" or p.name.startswith(".env")
+            or p.name.startswith("snx.log")):
         return "локальный артефакт или настройки"
     if (p.parts[:2] == ("docs", "recon") and p.suffix == ".txt") or (
-            len(p.parts) == 1 and p.suffix == ".txt" and p.name.startswith(("nxlink", "prof"))):
+            len(p.parts) == 1 and p.suffix == ".txt" and p.name.startswith(("nxlink", "prof", "crash"))):
         return "локальный отчёт или трасса"
     return None
 

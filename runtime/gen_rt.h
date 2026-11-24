@@ -1,12 +1,14 @@
 // Макросы и хелперы, которые использует сгенерированный рекомпилятором C.
 #pragma once
 
-// Закреплённые регистры (SNX_PIN, Switch/GCC; runtime/abi.h): регистры гостя — глобальные регистровые переменные,
-// общие для всех функций гостя, а не локальные копии из CPU. Объявление — раньше любого определения функции в
-// файле (иначе GCC — ошибка), поэтому до include и на встроенных типах. Порядок — как в трамплине rt_pin_enter
-// (runtime/rt.c). G_(...) — обмен с CPU, нужный только без закрепления (вход/выход функции, вокруг вызова
-// функции гостя), P_(...) — только с ним (вокруг вызова рантайма, который зовёт код гостя сам).
+// Закреплённые регистры (SNX_PIN, Switch/GCC; runtime/abi.h): регистры гостя (x19–x26), база памяти m (x27)
+// и указатель на состояние потока CPU *g_pin_c (x28) — глобальные регистровые переменные, общие для всех
+// функций гостя (c не передаётся через x0 и не сохраняется в прологах/эпилогах нелистовых функций).
+// Объявление — раньше любого определения функции в файле (иначе GCC — ошибка), поэтому до include и на
+// встроенных типах + forward-объявлении struct CPU. Порядок — как в трамплине rt_pin_enter (runtime/rt.c).
+// G_(...) — обмен с CPU, нужный только без закрепления, P_(...) — только с ним.
 #ifdef SNX_PIN
+struct CPU;
 register unsigned int eax __asm__("x19");
 register unsigned int ecx __asm__("x20");
 register unsigned int edx __asm__("x21");
@@ -16,14 +18,34 @@ register unsigned int ebp __asm__("x24");
 register unsigned int esi __asm__("x25");
 register unsigned int edi __asm__("x26");
 register unsigned char *m __asm__("x27");
+register struct CPU *g_pin_c __asm__("x28");
 #define G_(...)
 #define P_(...) __VA_ARGS__
+#define SNX_C_PARAM void
+#define SNX_C_ARG
+#define SNX_C_PARAM_COMMA
+#define SNX_C_ARG_COMMA
+#define SNX_GUEST_FN(fn) ((guest_fn)(void (*)(void))(fn))
 #else
 #define G_(...) __VA_ARGS__
 #define P_(...)
+#define SNX_C_PARAM CPU *restrict c
+#define SNX_C_ARG c
+#define SNX_C_PARAM_COMMA CPU *restrict c,
+#define SNX_C_ARG_COMMA c,
+#define SNX_GUEST_FN(fn) (fn)
 #endif
 
 #include "runtime/crt_math.h"
+
+// Для функций со switch (t) (jump-таблицы x86): на aarch64 GCC с -freorder-blocks-and-partition таблицы переходов
+// в .rodata не собираются при разнесении меток между .text и .text.unlikely. Отключаем таблицы переходов только у
+// самих функций со switch, чтобы остальные 299 функций чанка сохраняли вынос холодного кода в .text.unlikely.
+#if defined(__GNUC__) && !defined(__clang__)
+#define SNX_NO_JT __attribute__((optimize("no-jump-tables")))
+#else
+#define SNX_NO_JT
+#endif
 
 // Доступ к памяти гостя по указателю хоста: m + адрес (recomp/emit.py: ha). [рег ± поле] — m + рег ± d без
 // заворота через 2^32, чтобы m + рег считался раз на значение регистра.
@@ -46,7 +68,7 @@ static inline __attribute__((always_inline)) void REP_MOVS(u8 *m, u32 s, u32 d, 
     if (__builtin_constant_p(n) && __builtin_constant_p(df) && !df && n <= REP_INLINE_MAX) {
         for (u32 i = 0; i < n; i++, s += (u32)size, d += (u32)size)
             size == 4 ? st32(m + d, ld32(m + s)) : size == 2 ? st16(m + d, ld16(m + s)) : (void)(m[d] = m[s]);
-    } else {
+    } else if (n) {
         rt_rep_movs(m, s, d, n, size, df);
     }
 }
@@ -55,7 +77,7 @@ static inline __attribute__((always_inline)) void REP_STOS(u8 *m, u32 d, u32 n, 
     if (__builtin_constant_p(n) && __builtin_constant_p(df) && !df && n <= REP_INLINE_MAX) {
         for (u32 i = 0; i < n; i++, d += (u32)size)
             size == 4 ? st32(m + d, v) : size == 2 ? st16(m + d, (u16)v) : (void)(m[d] = (u8)v);
-    } else {
+    } else if (n) {
         rt_rep_stos(m, d, n, v, size, df);
     }
 }
@@ -91,44 +113,46 @@ static inline __attribute__((always_inline)) s64 FTRUNC(double v, int bits)
                   esi = c->esi, edi = c->edi)
 
 #ifdef SNX_PIN
-// кеш косвенного вызова (abi.h) с закреплёнными регистрами: функция гостя — прямо с места вызова; функция хоста
-// (бит 0 смещения) и промах — в rt_icall_slow, одной копии на файл (с SPILL/RELOAD на каждом месте функции D3DDrv с
-// десятками вызовов COM вырастали на треть). Промах места сначала смотрит общий кеш rt_ic2: функция гостя оттуда —
-// тоже прямым вызовом, без CPU и трамплина rt_pin_enter (диспетчер байт-кода UnrealScript промахивается почти
-// всегда); с регистрами через CPU — только функция хоста и промах общего кеша (rt_call_ic)
-static __attribute__((noinline)) void rt_icall_slow(CPU *restrict c, u32 t, u64 *ic, u64 v)
-{
-    if ((u32)v != t) {
-        v = __atomic_load_n(&rt_ic2[RT_IC2_IDX(t)], __ATOMIC_RELAXED);
-        if ((u32)v != t || !t) {
-            SPILL();
-            rt_call_ic(c, t, ic);
-            RELOAD();
-            return;
-        }
-        __atomic_store_n(ic, v, __ATOMIC_RELAXED);
-    }
-    s32 o = (s32)(u32)(v >> 32);
-    guest_fn fn = (guest_fn)((uintptr_t)rt_ic_base + (uintptr_t)(intptr_t)(o & ~1));
-    if (o & 1) {
-        SPILL();
-        fn(c);
-        RELOAD();
-    } else {
-        fn(c);
-    }
-}
+// Кеш косвенного вызова (abi.h) с закреплёнными регистрами (x19–x28): и функции гостя, и нативные функции хоста
+// (COM/HLE, завёрнутые в компактные pinned-обёртки rt_pin_wrap_native в runtime/icall_pin.c) имеют единый
+// pinned-ABI (void(void), c в x28) и вызываются прямо с места вызова без mov x0, x28, без бита native и без
+// ухода в rt_icall_slow. Промах места идёт в единую функцию rt_icall_slow(t, &ic) (rt_ic2 -> rt_call_ic).
+void rt_icall_slow(u32 t, u64 *ic) RT_HIDDEN;
 #undef RT_ICALL
 #define RT_ICALL(c, t)                                                                                     \
     do {                                                                                                   \
         static u64 ic_;                                                                                    \
         u64 v_ = __atomic_load_n(&ic_, __ATOMIC_RELAXED);                                                  \
-        s32 o_ = (s32)(u32)(v_ >> 32);                                                                     \
-        if ((u32)v_ == (t) && !(o_ & 1))                                                                   \
-            ((guest_fn)((uintptr_t)rt_ic_base + (uintptr_t)(intptr_t)o_))(c);                              \
+        if (__builtin_expect((u32)v_ == (t), 1))                                                           \
+            ((pin_fn)((uintptr_t)rt_ic_base + (intptr_t)((s64)v_ >> 32)))();                               \
         else                                                                                               \
-            rt_icall_slow((c), (t), &ic_, v_);                                                             \
+            rt_icall_slow((t), &ic_);                                                                      \
     } while (0)
+#undef RT_GNATIVE_CALL
+#define RT_GNATIVE_CALL(c, idx, t)                                                                         \
+    do {                                                                                                   \
+        u64 *ge_ = &rt_gnatives_cache[(u32)(idx) & (RT_GNATIVE_SIZE - 1)];                                 \
+        u64 v_ = __atomic_load_n(ge_, __ATOMIC_RELAXED);                                                   \
+        if (__builtin_expect((u32)v_ == (t), 1))                                                           \
+            ((pin_fn)((uintptr_t)rt_ic_base + (intptr_t)((s64)v_ >> 32)))();                               \
+        else                                                                                               \
+            rt_icall_slow((t), ge_);                                                                       \
+    } while (0)
+#endif
+
+// На Switch rdtsc (appCycles для статистики GStats UE2) инлайнится прямо через системный счётчик ARM cntpct_el0
+// (19,2 МГц -> нс: t * 625 / 12, совпадает с rt_ticks_ns в runtime/rt.c): убирает bl rt_rdtsc, проверку
+// rt_rdtsc_hook и сброс caller-saved регистров в горячих функциях D3DDrv/Engine. На хосте (и в difftest с
+// rt_rdtsc_hook) вызывается обычная rt_rdtsc().
+#if defined(__SWITCH__) && defined(__aarch64__)
+static inline __attribute__((always_inline)) u64 RT_RDTSC(void)
+{
+    u64 t;
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t));
+    return (t * 625ull) / 12ull;
+}
+#else
+#define RT_RDTSC() rt_rdtsc()
 #endif
 
 // setjmp гостя (см. recomp/gen.py SETJMP_EXPORTS): хостовый setjmp — прямо в кадре вызывающей функции
@@ -161,6 +185,16 @@ void rt_trace_count(u32 a);
 
 // Условные биты x87 после FCOM: C0 = 0x100, C2 = 0x400, C3 = 0x4000.
 static inline u32 FCOM(double x, double y)
+{
+    if (x != x || y != y)
+        return 0x4500u;
+    if (x < y)
+        return 0x0100u;
+    if (x == y)
+        return 0x4000u;
+    return 0;
+}
+static inline u32 FCOMF(float x, float y)
 {
     if (x != x || y != y)
         return 0x4500u;

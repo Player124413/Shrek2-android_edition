@@ -17,6 +17,8 @@ extern "C" {
 u32 com_vtable(const char *name, const guest_fn *methods, int n);
 // Новый объект с refcount 1; destroy вызывается при последнем Release.
 u32 com_create(u32 vtbl, void *host, void (*destroy)(void *host));
+// Однопоточный COM-объект (только поток гостя, без атомиков в AddRef/Release — D3D8).
+u32 com_create_st(u32 vtbl, void *host, void (*destroy)(void *host));
 void *com_host(u32 obj);  // NULL — не наш объект
 u32 com_addref(u32 obj);
 u32 com_release(u32 obj);

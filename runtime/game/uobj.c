@@ -265,6 +265,8 @@ int uo_set_str(u32 obj, const char *name, const char *s)
     if (!obj || !uo_find_prop(uo_class(obj), name, &p))
         return 0;
     u32 str = obj + p.offset, data = rd32(g_mem, str), num = rd32(g_mem, str + 4);
+    if (!len && (!num || (data && num == 1 && !rd16(g_mem, data))))  // уже пустая строка
+        return 1;
     if (data && num == len + 1) {  // уже такая строка
         size_t i = 0;
         while (i < len && rd16(g_mem, data + 2 * (u32)i) == w[i])

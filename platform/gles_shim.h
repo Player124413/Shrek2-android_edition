@@ -69,7 +69,7 @@ typedef struct {
     int clip_distance;    // GL_EXT_clip_cull_distance (иначе плоскости отсечения — discard в шейдере)
     int s3tc;             // DXT1/3/5 сжатыми (GL_EXT_texture_compression_s3tc и родственные)
     int border_clamp;     // CLAMP_TO_BORDER: ES 3.2, EXT/OES_texture_border_clamp
-    int program_binary;   // glProgramBinary с хотя бы одним форматом (кеш собранных программ между запусками)
+    int program_binary;   // glProgramBinary с хотя бы одним форматом
     int tex16;            // распакованный DXT — в 16 бит на пиксель (SNX_TEX16=1: экономия памяти)
     int invalidate;       // glInvalidateFramebuffer глубины после кадра (тайловые GPU; SNX_GLES_INVALIDATE=0 — нет)
     char renderer[128];
@@ -78,13 +78,6 @@ extern gles_caps_t gles_caps;
 
 // после того как контекст стал текущим (plat_gl_bind): версия, расширения, функции
 void gles_init(void);
-// каталог кеша собранных программ (glProgramBinary); NULL/"" — без кеша. До первой программы.
-void gles_set_shader_cache_dir(const char *dir);
-// собранная программа из кеша по исходникам (0 — нет); сохранить свежесобранную. Поток с текущим контекстом.
-unsigned gles_program_load(const char *vs, const char *fs);
-void gles_program_store(unsigned prog, const char *vs, const char *fs);
-// glProgramParameteri(PROGRAM_BINARY_RETRIEVABLE_HINT) — перед glLinkProgram, если кеш включён
-void gles_program_hint(unsigned prog);
 
 // ---------------------------------------------------------------- подменённые вызовы
 void snx_glPixelStorei(GLenum pname, GLint v);

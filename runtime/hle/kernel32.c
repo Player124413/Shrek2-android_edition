@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <setjmp.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <strings.h>
 #include <time.h>
@@ -11,7 +12,9 @@
 #include <wctype.h>
 
 #include "runtime/heap.h"
+#include "runtime/hle/gl_cs.h"
 #include "runtime/hle/hle.h"
+#include "runtime/hle/openal.h"
 #include "runtime/vmem.h"
 
 // ================================================================ память
@@ -899,27 +902,41 @@ static u64 now_filetime(void)
     return (u64)ts.tv_sec * 10000000ull + (u64)ts.tv_nsec / 100 + 116444736000000000ull;
 }
 
+static void tm_to_systemtime(const struct tm *tm, u16 ms, u32 st)
+{
+    wr16(g_mem, st + 0, (u16)(tm->tm_year + 1900));
+    wr16(g_mem, st + 2, (u16)(tm->tm_mon + 1));
+    wr16(g_mem, st + 4, (u16)tm->tm_wday);
+    wr16(g_mem, st + 6, (u16)tm->tm_mday);
+    wr16(g_mem, st + 8, (u16)tm->tm_hour);
+    wr16(g_mem, st + 10, (u16)tm->tm_min);
+    wr16(g_mem, st + 12, (u16)(tm->tm_sec > 59 ? 59 : tm->tm_sec));
+    wr16(g_mem, st + 14, ms);
+}
+
 static void filetime_to_systemtime(u64 ft, u32 st)
 {
     time_t t = (time_t)((ft - 116444736000000000ull) / 10000000ull);
     struct tm tm;
     gmtime_r(&t, &tm);
-    wr16(g_mem, st + 0, (u16)(tm.tm_year + 1900));
-    wr16(g_mem, st + 2, (u16)(tm.tm_mon + 1));
-    wr16(g_mem, st + 4, (u16)tm.tm_wday);
-    wr16(g_mem, st + 6, (u16)tm.tm_mday);
-    wr16(g_mem, st + 8, (u16)tm.tm_hour);
-    wr16(g_mem, st + 10, (u16)tm.tm_min);
-    wr16(g_mem, st + 12, (u16)tm.tm_sec);
-    wr16(g_mem, st + 14, (u16)(ft / 10000 % 1000));
+    tm_to_systemtime(&tm, (u16)(ft / 10000 % 1000), st);
 }
 
-void hle_kernel32_GetTickCount(CPU *c) { HLE_ENTER("GetTickCount", 0); RET(0, (u32)(rt_ticks_ns() / 1000000u)); }
+static void local_now(struct tm *tm, u16 *ms)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    localtime_r(&ts.tv_sec, tm);
+    if (ms)
+        *ms = (u16)(ts.tv_nsec / 1000000);
+}
+
+void hle_kernel32_GetTickCount(CPU *c) { HLE_ENTER("GetTickCount", 0); RET(0, (u32)(rt_guest_ticks_ns() / 1000000u)); }
 
 void hle_kernel32_QueryPerformanceCounter(CPU *c)
 {
     HLE_ENTER("QueryPerformanceCounter", 1);
-    wr64(g_mem, ARG(0), rt_ticks_ns());
+    wr64(g_mem, ARG(0), rt_guest_ticks_ns());
     RET(1, 1);
 }
 
@@ -940,7 +957,10 @@ void hle_kernel32_GetSystemTimeAsFileTime(CPU *c)
 void hle_kernel32_GetLocalTime(CPU *c)
 {
     HLE_ENTER("GetLocalTime", 1);
-    filetime_to_systemtime(now_filetime(), ARG(0));  // часовой пояс гостя — UTC
+    struct tm tm;
+    u16 ms;
+    local_now(&tm, &ms);
+    tm_to_systemtime(&tm, ms, ARG(0));
     RET(1, 0);
 }
 
@@ -994,8 +1014,278 @@ void hle_kernel32_Sleep(CPU *c)
     RET(1, 0);
 }
 
-void hle_kernel32_GetDateFormatA(CPU *c) { HLE_ENTER("GetDateFormatA", 6); hle_todo("GetDateFormatA"); RET(6, hle_put_a(ARG(4), ARG(5), "1/1/2004") + 1); }
-void hle_kernel32_GetTimeFormatA(CPU *c) { HLE_ENTER("GetTimeFormatA", 6); hle_todo("GetTimeFormatA"); RET(6, hle_put_a(ARG(4), ARG(5), "12:00:00 PM") + 1); }
+// Форматирование даты/времени Win32 (локализация EN-US 0x409): безопасная запись без переполнения гостевого буфера.
+typedef struct {
+    char buf[256];
+    size_t len;
+} dt_buf;
+
+static void dt_ch(dt_buf *b, char ch)
+{
+    if (b->len + 1 < sizeof b->buf)
+        b->buf[b->len++] = ch;
+}
+
+static void dt_str(dt_buf *b, const char *s)
+{
+    for (; *s; s++)
+        dt_ch(b, *s);
+}
+
+static void dt_num(dt_buf *b, int v, int width)
+{
+    char tmp[32];
+    if (width == 2)
+        snprintf(tmp, sizeof tmp, "%02d", v);
+    else if (width == 4)
+        snprintf(tmp, sizeof tmp, "%04d", v);
+    else
+        snprintf(tmp, sizeof tmp, "%d", v);
+    dt_str(b, tmp);
+}
+
+static int guest_range_ok(u32 addr, u32 size)
+{
+    return addr >= 0x10000u && (u64)addr + size <= RT_WINDOW;
+}
+
+static int days_in_month(int y, int m)
+{
+    static const u8 dm[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (m < 1 || m > 12)
+        return 0;
+    if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0))
+        return 29;
+    return dm[m - 1];
+}
+
+// День недели (0 — воскресенье .. 6 — суббота) по алгоритму Сакамото; Win32 GetDateFormat игнорирует lpDate->wDayOfWeek.
+static int gregorian_wday(int y, int m, int d)
+{
+    static const int t[12] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    if (m < 3)
+        y--;
+    int w = (y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7;
+    return w < 0 ? w + 7 : w;
+}
+
+static const char *dt_quote(dt_buf *b, const char *p)
+{
+    p++;  // пропустить открывающую кавычку '\''
+    if (*p == '\'') {
+        dt_ch(b, '\'');
+        return p + 1;
+    }
+    while (*p) {
+        if (*p == '\'') {
+            if (p[1] == '\'') {
+                dt_ch(b, '\'');
+                p += 2;
+            } else {
+                p++;
+                break;
+            }
+        } else {
+            dt_ch(b, *p++);
+        }
+    }
+    return p;
+}
+
+static u32 dt_finish(const dt_buf *b, u32 dst, s32 cch)
+{
+    if (cch < 0) {
+        rt_set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    u32 need = (u32)b->len + 1;
+    if (cch == 0)
+        return need;
+    if (!guest_range_ok(dst, (u32)cch)) {
+        rt_set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if ((u32)cch < need) {
+        rt_set_last_error(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    memcpy(g_mem + dst, b->buf, need);
+    return need;
+}
+
+void hle_kernel32_GetDateFormatA(CPU *c)
+{
+    HLE_ENTER("GetDateFormatA", 6);
+    static const char *const wday_short[7] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    static const char *const wday_long[7] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+    static const char *const mon_short[12] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    static const char *const mon_long[12] = {"January", "February", "March", "April", "May", "June",
+                                             "July", "August", "September", "October", "November", "December"};
+    u32 flags = ARG(1), lp_date = ARG(2), lp_fmt = ARG(3), dst = ARG(4);
+    s32 cch = (s32)ARG(5);
+    int year, mon, day;
+    if (lp_date) {
+        if (!guest_range_ok(lp_date, 16)) {
+            rt_set_last_error(ERROR_INVALID_PARAMETER);
+            RET(6, 0);
+        }
+        year = rd16(g_mem, lp_date + 0);
+        mon = rd16(g_mem, lp_date + 2);
+        day = rd16(g_mem, lp_date + 6);
+        if (mon < 1 || mon > 12 || day < 1 || day > days_in_month(year, mon)) {
+            rt_set_last_error(ERROR_INVALID_PARAMETER);
+            RET(6, 0);
+        }
+    } else {
+        struct tm tm;
+        local_now(&tm, NULL);
+        year = tm.tm_year + 1900;
+        mon = tm.tm_mon + 1;
+        day = tm.tm_mday;
+    }
+    const char *fmt;
+    if (lp_fmt) {
+        if (!guest_range_ok(lp_fmt, 1)) {
+            rt_set_last_error(ERROR_INVALID_PARAMETER);
+            RET(6, 0);
+        }
+        fmt = hle_cstr(lp_fmt);
+    } else if (flags & 0x00000002u) {  // DATE_LONGDATE
+        fmt = "dddd, MMMM dd, yyyy";
+    } else if (flags & 0x00000008u) {  // DATE_YEARMONTH
+        fmt = "MMMM, yyyy";
+    } else {                           // DATE_SHORTDATE (по умолчанию)
+        fmt = "M/d/yyyy";
+    }
+    int wday = gregorian_wday(year, mon, day);
+    dt_buf b = {.len = 0};
+    for (const char *p = fmt; *p;) {
+        if (*p == '\'') {
+            p = dt_quote(&b, p);
+            continue;
+        }
+        if (*p == 'd' || *p == 'M' || *p == 'y' || *p == 'g') {
+            char ch = *p;
+            int n = 0;
+            while (*p == ch)
+                p++, n++;
+            if (ch == 'd') {
+                if (n == 1) dt_num(&b, day, 1);
+                else if (n == 2) dt_num(&b, day, 2);
+                else if (n == 3) dt_str(&b, wday_short[wday]);
+                else dt_str(&b, wday_long[wday]);
+            } else if (ch == 'M') {
+                if (n == 1) dt_num(&b, mon, 1);
+                else if (n == 2) dt_num(&b, mon, 2);
+                else if (n == 3) dt_str(&b, mon_short[mon - 1]);
+                else dt_str(&b, mon_long[mon - 1]);
+            } else if (ch == 'y') {
+                if (n == 1) dt_num(&b, year % 100, 1);
+                else if (n == 2) dt_num(&b, year % 100, 2);
+                else dt_num(&b, year, 4);
+            } else {  // 'g'
+                if (n >= 2) dt_str(&b, "A.D.");
+                else dt_ch(&b, 'g');
+            }
+        } else {
+            dt_ch(&b, *p++);
+        }
+    }
+    b.buf[b.len] = 0;
+    RET(6, dt_finish(&b, dst, cch));
+}
+
+void hle_kernel32_GetTimeFormatA(CPU *c)
+{
+    HLE_ENTER("GetTimeFormatA", 6);
+    u32 flags = ARG(1), lp_time = ARG(2), lp_fmt = ARG(3), dst = ARG(4);
+    s32 cch = (s32)ARG(5);
+    int hour, min, sec;
+    if (lp_time) {
+        if (!guest_range_ok(lp_time, 16)) {
+            rt_set_last_error(ERROR_INVALID_PARAMETER);
+            RET(6, 0);
+        }
+        hour = rd16(g_mem, lp_time + 8);
+        min = rd16(g_mem, lp_time + 10);
+        sec = rd16(g_mem, lp_time + 12);
+        if (hour > 23 || min > 59 || sec > 59) {
+            rt_set_last_error(ERROR_INVALID_PARAMETER);
+            RET(6, 0);
+        }
+    } else {
+        struct tm tm;
+        local_now(&tm, NULL);
+        hour = tm.tm_hour;
+        min = tm.tm_min;
+        sec = tm.tm_sec > 59 ? 59 : tm.tm_sec;
+    }
+    char def_fmt[32];
+    const char *fmt;
+    if (lp_fmt) {
+        if (!guest_range_ok(lp_fmt, 1)) {
+            rt_set_last_error(ERROR_INVALID_PARAMETER);
+            RET(6, 0);
+        }
+        fmt = hle_cstr(lp_fmt);
+    } else {
+        // TIME_NOMINUTESORSECONDS=1, TIME_NOSECONDS=2, TIME_NOTIMEMARKER=4, TIME_FORCE24HOURFORMAT=8
+        int f24 = (flags & 8u) != 0;
+        snprintf(def_fmt, sizeof def_fmt, "%s%s%s%s",
+                 f24 ? "H" : "h",
+                 (flags & 1u) ? "" : ":mm",
+                 (flags & 3u) ? "" : ":ss",
+                 (f24 || (flags & 4u)) ? "" : " tt");
+        fmt = def_fmt;
+    }
+    int h12 = hour % 12;
+    if (h12 == 0)
+        h12 = 12;
+    dt_buf b = {.len = 0};
+    for (const char *p = fmt; *p;) {
+        if (*p == '\'') {
+            p = dt_quote(&b, p);
+            continue;
+        }
+        if (*p == 'h' || *p == 'H' || *p == 'm' || *p == 's' || *p == 't') {
+            char ch = *p;
+            int n = 0;
+            while (*p == ch)
+                p++, n++;
+            if (ch == 'h' || ch == 'H') {
+                int v = (ch == 'H' || (flags & 8u)) ? hour : h12;
+                dt_num(&b, v, n >= 2 ? 2 : 1);
+            } else if (ch == 'm') {
+                if (flags & 1u) {
+                    if (b.len > 0 && b.buf[b.len - 1] == ':')
+                        b.len--;
+                } else {
+                    dt_num(&b, min, n >= 2 ? 2 : 1);
+                }
+            } else if (ch == 's') {
+                if (flags & 3u) {
+                    if (b.len > 0 && b.buf[b.len - 1] == ':')
+                        b.len--;
+                } else {
+                    dt_num(&b, sec, n >= 2 ? 2 : 1);
+                }
+            } else {  // 't'
+                if (flags & 4u) {
+                    if (b.len > 0 && b.buf[b.len - 1] == ' ')
+                        b.len--;
+                } else if (n == 1) {
+                    dt_ch(&b, hour < 12 ? 'A' : 'P');
+                } else {
+                    dt_str(&b, hour < 12 ? "AM" : "PM");
+                }
+            }
+        } else {
+            dt_ch(&b, *p++);
+        }
+    }
+    b.buf[b.len] = 0;
+    RET(6, dt_finish(&b, dst, cch));
+}
 
 // ================================================================ отладка, исключения, завершение
 static void debug_string(const char *s)
@@ -1203,21 +1493,37 @@ void hle_kernel32_IsBadReadPtr(CPU *c) { HLE_ENTER("IsBadReadPtr", 2); RET(2, AR
 void hle_kernel32_IsBadWritePtr(CPU *c) { HLE_ENTER("IsBadWritePtr", 2); RET(2, ARG(0) < 0x10000u || (u64)ARG(0) + ARG(1) > RT_WINDOW); }
 void hle_kernel32_IsBadCodePtr(CPU *c) { HLE_ENTER("IsBadCodePtr", 1); RET(1, rt_lookup(ARG(0)) == NULL); }
 
+static _Atomic int g_bg_threads;
+
+static void guest_process_cleanup(void)
+{
+    int bg = atomic_load(&g_bg_threads);
+    if (bg > 0)
+        fprintf(stderr, "[hle] exiting with %d active background guest thread(s)\n", bg);
+    cs_stop();
+    openal_shutdown();
+    hle_file_flush_all();
+    fflush(stdout);
+    fflush(stderr);
+}
+
 void hle_kernel32_ExitProcess(CPU *c)
 {
     HLE_ENTER("ExitProcess", 1);
-    fprintf(stderr, "[hle] ExitProcess(%u)\n", ARG(0));
-    fflush(stdout);
-    fflush(stderr);
-    exit((int)ARG(0));
+    u32 code = ARG(0);
+    fprintf(stderr, "[hle] ExitProcess(%u)\n", code);
+    guest_process_cleanup();
+    exit((int)code);
 }
 
 void hle_kernel32_TerminateProcess(CPU *c)
 {
     HLE_ENTER("TerminateProcess", 2);
     if (ARG(0) == 0xFFFFFFFFu) {
-        fprintf(stderr, "[hle] TerminateProcess(self, %u)\n", ARG(1));
-        exit((int)ARG(1));
+        u32 code = ARG(1);
+        fprintf(stderr, "[hle] TerminateProcess(self, %u)\n", code);
+        guest_process_cleanup();
+        exit((int)code);
     }
     RET(2, 0);
 }
@@ -1288,6 +1594,7 @@ static void *thread_main(void *arg)
     t->finished = 1;
     pthread_cond_broadcast(&s->cv);
     pthread_mutex_unlock(&s->m);
+    atomic_fetch_sub(&g_bg_threads, 1);
     return NULL;
 }
 
@@ -1298,8 +1605,11 @@ static void thread_start(GuestThread *t)
     pthread_attr_setstacksize(&a, RT_HOST_STACK_THREAD);
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
     pthread_t th;
-    if (pthread_create(&th, &a, thread_main, t) != 0)
+    atomic_fetch_add(&g_bg_threads, 1);
+    if (pthread_create(&th, &a, thread_main, t) != 0) {
+        atomic_fetch_sub(&g_bg_threads, 1);
         rt_trap(&t->cpu, t->start, "pthread_create failed");
+    }
     pthread_attr_destroy(&a);
 }
 
@@ -1342,8 +1652,10 @@ void hle_kernel32_ExitThread(CPU *c)
     GuestThread *t = rt_thread_current();
     t->exit_code = ARG(0);
     if (!t->exit_jmp) {
+        u32 code = ARG(0);
         fprintf(stderr, "[hle] ExitThread on the main thread\n");
-        exit((int)ARG(0));
+        guest_process_cleanup();
+        exit((int)code);
     }
     longjmp(*(jmp_buf *)t->exit_jmp, 1);
 }

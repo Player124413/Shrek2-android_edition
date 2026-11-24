@@ -1,4 +1,5 @@
-// Окно игры и GL-контекст поверх SDL2: главный поток — события и создание окна, поток гостя — рисование.
+// Окно игры и GL-контекст поверх SDL2: главный поток — события, жизненный цикл ОС и создание окна,
+// поток гостя/рендера — рисование.
 // Android: контекст OpenGL ES 3.0, окно — всегда весь экран; при уходе в фон поверхность EGL уничтожается, поэтому
 // поток с контекстом отпускает его в plat_swap и ждёт возврата (там же берёт новую поверхность).
 #include "platform/window.h"
@@ -13,9 +14,14 @@
 #include <time.h>
 
 #include "platform/gl.h"
+#include "platform/platform.h"
 
 plat_event_fn plat_on_event;
 void (*plat_on_tick)(void);
+void (*plat_on_focus)(int focused);
+void (*plat_on_resume)(void);
+void (*plat_on_screen_mode)(int w, int h);
+void (*plat_on_exit_request)(void);
 
 static plat_pause_fn g_pause_hooks[8];
 static int g_npause_hooks;
@@ -30,7 +36,16 @@ static SDL_Window *g_win;
 static SDL_GLContext g_ctx;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
-static volatile int g_quit;
+static _Atomic int g_quit;
+static _Atomic int g_focused = 1;
+static _Atomic int g_screen_w;
+static _Atomic int g_screen_h;
+static _Atomic int g_screen_mode_dirty;
+static _Atomic int g_gl_loaded;
+#ifdef __SWITCH__
+static AppletHookCookie g_applet_cookie;
+static int g_applet_hooked;
+#endif
 
 // фон (Android): поток с контекстом GL отпускает его в plat_swap и ждёт возврата приложения
 static pthread_mutex_t g_bg_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -86,6 +101,86 @@ static struct {
     char title[128];
 } g_req;
 
+static void handle_focus(int focused)
+{
+    focused = focused ? 1 : 0;
+    if (atomic_exchange(&g_focused, focused) == focused)
+        return;
+    if (plat_on_focus)
+        plat_on_focus(focused);
+}
+
+static void update_screen_mode(int notify)
+{
+    int w = 1280, h = 720;
+#ifdef __SWITCH__
+    // SDL на Switch всегда отдаёт 1920x1080; экран в руках — 1280x720
+    if (appletGetOperationMode() == AppletOperationMode_Handheld) {
+        w = 1280;
+        h = 720;
+    } else {
+        w = 1920;
+        h = 1080;
+    }
+#else
+    SDL_DisplayMode m;
+    if (SDL_GetDesktopDisplayMode(0, &m) == 0 && m.w > 0 && m.h > 0) {
+        w = m.w;
+        h = m.h;
+    }
+#endif
+#ifdef __ANDROID__
+    if (h > w) {  // до поворота активности экран может быть ещё портретным: игра — всегда альбомная
+        int t = w;
+        w = h;
+        h = t;
+    }
+#endif
+    int prev_w = atomic_exchange(&g_screen_w, w);
+    int prev_h = atomic_exchange(&g_screen_h, h);
+    if (w != prev_w || h != prev_h) {
+#ifdef __SWITCH__
+        SDL_Log("screen %dx%d (%s)", w, h, h == 720 ? "handheld" : "docked");
+#else
+        SDL_Log("screen %dx%d", w, h);
+#endif
+        if (notify) {
+            atomic_store(&g_screen_mode_dirty, 1);
+            if (plat_on_screen_mode)
+                plat_on_screen_mode(w, h);
+        }
+    }
+}
+
+#ifdef __SWITCH__
+// Хук жизненного цикла Horizon OS (libnx): вызывается из appletMainLoop() в главном потоке [проверить на Switch].
+static void on_applet_hook(AppletHookType hook, void *param)
+{
+    (void)param;
+    switch (hook) {
+    case AppletHookType_OnFocusState: {
+        AppletFocusState st = appletGetFocusState();
+        handle_focus(st == AppletFocusState_InFocus);
+        break;
+    }
+    case AppletHookType_OnResume:
+        if (plat_on_resume)
+            plat_on_resume();
+        break;
+    case AppletHookType_OnOperationMode:
+        update_screen_mode(1);
+        break;
+    case AppletHookType_OnExitRequest:
+        plat_quit();
+        if (plat_on_exit_request)
+            plat_on_exit_request();
+        break;
+    default:
+        break;
+    }
+}
+#endif
+
 int plat_init(void)
 {
 #ifdef __ANDROID__
@@ -99,6 +194,18 @@ int plat_init(void)
         SDL_Log("SDL_Init: %s", SDL_GetError());
         return -1;
     }
+    atomic_store(&g_quit, 0);
+    atomic_store(&g_screen_mode_dirty, 0);
+#ifdef __SWITCH__
+    if (!g_applet_hooked) {
+        appletHook(&g_applet_cookie, on_applet_hook, NULL);
+        g_applet_hooked = 1;
+    }
+    atomic_store(&g_focused, appletGetFocusState() == AppletFocusState_InFocus ? 1 : 0);
+#else
+    atomic_store(&g_focused, 1);
+#endif
+    update_screen_mode(0);
 #ifdef __ANDROID__
     SDL_AddEventWatch(app_watch, NULL);
 #else
@@ -169,10 +276,20 @@ static int create_window(void)
 
 void plat_run(void)
 {
-    while (!g_quit) {
+#ifdef __SWITCH__
+    while (!atomic_load(&g_quit) && appletMainLoop()) {
+#else
+    while (!atomic_load(&g_quit)) {
+#endif
         SDL_Event ev;
         if (SDL_WaitEventTimeout(&ev, 5)) {
             do {
+                if (ev.type == SDL_WINDOWEVENT) {
+                    if (ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
+                        handle_focus(0);
+                    else if (ev.window.event == SDL_WINDOWEVENT_FOCUS_GAINED)
+                        handle_focus(1);
+                }
                 if (plat_on_event)
                     plat_on_event(&ev);
             } while (SDL_PollEvent(&ev));
@@ -188,11 +305,28 @@ void plat_run(void)
         }
         pthread_mutex_unlock(&g_lock);
     }
+#ifdef __SWITCH__
+    // appletMainLoop() вернул false без предварительного OnExitRequest — уведомить хост
+    if (!atomic_exchange(&g_quit, 1) && plat_on_exit_request)
+        plat_on_exit_request();
+#endif
+    // разбудить поток гостя, если он ждал создания окна во время выхода
+    pthread_mutex_lock(&g_lock);
+    if (g_req.pending) {
+        g_req.pending = 0;
+        g_req.result = -1;
+        g_req.done = 1;
+        pthread_cond_broadcast(&g_cv);
+    }
+    pthread_mutex_unlock(&g_lock);
 }
 
 void plat_quit(void)
 {
-    g_quit = 1;
+    pthread_mutex_lock(&g_lock);
+    atomic_store(&g_quit, 1);
+    pthread_cond_broadcast(&g_cv);
+    pthread_mutex_unlock(&g_lock);
     pthread_mutex_lock(&g_bg_lock);
     pthread_cond_broadcast(&g_bg_cv);
     pthread_mutex_unlock(&g_bg_lock);
@@ -221,36 +355,41 @@ static void start_glthread(void)
 int plat_window_open(int w, int h, int fullscreen, const char *title)
 {
     pthread_mutex_lock(&g_lock);
+    if (atomic_load(&g_quit)) {
+        pthread_mutex_unlock(&g_lock);
+        return -1;
+    }
     g_req.w = w;
     g_req.h = h;
     g_req.fullscreen = fullscreen;
     SDL_strlcpy(g_req.title, title ? title : "shrekNX", sizeof g_req.title);
     g_req.done = 0;
     g_req.pending = 1;
-    while (!g_req.done)
+    while (!g_req.done && !atomic_load(&g_quit))
         pthread_cond_wait(&g_cv, &g_lock);
-    int r = g_req.result;
+    int r = g_req.done ? g_req.result : -1;
     pthread_mutex_unlock(&g_lock);
     return r;
 }
 
 int plat_gl_bind(void)
 {
-    static int loaded;
+    if (!g_win || !g_ctx)
+        return -1;
     if (SDL_GL_MakeCurrent(g_win, g_ctx) != 0) {
         SDL_Log("SDL_GL_MakeCurrent: %s", SDL_GetError());
         return -1;
     }
     g_ctx_bound = 1;
-    if (loaded)
+    if (atomic_exchange(&g_gl_loaded, 1))
         return 0;
-    loaded = 1;
 #ifdef SNX_GLES
     gles_init();
 #endif
 #if SNX_GL_NEEDS_LOADER
     if (!gladLoadGLLoader((GLADloadproc)SDL_GL_GetProcAddress)) {
         SDL_Log("gladLoadGL failed");
+        atomic_store(&g_gl_loaded, 0);
         return -1;
     }
 #endif
@@ -266,38 +405,63 @@ int plat_gl_bind(void)
     return 0;
 }
 
+void plat_gl_unbind(void)
+{
+    if (g_win)
+        SDL_GL_MakeCurrent(g_win, NULL);
+}
+
+void plat_shutdown(void)
+{
+#ifdef __SWITCH__
+    rt_platform_cpu_boost_reset();
+    if (g_applet_hooked) {
+        appletUnhook(&g_applet_cookie);
+        g_applet_hooked = 0;
+    }
+#endif
+    if (g_ctx) {
+        SDL_GL_DeleteContext(g_ctx);
+        g_ctx = NULL;
+    }
+    if (g_win) {
+        SDL_DestroyWindow(g_win);
+        g_win = NULL;
+    }
+    atomic_store(&g_gl_loaded, 0);
+    g_ctx_bound = 0;
+    atomic_store(&g_screen_w, 0);
+    atomic_store(&g_screen_h, 0);
+    SDL_Quit();
+}
+
 int plat_window_is_open(void) { return g_win != NULL; }
 
 void plat_screen_size(int *w, int *h)
 {
-#ifdef __SWITCH__
-    // SDL на Switch всегда отдаёт 1920x1080; экран в руках — 1280x720
-    if (appletGetOperationMode() == AppletOperationMode_Handheld) {
-        *w = 1280;
-        *h = 720;
-    } else {
-        *w = 1920;
-        *h = 1080;
+    // Читаем кеш, заполненный в plat_init() / OnOperationMode (главный поток), чтобы не звать SDL из других потоков
+    int sw = atomic_load(&g_screen_w);
+    int sh = atomic_load(&g_screen_h);
+    if (sw <= 0 || sh <= 0) {
+        update_screen_mode(0);
+        sw = atomic_load(&g_screen_w);
+        sh = atomic_load(&g_screen_h);
     }
-    SDL_Log("screen %dx%d (%s)", *w, *h, *h == 720 ? "handheld" : "docked");
-    return;
-#endif
-    SDL_DisplayMode m;
-    if (SDL_GetDesktopDisplayMode(0, &m) == 0 && m.w > 0 && m.h > 0) {
-        *w = m.w;
-        *h = m.h;
-    } else {
-        *w = 1280;
-        *h = 720;
-    }
-#ifdef __ANDROID__
-    if (*h > *w) {  // до поворота активности экран может быть ещё портретным: игра — всегда альбомная
-        int t = *w;
-        *w = *h;
-        *h = t;
-    }
-#endif
-    SDL_Log("screen %dx%d", *w, *h);
+    if (w)
+        *w = sw;
+    if (h)
+        *h = sh;
+}
+
+int plat_take_screen_mode_changed(int *w, int *h)
+{
+    if (!atomic_exchange(&g_screen_mode_dirty, 0))
+        return 0;
+    if (w)
+        *w = atomic_load(&g_screen_w);
+    if (h)
+        *h = atomic_load(&g_screen_h);
+    return 1;
 }
 
 void plat_drawable_size(int *w, int *h)

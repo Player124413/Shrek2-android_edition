@@ -1,9 +1,11 @@
 // Слой интерфейса порта поверх кадра (см. overlay.h). Атлас R8 1024x1024: вверху — формы значков (круг,
-// кольцо, «таблетка», крестовина; сглаживание по расстоянию до края), ниже — глифы ASCII шрифта кеглем 48.
-// Значок кнопки — светлая форма с тёмной надписью поверх, как на экранах Switch.
+// кольцо, «таблетка», крестовина; сглаживание по расстоянию до края), ниже — глифы ASCII и кириллицы
+// (U+0400..U+045F, включая Ё/ё) кеглем 48. Значок кнопки — светлая форма с тёмной надписью поверх, как на Switch.
 #include "runtime/hle/overlay.h"
 
 #include <math.h>
+#include <stdatomic.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,22 +18,38 @@
 #endif
 
 #include "platform/gl.h"
+// Все вызовы GL в этом файле выполняются внутри x_draw() (через cs_async в потоке рендера) — идём в GL напрямую
+#define GL_CS_IMPL
 #include "runtime/hle/gl_cs.h"
 
 #define ATLAS 1024
 #define FONT_PX 48
 #define MAX_VERTS (6 * 4096)
 
+#define GL_ASCII_FIRST 32u
+#define GL_ASCII_COUNT 95u  // ASCII 32..126
+#define GL_CYR_FIRST 0x0400u
+#define GL_CYR_COUNT 96u    // кириллица U+0400..U+045F (включая Ё/ё)
+#define GL_TOTAL (GL_ASCII_COUNT + GL_CYR_COUNT)
+
 typedef struct {
     float u0, v0, u1, v1;  // в атласе (доли)
     float w, h, bx, by;    // размер глифа, смещение от пера вправо и от базовой линии вверх (пиксели кегля 48)
     float adv;
+    u8 valid;
 } ov_glyph;
 
 typedef struct {
     float x, y, u, v;
     u32 c;
 } ov_vert;
+
+typedef struct {
+    u32 fbo;
+    int w, h, n;
+} ov_batch;  // за ним — n вершин
+
+_Static_assert(sizeof(ov_batch) == 16 && sizeof(ov_vert) == 20, "ожидаемая плотная раскладка ov_batch/ov_vert");
 
 enum { SH_WHITE, SH_DISC, SH_RING, SH_PILL, SH_CROSS, SH_N };
 static const int g_sh_rect[SH_N][4] = {  // x, y, w, h в атласе
@@ -41,10 +59,59 @@ static const int g_sh_rect[SH_N][4] = {  // x, y, w, h в атласе
 static u8 *g_atlas;
 static int g_state;  // 0 — не готов, 1 — атлас есть, -1 — не вышло
 static int g_have_font;
-static ov_glyph g_gl[128];
+static ov_glyph g_gl[GL_TOTAL];
 static float g_ascent, g_cap;  // высота над базовой линией строки и заглавных (пиксели кегля 48)
-static ov_vert g_v[MAX_VERTS];
+static struct {
+    ov_batch hdr;
+    ov_vert v[MAX_VERTS];
+} g_batch;
 static int g_nv;
+
+typedef void (*ov_draw_hook_fn)(int w, int h);
+static _Atomic ov_draw_hook_fn g_draw_hook;
+
+// ---------------------------------------------------------------- UTF-8 и индекс глифа
+static int glyph_idx(u32 cp)
+{
+    if (cp >= GL_ASCII_FIRST && cp < GL_ASCII_FIRST + GL_ASCII_COUNT)
+        return (int)(cp - GL_ASCII_FIRST);
+    if (cp >= GL_CYR_FIRST && cp < GL_CYR_FIRST + GL_CYR_COUNT)
+        return (int)(GL_ASCII_COUNT + (cp - GL_CYR_FIRST));
+    if (cp == 0x00A0u)
+        return (int)(' ' - GL_ASCII_FIRST);
+    if (cp == 0x2013u || cp == 0x2014u)
+        return (int)('-' - GL_ASCII_FIRST);
+    return -1;
+}
+
+// Следующий кодовый пункт UTF-8; некорректные байты пропускаются безопасно без чтения за '\0'.
+static u32 utf8_next(const char **ps)
+{
+    const u8 *p = (const u8 *)*ps;
+    u8 b0 = p[0];
+    if (b0 < 0x80u) {
+        *ps = (const char *)(p + 1);
+        return b0;
+    }
+    if ((b0 & 0xE0u) == 0xC0u && (p[1] & 0xC0u) == 0x80u) {
+        u32 cp = ((u32)(b0 & 0x1Fu) << 6) | (u32)(p[1] & 0x3Fu);
+        *ps = (const char *)(p + 2);
+        return cp >= 0x80u ? cp : 0xFFFDu;
+    }
+    if ((b0 & 0xF0u) == 0xE0u && (p[1] & 0xC0u) == 0x80u && (p[2] & 0xC0u) == 0x80u) {
+        u32 cp = ((u32)(b0 & 0x0Fu) << 12) | ((u32)(p[1] & 0x3Fu) << 6) | (u32)(p[2] & 0x3Fu);
+        *ps = (const char *)(p + 3);
+        return (cp >= 0x800u && !(cp >= 0xD800u && cp <= 0xDFFFu)) ? cp : 0xFFFDu;
+    }
+    if ((b0 & 0xF8u) == 0xF0u && (p[1] & 0xC0u) == 0x80u && (p[2] & 0xC0u) == 0x80u && (p[3] & 0xC0u) == 0x80u) {
+        u32 cp = ((u32)(b0 & 0x07u) << 18) | ((u32)(p[1] & 0x3Fu) << 12) | ((u32)(p[2] & 0x3Fu) << 6) |
+                 (u32)(p[3] & 0x3Fu);
+        *ps = (const char *)(p + 4);
+        return (cp >= 0x10000u && cp <= 0x10FFFFu) ? cp : 0xFFFDu;
+    }
+    *ps = (const char *)(p + 1);
+    return 0xFFFDu;
+}
 
 // ---------------------------------------------------------------- атлас
 static float clamp01(float v) { return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v; }
@@ -80,35 +147,104 @@ static void shape(int id)
         }
 }
 
-static FT_Face open_font(FT_Library ft)
+static FT_Face open_font(FT_Library ft, int *pl_inited)
 {
     FT_Face face = NULL;
     const char *env = getenv("SNX_FONT");
     if (env && !FT_New_Face(ft, env, 0, &face))
         return face;
 #ifdef __SWITCH__
+    // Системный шрифт Switch PlSharedFontType_Standard уже включает кириллицу [проверить на железе Switch]
     PlFontData fd;
-    if (R_SUCCEEDED(plInitialize(PlServiceType_User)) &&
-        R_SUCCEEDED(plGetSharedFontByType(&fd, PlSharedFontType_Standard)) &&
-        !FT_New_Memory_Face(ft, (const FT_Byte *)fd.address, (FT_Long)fd.size, 0, &face))
-        return face;
+    if (R_SUCCEEDED(plInitialize(PlServiceType_User))) {
+        *pl_inited = 1;
+        if (R_SUCCEEDED(plGetSharedFontByType(&fd, PlSharedFontType_Standard)) &&
+            !FT_New_Memory_Face(ft, (const FT_Byte *)fd.address, (FT_Long)fd.size, 0, &face))
+            return face;
+        plExit();
+        *pl_inited = 0;
+    }
+#else
+    (void)pl_inited;
+#ifdef __APPLE__
+    // Предпочитаем системные шрифты macOS с полной кириллицей (Arial Rounded Bold содержит только латиницу)
+    static const char *const paths[] = {
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/SFCompactRounded.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf",
+    };
 #elif defined(__ANDROID__)
     // системные шрифты Android разных лет: Roboto (5+, на 12+ — переменный и RobotoStatic), Droid Sans (старые)
     static const char *const paths[] = {"/system/fonts/Roboto-Bold.ttf", "/system/fonts/RobotoStatic-Regular.ttf",
                                         "/system/fonts/Roboto-Regular.ttf", "/system/fonts/DroidSans-Bold.ttf",
                                         "/system/fonts/DroidSans.ttf", "/system/fonts/NotoSans-Regular.ttf"};
-    for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++)
-        if (!FT_New_Face(ft, paths[i], 0, &face))
-            return face;
 #else
-    static const char *const paths[] = {"/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf",
-                                        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-                                        "/System/Library/Fonts/Helvetica.ttc"};
-    for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++)
-        if (!FT_New_Face(ft, paths[i], 0, &face))
-            return face;
+    static const char *const paths[] = {
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    };
+#endif
+    FT_Face fallback = NULL;
+    for (size_t i = 0; i < sizeof paths / sizeof paths[0]; i++) {
+        FT_Face cand = NULL;
+        if (FT_New_Face(ft, paths[i], 0, &cand))
+            continue;
+        if (FT_Get_Char_Index(cand, 0x0410u) != 0) {
+            if (fallback)
+                FT_Done_Face(fallback);
+            return cand;
+        }
+        if (!fallback)
+            fallback = cand;
+        else
+            FT_Done_Face(cand);
+    }
+    return fallback;
 #endif
     return NULL;
+}
+
+static void pack_glyph(FT_Face face, u32 cp, int idx, int *px, int *py, int *row)
+{
+    if (idx < 0 || idx >= (int)GL_TOTAL)
+        return;
+    if (cp != ' ' && !FT_Get_Char_Index(face, (FT_ULong)cp))
+        return;
+    if (FT_Load_Char(face, (FT_ULong)cp, FT_LOAD_RENDER))
+        return;
+    FT_GlyphSlot g = face->glyph;
+    int w = (int)g->bitmap.width, h = (int)g->bitmap.rows;
+    if (w < 0 || h < 0 || w + 2 > ATLAS || h + 2 > ATLAS)
+        return;
+    if (*px + w + 2 > ATLAS) {
+        *px = 0;
+        *py += *row + 2;
+        *row = 0;
+    }
+    if (*py + h > ATLAS)
+        return;
+    for (int y = 0; y < h; y++) {
+        const u8 *src = g->bitmap.pitch >= 0 ? g->bitmap.buffer + (size_t)y * (size_t)g->bitmap.pitch
+                                             : g->bitmap.buffer + (size_t)(h - 1 - y) * (size_t)(-g->bitmap.pitch);
+        memcpy(g_atlas + (size_t)(*py + y) * ATLAS + (size_t)*px, src, (size_t)w);
+    }
+    ov_glyph *o = &g_gl[idx];
+    o->u0 = (float)*px / ATLAS;
+    o->v0 = (float)*py / ATLAS;
+    o->u1 = (float)(*px + w) / ATLAS;
+    o->v1 = (float)(*py + h) / ATLAS;
+    o->w = (float)w;
+    o->h = (float)h;
+    o->bx = (float)g->bitmap_left;
+    o->by = (float)g->bitmap_top;
+    o->adv = (float)(g->advance.x >> 6);
+    o->valid = 1;
+    *px += w + 2;
+    if (h > *row)
+        *row = h;
 }
 
 static void build_atlas(void)
@@ -122,47 +258,38 @@ static void build_atlas(void)
         g_atlas[(i / 4) * ATLAS + i % 4] = 255;
     for (int s = SH_DISC; s < SH_N; s++)
         shape(s);
-    FT_Library ft;
+    FT_Library ft = NULL;
     FT_Face face = NULL;
-    if (!FT_Init_FreeType(&ft) && (face = open_font(ft)) && !FT_Set_Pixel_Sizes(face, 0, FONT_PX)) {
+    int ft_ok = !FT_Init_FreeType(&ft), pl_inited = 0;
+    if (ft_ok && (face = open_font(ft, &pl_inited)) && !FT_Set_Pixel_Sizes(face, 0, FONT_PX)) {
         g_ascent = (float)(face->size->metrics.ascender >> 6);
         int px = 0, py = 104, row = 0;
-        for (int ch = 32; ch < 127; ch++) {
-            if (FT_Load_Char(face, (FT_ULong)ch, FT_LOAD_RENDER))
-                continue;
-            FT_GlyphSlot g = face->glyph;
-            int w = (int)g->bitmap.width, h = (int)g->bitmap.rows;
-            if (px + w + 2 > ATLAS) {
-                px = 0;
-                py += row + 2;
-                row = 0;
-            }
-            if (py + h > ATLAS)
-                break;
-            for (int y = 0; y < h; y++)
-                memcpy(g_atlas + (py + y) * ATLAS + px, g->bitmap.buffer + y * g->bitmap.pitch, (size_t)w);
-            ov_glyph *o = &g_gl[ch];
-            o->u0 = (float)px / ATLAS;
-            o->v0 = (float)py / ATLAS;
-            o->u1 = (float)(px + w) / ATLAS;
-            o->v1 = (float)(py + h) / ATLAS;
-            o->w = (float)w;
-            o->h = (float)h;
-            o->bx = (float)g->bitmap_left;
-            o->by = (float)g->bitmap_top;
-            o->adv = (float)(g->advance.x >> 6);
-            px += w + 2;
-            row = h > row ? h : row;
-        }
-        g_cap = g_gl['H'].by > 0 ? g_gl['H'].by : g_ascent * 0.7f;
+        for (u32 cp = GL_ASCII_FIRST; cp < GL_ASCII_FIRST + GL_ASCII_COUNT; cp++)
+            pack_glyph(face, cp, glyph_idx(cp), &px, &py, &row);
+        for (u32 cp = GL_CYR_FIRST; cp < GL_CYR_FIRST + GL_CYR_COUNT; cp++)
+            pack_glyph(face, cp, glyph_idx(cp), &px, &py, &row);
+        int hi = glyph_idx('H');
+        g_cap = (hi >= 0 && g_gl[hi].by > 0) ? g_gl[hi].by : g_ascent * 0.7f;
         g_have_font = 1;
-        fprintf(stderr, "[overlay] font %s %s\n", face->family_name ? face->family_name : "?",
-                face->style_name ? face->style_name : "");
+        fprintf(stderr, "[overlay] font %s %s (atlas used y=%d/%d)\n", face->family_name ? face->family_name : "?",
+                face->style_name ? face->style_name : "", py + row, ATLAS);
     } else
         fprintf(stderr, "[overlay] no font: icons without letters, no text\n");
     if (face)
         FT_Done_Face(face);
+    if (ft_ok)
+        FT_Done_FreeType(ft);
+#ifdef __SWITCH__
+    if (pl_inited)
+        plExit();
+#endif
     g_state = 1;
+}
+
+static void ensure_atlas(void)
+{
+    if (!g_state)
+        build_atlas();
 }
 
 // ---------------------------------------------------------------- список
@@ -170,7 +297,7 @@ static void quad(float x0, float y0, float x1, float y1, float u0, float v0, flo
 {
     if (g_nv + 6 > MAX_VERTS)
         return;
-    ov_vert *v = g_v + g_nv;
+    ov_vert *v = g_batch.v + g_nv;
     v[0] = (ov_vert){x0, y0, u0, v0, c};
     v[1] = (ov_vert){x1, y0, u1, v0, c};
     v[2] = (ov_vert){x0, y1, u0, v1, c};
@@ -192,36 +319,44 @@ static void sprite(int id, float x, float y, float w, float h, u32 c)
 
 void ov_begin(void)
 {
-    if (!g_state)
-        build_atlas();
+    ensure_atlas();
     g_nv = 0;
 }
 
 void ov_rect(float x, float y, float w, float h, u32 rgba)
 {
+    ensure_atlas();
     if (g_state > 0)
         sprite(SH_WHITE, x, y, w, h, rgba);
 }
 
 float ov_text_width(float h, const char *s)
 {
+    if (!s)
+        return 0;
+    ensure_atlas();
     float k = h / FONT_PX, w = 0;
-    for (; g_have_font && *s; s++)
-        if ((unsigned char)*s < 128)
-            w += g_gl[(unsigned char)*s].adv * k;
+    while (g_have_font && *s) {
+        int idx = glyph_idx(utf8_next(&s));
+        if (idx >= 0 && g_gl[idx].valid)
+            w += g_gl[idx].adv * k;
+    }
     return w;
 }
 
 float ov_text(float x, float y, float h, u32 rgba, const char *s)
 {
+    if (!s)
+        return 0;
+    ensure_atlas();
     if (g_state <= 0 || !g_have_font)
         return 0;
     float k = h / FONT_PX, pen = x, base = y + g_ascent * k;
-    for (; *s; s++) {
-        unsigned ch = (unsigned char)*s;
-        if (ch >= 128)
+    while (*s) {
+        int idx = glyph_idx(utf8_next(&s));
+        if (idx < 0 || !g_gl[idx].valid)
             continue;
-        const ov_glyph *g = &g_gl[ch];
+        const ov_glyph *g = &g_gl[idx];
         if (g->w > 0)
             quad(pen + g->bx * k, base - g->by * k, pen + (g->bx + g->w) * k, base + (g->h - g->by) * k, g->u0, g->v0,
                  g->u1, g->v1, rgba);
@@ -251,6 +386,7 @@ float ov_icon_width(float h, ov_button b) { return b < OV_BUTTON_N ? g_btn[b].w 
 
 float ov_icon(float x, float y, float h, ov_button b)
 {
+    ensure_atlas();
     if (g_state <= 0 || b >= OV_BUTTON_N)
         return 0;
     const u32 face = OV_RGBA(240, 240, 240, 255), ink = OV_RGBA(30, 30, 30, 255), accent = OV_RGBA(255, 210, 40, 255);
@@ -289,7 +425,8 @@ float ov_icon(float x, float y, float h, ov_button b)
 
 // ---------------------------------------------------------------- рисование (поток рендера)
 static GLuint g_prog, g_vao, g_vbo, g_tex;
-static GLint g_loc_size;
+static GLint g_loc_size, g_loc_flip_y;
+static int g_gl_inited;
 
 static GLuint shader(GLenum type, const char *src)
 {
@@ -313,9 +450,11 @@ static void gl_init(void)
                              "layout(location = 1) in vec2 t;\n"
                              "layout(location = 2) in vec4 c;\n"
                              "uniform vec2 size;\n"
+                             "uniform float flip_y;\n"
                              "out vec2 vt;\n"
                              "out vec4 vc;\n"
-                             "void main() { vt = t; vc = c; gl_Position = vec4(p / size * 2.0 - 1.0, 0.0, 1.0); }\n";
+                             "void main() { vt = t; vc = c;\n"
+                             "  gl_Position = vec4(p.x / size.x * 2.0 - 1.0, (p.y / size.y * 2.0 - 1.0) * flip_y, 0.0, 1.0); }\n";
     static const char fs[] = "in vec2 vt;\n"
                              "in vec4 vc;\n"
                              "uniform sampler2D tex;\n"
@@ -329,6 +468,7 @@ static void gl_init(void)
     glDeleteShader(v);
     glDeleteShader(f);
     g_loc_size = glGetUniformLocation(g_prog, "size");
+    g_loc_flip_y = glGetUniformLocation(g_prog, "flip_y");
     glGenVertexArrays(1, &g_vao);
     glGenBuffers(1, &g_vbo);
     glBindVertexArray(g_vao);
@@ -341,103 +481,87 @@ static void gl_init(void)
     glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(ov_vert), (void *)16);
     glGenTextures(1, &g_tex);
     glBindTexture(GL_TEXTURE_2D, g_tex);
+    GLint unpack_al = 4, unpack_row = 0;
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &unpack_al);
+    glGetIntegerv(GL_UNPACK_ROW_LENGTH, &unpack_row);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, ATLAS, ATLAS, 0, GL_RED, GL_UNSIGNED_BYTE, g_atlas);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, unpack_al);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, unpack_row);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    free(g_atlas);
+    g_atlas = NULL;
 }
 
-typedef struct {
-    u32 fbo;
-    int w, h, n;
-} ov_batch;  // за ним — n вершин
-
-// Состояние GL, которое трогает рисование: слой D3D8 держит его в своих кешах — вернуть как было.
+// Сразу после ov_flush в d3d8_present перебиндивается DRAW_FRAMEBUFFER=0, сбрасываются scissor/colorMask/clearColor
+// и инвалидируется кеш состояния кадра (g_applied_gen = 0xFFFFFFFFu), поэтому 22 glGet*/glIsEnabled на каждый кадр
+// не нужны. Сохраняем только привязки VAO/программы/текстуры и явно выключаем смешивание, чтобы не мешать выводу кадра.
 static void x_draw(void *arg)
 {
     const ov_batch *b = arg;
-    GLint fb, vp[4], prog, vao, abuf, active, tex, samp, src_rgb, dst_rgb, src_a, dst_a, eq_rgb, eq_a, unpack_al, unpack_row;
-    GLboolean blend, depth, stencil, cull, scissor, cmask[4];
-    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fb);
-    glGetIntegerv(GL_VIEWPORT, vp);
+    GLint prog, vao, active, tex, samp;
     glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
     glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
-    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &abuf);
     glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
     glActiveTexture(GL_TEXTURE0);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
     glGetIntegerv(GL_SAMPLER_BINDING, &samp);
-    glGetIntegerv(GL_BLEND_SRC_RGB, &src_rgb);
-    glGetIntegerv(GL_BLEND_DST_RGB, &dst_rgb);
-    glGetIntegerv(GL_BLEND_SRC_ALPHA, &src_a);
-    glGetIntegerv(GL_BLEND_DST_ALPHA, &dst_a);
-    glGetIntegerv(GL_BLEND_EQUATION_RGB, &eq_rgb);
-    glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &eq_a);
-    glGetIntegerv(GL_UNPACK_ALIGNMENT, &unpack_al);
-    glGetIntegerv(GL_UNPACK_ROW_LENGTH, &unpack_row);
-    glGetBooleanv(GL_COLOR_WRITEMASK, cmask);
-    blend = glIsEnabled(GL_BLEND);
-    depth = glIsEnabled(GL_DEPTH_TEST);
-    stencil = glIsEnabled(GL_STENCIL_TEST);
-    cull = glIsEnabled(GL_CULL_FACE);
-    scissor = glIsEnabled(GL_SCISSOR_TEST);
 
-    if (!g_prog)
+    if (!g_gl_inited) {
         gl_init();
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, b->fbo);
-    glViewport(0, 0, b->w, b->h);
-    glUseProgram(g_prog);
-    glUniform2f(g_loc_size, (float)b->w, (float)b->h);
-    glBindVertexArray(g_vao);
-    glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(ov_vert) * (size_t)b->n), b + 1, GL_STREAM_DRAW);
-    glBindTexture(GL_TEXTURE_2D, g_tex);
-    glBindSampler(0, 0);
-    glEnable(GL_BLEND);
-    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-    glBlendEquation(GL_FUNC_ADD);
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_STENCIL_TEST);
-    glDisable(GL_CULL_FACE);
-    glDisable(GL_SCISSOR_TEST);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glDrawArrays(GL_TRIANGLES, 0, b->n);
+        g_gl_inited = 1;
+    }
+    if (g_prog) {
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, b->fbo);
+        glViewport(0, 0, b->w, b->h);
+        glUseProgram(g_prog);
+        glUniform2f(g_loc_size, (float)b->w, (float)b->h);
+        // FBO игры хранится сверху вниз (flip_y=+1), окно GL (fbo=0) — снизу вверх (flip_y=-1)
+        glUniform1f(g_loc_flip_y, b->fbo == 0 ? -1.0f : 1.0f);
+        glBindVertexArray(g_vao);
+        glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(ov_vert) * (size_t)b->n), b + 1, GL_STREAM_DRAW);
+        glBindTexture(GL_TEXTURE_2D, g_tex);
+        glBindSampler(0, 0);
+        glEnable(GL_BLEND);
+        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        glBlendEquation(GL_FUNC_ADD);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_STENCIL_TEST);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_POLYGON_OFFSET_FILL);
+        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glDrawArrays(GL_TRIANGLES, 0, b->n);
+        glDisable(GL_BLEND);
+    }
 
-    glColorMask(cmask[0], cmask[1], cmask[2], cmask[3]);
-    (scissor ? glEnable : glDisable)(GL_SCISSOR_TEST);
-    (cull ? glEnable : glDisable)(GL_CULL_FACE);
-    (stencil ? glEnable : glDisable)(GL_STENCIL_TEST);
-    (depth ? glEnable : glDisable)(GL_DEPTH_TEST);
-    (blend ? glEnable : glDisable)(GL_BLEND);
-    glBlendEquationSeparate((GLenum)eq_rgb, (GLenum)eq_a);
-    glBlendFuncSeparate((GLenum)src_rgb, (GLenum)dst_rgb, (GLenum)src_a, (GLenum)dst_a);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, unpack_al);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, unpack_row);
     glBindSampler(0, (GLuint)samp);
     glBindTexture(GL_TEXTURE_2D, (GLuint)tex);
     glActiveTexture((GLenum)active);
-    glBindBuffer(GL_ARRAY_BUFFER, (GLuint)abuf);
     glBindVertexArray((GLuint)vao);
     glUseProgram((GLuint)prog);
-    glViewport(vp[0], vp[1], vp[2], vp[3]);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)fb);
+}
+
+void ov_set_draw_hook(void (*fn)(int w, int h))
+{
+    atomic_store_explicit(&g_draw_hook, fn, memory_order_release);
 }
 
 void ov_flush(u32 fbo, int w, int h)
 {
+    ov_draw_hook_fn hook = atomic_load_explicit(&g_draw_hook, memory_order_acquire);
+    if (hook)
+        hook(w, h);
     if (g_state <= 0 || !g_nv)
         return;
+    g_batch.hdr = (ov_batch){fbo, w, h, g_nv};
     size_t size = sizeof(ov_batch) + sizeof(ov_vert) * (size_t)g_nv;
-    ov_batch *b = malloc(size);
-    if (!b)
-        return;
-    *b = (ov_batch){fbo, w, h, g_nv};
-    memcpy(b + 1, g_v, sizeof(ov_vert) * (size_t)g_nv);
-    cs_async(x_draw, b, size);
-    free(b);
+    cs_async(x_draw, &g_batch, size);
     g_nv = 0;
 }

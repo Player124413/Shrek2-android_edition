@@ -8,6 +8,7 @@
 
 typedef struct {
     u32 guest, refs;
+    u8 st;  // 1 — строго однопоточный объект (D3D8): счётчик без атомиков
     void *host;
     void (*destroy)(void *);
 } com_entry;
@@ -70,7 +71,7 @@ static com_entry *entry(u32 obj)
     return i < MAX_COM && g_com[i].guest == obj ? &g_com[i] : NULL;
 }
 
-u32 com_create(u32 vtbl, void *host, void (*destroy)(void *))
+static u32 com_create_impl(u32 vtbl, void *host, void (*destroy)(void *), u8 st)
 {
     u32 obj = heap_alloc(heap_process(), HEAP_ZERO_MEMORY, 16);
     if (!obj)
@@ -78,7 +79,7 @@ u32 com_create(u32 vtbl, void *host, void (*destroy)(void *))
     pthread_mutex_lock(&g_com_lock);
     for (u32 i = 1; i < MAX_COM; i++)
         if (!g_com[i].guest) {
-            g_com[i] = (com_entry){obj, 1, host, destroy};
+            g_com[i] = (com_entry){obj, 1, st, host, destroy};
             wr32(g_mem, obj, vtbl);
             wr32(g_mem, obj + 4, i);
             pthread_mutex_unlock(&g_com_lock);
@@ -90,6 +91,10 @@ u32 com_create(u32 vtbl, void *host, void (*destroy)(void *))
     return 0;
 }
 
+u32 com_create(u32 vtbl, void *host, void (*destroy)(void *)) { return com_create_impl(vtbl, host, destroy, 0); }
+
+u32 com_create_st(u32 vtbl, void *host, void (*destroy)(void *)) { return com_create_impl(vtbl, host, destroy, 1); }
+
 void *com_host(u32 obj)
 {
     com_entry *e = entry(obj);
@@ -99,7 +104,9 @@ void *com_host(u32 obj)
 u32 com_addref(u32 obj)
 {
     com_entry *e = entry(obj);
-    return e ? __atomic_add_fetch(&e->refs, 1, __ATOMIC_ACQ_REL) : 0;
+    if (!e)
+        return 0;
+    return e->st ? ++e->refs : __atomic_add_fetch(&e->refs, 1, __ATOMIC_ACQ_REL);
 }
 
 u32 com_release(u32 obj)
@@ -107,7 +114,7 @@ u32 com_release(u32 obj)
     com_entry *e = entry(obj);
     if (!e)
         return 0;
-    u32 r = __atomic_sub_fetch(&e->refs, 1, __ATOMIC_ACQ_REL);
+    u32 r = e->st ? --e->refs : __atomic_sub_fetch(&e->refs, 1, __ATOMIC_ACQ_REL);
     if (r == 0) {
         void *host = e->host;
         void (*destroy)(void *) = e->destroy;

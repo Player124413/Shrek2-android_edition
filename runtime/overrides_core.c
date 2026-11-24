@@ -130,13 +130,12 @@ store:
 extern void (*const ovr_orig_ovr_core_collect_garbage)(CPU *c);
 extern void (*const ovr_orig_ovr_core_struct_link)(CPU *c);
 
-static u32 g_gc_epoch = 1;  // сборки мусора: классы могли освободиться (перечитывание конфига ниже)
-
 void ovr_core_collect_garbage(CPU *c)
 {
-    g_gc_epoch++;
+    __atomic_add_fetch(&rt_gc_epoch, 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&g_fn_epoch, 1, __ATOMIC_RELAXED);
     RT_ENTER_GEN(c, ovr_orig_ovr_core_collect_garbage);  // оригинал — код гостя
+    __atomic_add_fetch(&rt_gc_epoch, 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&g_fn_epoch, 1, __ATOMIC_RELAXED);
 }
 
@@ -344,9 +343,10 @@ void ovr_core_load_config(CPU *c)
         memset(g_sc.cls, 0, sizeof g_sc.cls);
         slot = (cls * 0x9E3779B1u) >> 20;
     }
-    int same = g_sc.cls[slot].cls == cls && g_sc.cls[slot].epoch == g_gc_epoch && g_sc.cls[slot].hash == h;
+    u32 gc_ep = __atomic_load_n(&rt_gc_epoch, __ATOMIC_RELAXED);
+    int same = g_sc.cls[slot].cls == cls && g_sc.cls[slot].epoch == gc_ep && g_sc.cls[slot].hash == h;
     g_sc.cls[slot].cls = cls;
-    g_sc.cls[slot].epoch = g_gc_epoch;
+    g_sc.cls[slot].epoch = gc_ep;
     g_sc.cls[slot].hash = h;
     if (same && !cfg_check()) {
         g_sc.skipped++;
@@ -490,4 +490,156 @@ void ovr_memcpy(CPU *c)
     memmove(g_mem + dst, g_mem + src, n);
     c->eax = dst;
     c->esp += 4;
+}
+
+// ---------------------------------------------------------------- быстрые листья Core.dll (appMemcmp, FBox, FVector)
+// Слабые определения NULL вынесены в runtime/ovr_orig_weak.c (чтобы GCC с -fvisibility=hidden не сворачивал
+// const-указатели в NULL в этом TU). В сборках с Core.dll сильные определения из core_table.c их перекрывают.
+extern void (*const ovr_orig_ovr_core_box_add_vec)(CPU *c);
+extern void (*const ovr_orig_ovr_core_vec_safe_normal)(CPU *c);
+extern void (*const ovr_orig_ovr_core_vec_normalize)(CPU *c);
+
+static inline int core_math_check(void)
+{
+    static int v = -1;
+    if (v < 0)
+        v = getenv("SNX_MATH_CHECK") != NULL;
+    return v;
+}
+
+// Core.dll!0x101286b0 (экспорт 0x101028a6, appMemcmp): cdecl int appMemcmp(const void *a, const void *b, int n).
+// Оригинал через repe cmpsb + sbb возвращает строго -1, 0 или +1 (а не разность байтов).
+void ovr_core_memcmp(CPU *c)
+{
+    u32 a = rd32(g_mem, c->esp + 4u);
+    u32 b = rd32(g_mem, c->esp + 8u);
+    u32 n = rd32(g_mem, c->esp + 12u);
+    int r = n ? memcmp(g_mem + a, g_mem + b, n) : 0;
+    c->eax = r < 0 ? 0xFFFFFFFFu : r > 0 ? 1u : 0u;
+    c->esp += 4u;
+}
+
+// Core.dll!0x101186c0 (экспорт 0x10101aff, FBox::operator+=(const FVector &)): thiscall, ret 4, eax = this.
+// Раскладка FBox: +0x00 Min (3 float), +0x0C Max (3 float), +0x18 IsValid (u8).
+static void box_add_vec_apply(u8 *m, u32 box, u32 vec)
+{
+    if (m[box + 0x18u]) {
+        float vx = rdf32(m, vec), vy = rdf32(m, vec + 4u), vz = rdf32(m, vec + 8u);
+        float minx = rdf32(m, box), miny = rdf32(m, box + 4u), minz = rdf32(m, box + 8u);
+        float maxx = rdf32(m, box + 0x0Cu), maxy = rdf32(m, box + 0x10u), maxz = rdf32(m, box + 0x14u);
+        // Побитово как x87 fcomp/fnstsw в оригинале (включая NaN): Min = (Min <= V ? Min : V), Max = (Max >= V ? Max : V)
+        wrf32(m, box, minx <= vx ? minx : vx);
+        wrf32(m, box + 4u, miny <= vy ? miny : vy);
+        wrf32(m, box + 8u, minz <= vz ? minz : vz);
+        wrf32(m, box + 0x0Cu, maxx >= vx ? maxx : vx);
+        wrf32(m, box + 0x10u, maxy >= vy ? maxy : vy);
+        wrf32(m, box + 0x14u, maxz >= vz ? maxz : vz);
+    } else {
+        u32 x = rd32(m, vec), y = rd32(m, vec + 4u), z = rd32(m, vec + 8u);
+        wr32(m, box, x);
+        wr32(m, box + 4u, y);
+        wr32(m, box + 8u, z);
+        wr32(m, box + 0x0Cu, x);
+        wr32(m, box + 0x10u, y);
+        wr32(m, box + 0x14u, z);
+        m[box + 0x18u] = 1u;
+    }
+}
+
+void ovr_core_box_add_vec(CPU *c)
+{
+    u8 *m = g_mem;
+    u32 box = c->ecx, vec = rd32(m, c->esp + 4u);
+    if (core_math_check() && ovr_orig_ovr_core_box_add_vec) {
+        u8 before[25], ours[25];
+        memcpy(before, m + box, sizeof before);
+        box_add_vec_apply(m, box, vec);
+        memcpy(ours, m + box, sizeof ours);
+        memcpy(m + box, before, sizeof before);
+        RT_ENTER_GEN(c, ovr_orig_ovr_core_box_add_vec);
+        if (c->eax != box || memcmp(ours, m + box, sizeof ours) != 0)
+            fprintf(stderr, "[core] SNX_MATH_CHECK: FBox::+= mismatch (eax %08x vs %08x)\n", c->eax, box);
+        return;
+    }
+    box_add_vec_apply(m, box, vec);
+    c->eax = box;
+    c->esp += 8u;  // thiscall, один аргумент: ret 4
+}
+
+// Core.dll!0x1014ad30 (экспорт 0x10103c97, FVector::SafeNormal): thiscall с sret [esp+4], ret 4, eax = out.
+// Порог — константа double 1e-8 (Core.dll!0x101904c8). Для X и Y масштаб усечён до float (fst [esp+4] в 1014ad8c),
+// для Z — double; при sq < 1e-8 возвращается {0, 0, 0}.
+static void vec_safe_normal_apply(u8 *m, u32 v, u32 out)
+{
+    double x = (double)rdf32(m, v);
+    double y = (double)rdf32(m, v + 4u);
+    double z = (double)rdf32(m, v + 8u);
+    double sq = x * x + y * y + z * z;
+    if (sq < 1e-8) {
+        wr32(m, out, 0u);
+        wr32(m, out + 4u, 0u);
+        wr32(m, out + 8u, 0u);
+        return;
+    }
+    double s = 1.0 / sqrt(sq);
+    float sf = (float)s;
+    wrf32(m, out, (float)((double)sf * x));
+    wrf32(m, out + 4u, (float)((double)sf * y));
+    wrf32(m, out + 8u, (float)(s * z));
+}
+
+void ovr_core_vec_safe_normal(CPU *c)
+{
+    u8 *m = g_mem;
+    u32 v = c->ecx, out = rd32(m, c->esp + 4u);
+    if (core_math_check() && ovr_orig_ovr_core_vec_safe_normal) {
+        u8 before_out[12], ours[12];
+        memcpy(before_out, m + out, sizeof before_out);
+        vec_safe_normal_apply(m, v, out);
+        memcpy(ours, m + out, sizeof ours);
+        memcpy(m + out, before_out, sizeof before_out);
+        RT_ENTER_GEN(c, ovr_orig_ovr_core_vec_safe_normal);
+        if (c->eax != out || memcmp(ours, m + out, sizeof ours) != 0)
+            fprintf(stderr, "[core] SNX_MATH_CHECK: FVector::SafeNormal mismatch (eax %08x vs %08x)\n", c->eax, out);
+        return;
+    }
+    vec_safe_normal_apply(m, v, out);
+    c->eax = out;
+    c->esp += 8u;  // thiscall, sret: ret 4
+}
+
+// Core.dll!0x1010cd60 (экспорт 0x101010b4, FVector::Normalize): thiscall без аргументов, ret, eax = 1/0.
+// Порог — double 1e-8 (Core.dll!0x101904c8); при sq < 1e-8 или NaN возвращает 0 и не меняет вектор.
+static u32 vec_normalize_apply(u8 *m, u32 v)
+{
+    double x = (double)rdf32(m, v);
+    double y = (double)rdf32(m, v + 4u);
+    double z = (double)rdf32(m, v + 8u);
+    double sq = x * x + y * y + z * z;
+    if (!(sq >= 1e-8))
+        return 0u;
+    double s = 1.0 / sqrt(sq);
+    wrf32(m, v, (float)(s * x));
+    wrf32(m, v + 4u, (float)(s * y));
+    wrf32(m, v + 8u, (float)(s * z));
+    return 1u;
+}
+
+void ovr_core_vec_normalize(CPU *c)
+{
+    u8 *m = g_mem;
+    u32 v = c->ecx;
+    if (core_math_check() && ovr_orig_ovr_core_vec_normalize) {
+        u8 before[12], ours[12];
+        memcpy(before, m + v, sizeof before);
+        u32 r = vec_normalize_apply(m, v);
+        memcpy(ours, m + v, sizeof ours);
+        memcpy(m + v, before, sizeof before);
+        RT_ENTER_GEN(c, ovr_orig_ovr_core_vec_normalize);
+        if (c->eax != r || memcmp(ours, m + v, sizeof ours) != 0)
+            fprintf(stderr, "[core] SNX_MATH_CHECK: FVector::Normalize mismatch (got %u, orig %u)\n", r, c->eax);
+        return;
+    }
+    c->eax = vec_normalize_apply(m, v);
+    c->esp += 4u;  // thiscall без аргументов: ret
 }
