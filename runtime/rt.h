@@ -27,9 +27,12 @@ extern "C" {
 // частоте из sysfs) с повышенным приоритетом и в сессии подсказок производительности (ADPF, Android 12+).
 #if defined(__SWITCH__) || defined(__ANDROID__)
 void rt_platform_thread_core(int core);
+#endif
+#if defined(__SWITCH__)
 // До SDL и потоков: в applet-режиме (памяти меньше окна гостя) — текстовый экран libnx с подсказкой и 0 после
 // нажатия кнопки (вызывающий выходит обычным возвратом из main); иначе 1 — можно запускаться.
 int rt_platform_preflight(void);
+#elif defined(__ANDROID__)
 #elif defined(__APPLE__)
 #include <pthread/qos.h>
 static inline void rt_platform_thread_core(int core)

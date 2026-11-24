@@ -611,8 +611,10 @@ int main(int argc, char **argv)
             dup2(fileno(stderr), fileno(stdout));
         }
     }
+#ifdef __SWITCH__
     if (!rt_platform_preflight())
         return 1;  // applet-режим: подсказка показана, SDL и потоков ещё нет — обычный возврат в hbloader
+#endif
 #endif
 #ifdef SNX_NO_GAME
     // APK из CI без файлов игры (host/boot/CMakeLists.txt): код порта собран, модулей игры нет
